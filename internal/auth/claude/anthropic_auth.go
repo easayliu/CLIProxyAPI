@@ -23,7 +23,7 @@ const (
 	AuthURL     = "https://platform.claude.com/oauth/authorize"
 	TokenURL    = "https://platform.claude.com/v1/oauth/token"
 	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	RedirectURI = "http://localhost:54545/oauth/callback"
+	RedirectURI = "http://localhost:54545/callback"
 )
 
 // tokenResponse represents the response structure from Anthropic's OAuth token endpoint.
@@ -562,7 +562,7 @@ func (o *ClaudeAuth) approveOAuthAuthorization(ctx context.Context, sessionKey, 
 			fmt.Errorf("authorize returned %d: %s", resp.StatusCode, truncateBody(body, 200)))
 	}
 
-	// Response: {"redirect_uri": "http://localhost:54545/oauth/callback?code=xxx&state=yyy"}
+	// Response: {"redirect_uri": "http://localhost:54545/callback?code=xxx&state=yyy"}
 	var result struct {
 		RedirectURI string `json:"redirect_uri"`
 	}

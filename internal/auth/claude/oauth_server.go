@@ -83,7 +83,7 @@ func (s *OAuthServer) Start() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/oauth/callback", s.handleCallback)
+	mux.HandleFunc("/callback", s.handleCallback)
 	mux.HandleFunc("/success", s.handleSuccess)
 
 	s.server = &http.Server{

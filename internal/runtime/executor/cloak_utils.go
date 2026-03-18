@@ -3,29 +3,44 @@ package executor
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"regexp"
+	"encoding/json"
 	"strings"
 
 	"github.com/google/uuid"
 )
 
-// userIDPattern matches Claude Code format: user_[64-hex]_account_[uuid]_session_[uuid]
-var userIDPattern = regexp.MustCompile(`^user_[a-fA-F0-9]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+// userIDStruct matches the real Claude Code metadata.user_id JSON format.
+type userIDStruct struct {
+	DeviceID    string `json:"device_id"`
+	AccountUUID string `json:"account_uuid"`
+	SessionID   string `json:"session_id"`
+}
 
-// generateFakeUserID generates a fake user ID in Claude Code format.
-// Format: user_[64-hex-chars]_account_[UUID-v4]_session_[UUID-v4]
+// generateFakeUserID generates a fake user ID matching real Claude Code format.
+// Real format: JSON string {"device_id":"64hex","account_uuid":"uuid","session_id":"uuid"}
 func generateFakeUserID() string {
 	hexBytes := make([]byte, 32)
 	_, _ = rand.Read(hexBytes)
-	hexPart := hex.EncodeToString(hexBytes)
-	accountUUID := uuid.New().String()
-	sessionUUID := uuid.New().String()
-	return "user_" + hexPart + "_account_" + accountUUID + "_session_" + sessionUUID
+	uid := userIDStruct{
+		DeviceID:    hex.EncodeToString(hexBytes),
+		AccountUUID: uuid.New().String(),
+		SessionID:   uuid.New().String(),
+	}
+	b, _ := json.Marshal(uid)
+	return string(b)
 }
 
 // isValidUserID checks if a user ID matches Claude Code format.
+// Accepts both the new JSON object format and the legacy string format.
 func isValidUserID(userID string) bool {
-	return userIDPattern.MatchString(userID)
+	// New format: JSON object with device_id, account_uuid, session_id
+	if strings.HasPrefix(userID, "{") {
+		var uid userIDStruct
+		if err := json.Unmarshal([]byte(userID), &uid); err == nil {
+			return uid.DeviceID != "" && uid.AccountUUID != "" && uid.SessionID != ""
+		}
+	}
+	return false
 }
 
 // shouldCloak determines if request should be cloaked based on config and client User-Agent.

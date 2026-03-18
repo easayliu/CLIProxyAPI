@@ -6,6 +6,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -886,16 +887,11 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.78 (external, cli)"))
 	}
 	r.Header.Set("Connection", "keep-alive")
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-		// SSE streams must not be compressed: the downstream scanner reads
-		// line-delimited text and cannot parse compressed bytes.  Using
-		// "identity" tells the upstream to send an uncompressed stream.
-		r.Header.Set("Accept-Encoding", "identity")
-	} else {
-		r.Header.Set("Accept", "application/json")
-		r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	}
+	// Real Claude Code always uses application/json + full Accept-Encoding,
+	// even for streaming requests; streaming is controlled by the body "stream" field.
+	// decodeResponseBody already handles decompression before the SSE scanner.
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	// Keep OS/Arch mapping dynamic (not configurable).
 	// They intentionally continue to derive from runtime.GOOS/runtime.GOARCH.
 	var attrs map[string]string
@@ -903,12 +899,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
-	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
-	// may override it with a user-configured value.  Compressed SSE breaks the line
-	// scanner regardless of user preference, so this is non-negotiable for streams.
-	if stream {
-		r.Header.Set("Accept-Encoding", "identity")
-	}
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1202,6 +1192,17 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 	return payload
 }
 
+// injectContextManagement adds the context_management field if not already present.
+// Real Claude Code v2.1.78 sends: {"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}
+func injectContextManagement(payload []byte) []byte {
+	if gjson.GetBytes(payload, "context_management").Exists() {
+		return payload
+	}
+	payload, _ = sjson.SetRawBytes(payload, "context_management",
+		[]byte(`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`))
+	return payload
+}
+
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
@@ -1211,7 +1212,7 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 //  2. Take runes at positions 4, 7, 20 (default "0" if out of range)
 //  3. SHA-256(salt + chars + version), take first 3 hex chars
 //
-// cch is always "00000" (hardcoded static placeholder in v2.1.78 source).
+// cch is a 5-character hex hash that varies per request in real Claude Code.
 func generateBillingHeader(payload []byte) string {
 	const salt = "59cf53e54c78"
 	const version = "2.1.78"
@@ -1253,7 +1254,12 @@ func generateBillingHeader(payload []byte) string {
 	h := sha256.Sum256([]byte(salt + chars + version))
 	buildHash := hex.EncodeToString(h[:])[:3]
 
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", version, buildHash)
+	// Generate a 5-char hex cch value from random bytes.
+	var cchBuf [3]byte
+	_, _ = rand.Read(cchBuf[:])
+	cch := hex.EncodeToString(cchBuf[:])[:5]
+
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:
@@ -1272,9 +1278,9 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 
 	// Agent block matches real Claude Code v2.1.78 interactive mode system[1].
 	// In OAuth mode the real CLI adds ttl:"1h" via fQ when quota conditions are met.
-	agentBlock := `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral"}}`
+	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral"}}`
 	if oauthMode {
-		agentBlock = `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"1h"}}`
+		agentBlock = `{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}`
 	}
 
 	if strictMode {
@@ -1371,6 +1377,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
 		payload = checkSystemInstructionsWithMode(payload, strictMode, true)
 	}
+
+	// Inject context_management if not already present.
+	// Real Claude Code sends this to control thinking context management.
+	payload = injectContextManagement(payload)
 
 	// Inject fake user ID
 	payload = injectFakeUserID(payload, apiKey, cacheUserID)

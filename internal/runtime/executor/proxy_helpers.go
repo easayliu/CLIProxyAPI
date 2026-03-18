@@ -17,6 +17,10 @@ import (
 // 2. Use cfg.ProxyURL if auth proxy is not configured
 // 3. Use RoundTripper from context if neither are configured
 //
+// When TLS fingerprint spoofing is enabled (default), the returned client uses
+// a uTLS-based transport that presents a Chrome-like ClientHello instead of
+// Go's default crypto/tls fingerprint.
+//
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
 //   - cfg: The application configuration
@@ -46,7 +50,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if proxyURL != "" {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
-			httpClient.Transport = transport
+			httpClient.Transport = wrapTransportWithFingerprint(transport)
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
@@ -56,8 +60,11 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 		httpClient.Transport = rt
+		return httpClient
 	}
 
+	// Default: direct connection with TLS fingerprint spoofing
+	httpClient.Transport = wrapTransportWithFingerprint(nil)
 	return httpClient
 }
 

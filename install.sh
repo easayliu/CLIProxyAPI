@@ -11,6 +11,7 @@ REPO_OWNER="easayliu"
 REPO_NAME="CLIProxyAPI"
 INSTALL_DIR="$HOME/cliproxyapi"
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+API_RELEASES_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
 SCRIPT_NAME="cliproxyapi-installer"
 
 # Colors for output
@@ -352,20 +353,99 @@ check_dependencies() {
 # Fetch latest release info from GitHub API
 fetch_release_info() {
     log_info "Fetching latest release information..."
-    
+
     local release_info
     if command -v curl >/dev/null 2>&1; then
         release_info=$(curl -s "$API_URL")
     else
         release_info=$(wget -qO- "$API_URL")
     fi
-    
+
     if [[ -z "$release_info" ]]; then
         log_error "Failed to fetch release information from GitHub API"
         exit 1
     fi
-    
+
     echo "$release_info"
+}
+
+# Fetch release info for a specific version from GitHub API
+fetch_release_info_by_version() {
+    local version="$1"
+    # Normalize: ensure tag has "v" prefix
+    local tag="$version"
+    if [[ "$tag" != v* ]]; then
+        tag="v${tag}"
+    fi
+
+    log_info "Fetching release information for ${tag}..."
+
+    local url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}"
+    local release_info
+    if command -v curl >/dev/null 2>&1; then
+        release_info=$(curl -s "$url")
+    else
+        release_info=$(wget -qO- "$url")
+    fi
+
+    if [[ -z "$release_info" ]]; then
+        log_error "Failed to fetch release information for ${tag}"
+        exit 1
+    fi
+
+    # Check for "Not Found" error from GitHub API
+    if echo "$release_info" | grep -q '"message": *"Not Found"'; then
+        log_error "Version ${tag} not found on GitHub releases"
+        exit 1
+    fi
+
+    echo "$release_info"
+}
+
+# List available versions from GitHub releases
+list_versions() {
+    log_info "Fetching available versions..."
+
+    local releases
+    if command -v curl >/dev/null 2>&1; then
+        releases=$(curl -s "${API_RELEASES_URL}?per_page=20")
+    else
+        releases=$(wget -qO- "${API_RELEASES_URL}?per_page=20")
+    fi
+
+    if [[ -z "$releases" ]]; then
+        log_error "Failed to fetch releases from GitHub API"
+        exit 1
+    fi
+
+    local current_version
+    current_version=$(get_current_version)
+
+    echo
+    echo "Available Versions (latest 20):"
+    echo "================================"
+
+    local versions
+    versions=$(echo "$releases" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+
+    if [[ -z "$versions" ]]; then
+        log_error "No versions found"
+        exit 1
+    fi
+
+    while IFS= read -r tag; do
+        local ver="${tag#v}"
+        if [[ "$ver" == "$current_version" ]]; then
+            echo -e "  ${GREEN}${tag}${NC} (installed)"
+        else
+            echo "  ${tag}"
+        fi
+    done <<< "$versions"
+
+    echo
+    echo -e "${BLUE}To install a specific version:${NC}"
+    echo -e "  ${CYAN}$SCRIPT_NAME install --version v1.2.3${NC}"
+    echo
 }
 
 # Extract version and download URL from release info
@@ -729,16 +809,32 @@ make_executable() {
 }
 
 # Main installation function
+# Usage: install_cliproxyapi [--version vX.Y.Z]
 install_cliproxyapi() {
+    local target_version=""
+
+    # Parse optional --version argument
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version)
+                target_version="${2:-}"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
     local current_version
     current_version=$(get_current_version)
     local is_upgrade=false
     local service_was_running=false
-    
+
     if [[ "$current_version" != "none" ]]; then
         log_info "Current CLIProxyAPI version: $current_version"
         is_upgrade=true
-        
+
         # Check if service is running before upgrade
         if is_service_running; then
             service_was_running=true
@@ -747,31 +843,47 @@ install_cliproxyapi() {
     else
         log_info "CLIProxyAPI not installed, performing fresh installation"
     fi
-    
+
     # Check dependencies
     check_dependencies
-    
+
     # Detect Linux architecture
     local os_arch
     os_arch=$(detect_linux_arch)
     log_step "Detected platform: $os_arch"
-    
-    # Fetch release info
+
+    # Fetch release info (specific version or latest)
     local release_info
-    release_info=$(fetch_release_info)
-    
+    if [[ -n "$target_version" ]]; then
+        release_info=$(fetch_release_info_by_version "$target_version")
+    else
+        release_info=$(fetch_release_info)
+    fi
+
     # Extract version and download URL
     local release_data
     release_data=$(extract_release_info "$release_info" "$os_arch")
     local version=$(echo "$release_data" | cut -d'|' -f1)
     local download_url=$(echo "$release_data" | cut -d'|' -f2)
-    
-    log_step "Latest version: $version"
-    
-    # Check if already up to date
-    if [[ "$is_upgrade" == true && "$current_version" == "$version" ]]; then
+
+    if [[ -n "$target_version" ]]; then
+        log_step "Target version: $version"
+    else
+        log_step "Latest version: $version"
+    fi
+
+    # Check if already up to date (only when not explicitly requesting a version)
+    if [[ -z "$target_version" && "$is_upgrade" == true && "$current_version" == "$version" ]]; then
         log_success "CLIProxyAPI is already up to date (version $version)"
         return
+    fi
+
+    # Warn if downgrading
+    if [[ "$is_upgrade" == true && "$current_version" != "none" ]]; then
+        # Simple semver comparison: if target < current it's a downgrade
+        if [[ "$(printf '%s\n' "$current_version" "$version" | sort -V | head -1)" == "$version" && "$current_version" != "$version" ]]; then
+            log_warning "Downgrading from $current_version to $version"
+        fi
     fi
     
     # Stop service and processes if running (for upgrades)
@@ -957,7 +1069,11 @@ trap cleanup EXIT
 main() {
     case "${1:-install}" in
         "install"|"upgrade")
-            install_cliproxyapi
+            shift || true
+            install_cliproxyapi "$@"
+            ;;
+        "list-versions"|"versions")
+            list_versions
             ;;
         "status")
             show_status
@@ -1029,14 +1145,16 @@ main() {
 Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
 
 Commands:
-  install, upgrade    Install or upgrade CLIProxyAPI (default)
-  status             Show current installation status
-  auth               Show authentication setup information
-  check-config       Check configuration and API keys
-  generate-key       Generate new API key and show it
-  manage-docs        Manage documentation (update, organize, check consistency)
-  uninstall          Remove CLIProxyAPI completely
-  -h, --help         Show this help message
+  install, upgrade              Install or upgrade CLIProxyAPI (default)
+    --version <tag>             Install a specific version (e.g. --version v1.2.3)
+  list-versions, versions       List available versions from GitHub releases
+  status                        Show current installation status
+  auth                          Show authentication setup information
+  check-config                  Check configuration and API keys
+  generate-key                  Generate new API key and show it
+  manage-docs                   Manage documentation
+  uninstall                     Remove CLIProxyAPI completely
+  -h, --help                    Show this help message
 
 Description:
   This Linux-specific script installs, upgrades, or removes CLIProxyAPI.
@@ -1046,7 +1164,7 @@ Description:
 
 Features:
   - Automatic Linux architecture detection (amd64/arm64)
-  - Downloads latest version from GitHub releases
+  - Downloads latest or specific version from GitHub releases
   - Preserves configuration during upgrades
   - Automatic API key generation
   - Systemd service file creation
@@ -1058,12 +1176,14 @@ Supported Platforms:
   - Linux: amd64, arm64
 
 Examples:
-  $SCRIPT_NAME              # Install or upgrade
-  $SCRIPT_NAME status       # Show current status
-  $SCRIPT_NAME auth         # Show authentication info
-  $SCRIPT_NAME check-config # Check configuration
-  $SCRIPT_NAME generate-key # Generate new API key
-  $SCRIPT_NAME uninstall    # Remove completely
+  $SCRIPT_NAME                            # Install or upgrade to latest
+  $SCRIPT_NAME install --version v1.2.3   # Install specific version
+  $SCRIPT_NAME list-versions              # Show available versions
+  $SCRIPT_NAME status                     # Show current status
+  $SCRIPT_NAME auth                       # Show authentication info
+  $SCRIPT_NAME check-config               # Check configuration
+  $SCRIPT_NAME generate-key               # Generate new API key
+  $SCRIPT_NAME uninstall                  # Remove completely
 
 EOF
             ;;

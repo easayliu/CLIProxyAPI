@@ -20,7 +20,7 @@ import (
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL     = "https://platform.claude.com/oauth/authorize"
+	AuthURL     = "https://claude.ai/oauth/authorize"
 	TokenURL    = "https://platform.claude.com/v1/oauth/token"
 	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	RedirectURI = "http://localhost:54545/callback"
@@ -85,7 +85,6 @@ func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string
 	}
 
 	params := url.Values{
-		"code":                  {"true"},
 		"client_id":             {ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {RedirectURI},
@@ -526,7 +525,7 @@ func (o *ClaudeAuth) approveOAuthAuthorization(ctx context.Context, sessionKey, 
 		"client_id":             ClientID,
 		"organization_uuid":     orgUUID,
 		"redirect_uri":          RedirectURI,
-		"scope":                 "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+		"scope":                 "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
 		"state":                 state,
 		"code_challenge":        pkceCodes.CodeChallenge,
 		"code_challenge_method": "S256",

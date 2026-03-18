@@ -83,7 +83,7 @@ func (s *OAuthServer) Start() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", s.handleCallback)
+	mux.HandleFunc("/oauth/callback", s.handleCallback)
 	mux.HandleFunc("/success", s.handleSuccess)
 
 	s.server = &http.Server{
@@ -239,7 +239,7 @@ func (s *OAuthServer) handleSuccess(w http.ResponseWriter, r *http.Request) {
 	setupRequired := query.Get("setup_required") == "true"
 	platformURL := query.Get("platform_url")
 	if platformURL == "" {
-		platformURL = "https://console.anthropic.com/"
+		platformURL = "https://platform.claude.com/"
 	}
 
 	// Generate success page HTML with dynamic content

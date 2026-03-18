@@ -20,10 +20,10 @@ import (
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL     = "https://claude.ai/oauth/authorize"
-	TokenURL    = "https://api.anthropic.com/v1/oauth/token"
+	AuthURL     = "https://platform.claude.com/oauth/authorize"
+	TokenURL    = "https://platform.claude.com/v1/oauth/token"
 	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	RedirectURI = "http://localhost:54545/callback"
+	RedirectURI = "http://localhost:54545/oauth/callback"
 )
 
 // tokenResponse represents the response structure from Anthropic's OAuth token endpoint.
@@ -89,7 +89,7 @@ func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string
 		"client_id":             {ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {RedirectURI},
-		"scope":                 {"org:create_api_key user:profile user:inference"},
+		"scope":                 {"org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"},
 		"code_challenge":        {pkceCodes.CodeChallenge},
 		"code_challenge_method": {"S256"},
 		"state":                 {state},
@@ -526,7 +526,7 @@ func (o *ClaudeAuth) approveOAuthAuthorization(ctx context.Context, sessionKey, 
 		"client_id":             ClientID,
 		"organization_uuid":     orgUUID,
 		"redirect_uri":          RedirectURI,
-		"scope":                 "user:profile user:inference",
+		"scope":                 "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
 		"state":                 state,
 		"code_challenge":        pkceCodes.CodeChallenge,
 		"code_challenge_method": "S256",
@@ -562,7 +562,7 @@ func (o *ClaudeAuth) approveOAuthAuthorization(ctx context.Context, sessionKey, 
 			fmt.Errorf("authorize returned %d: %s", resp.StatusCode, truncateBody(body, 200)))
 	}
 
-	// Response: {"redirect_uri": "http://localhost:54545/callback?code=xxx&state=yyy"}
+	// Response: {"redirect_uri": "http://localhost:54545/oauth/callback?code=xxx&state=yyy"}
 	var result struct {
 		RedirectURI string `json:"redirect_uri"`
 	}

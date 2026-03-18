@@ -100,6 +100,20 @@ var (
 		Message: "Timeout waiting for OAuth callback",
 		Code:    http.StatusRequestTimeout,
 	}
+
+	// ErrInvalidSessionKey represents an error when the provided session key is invalid or expired.
+	ErrInvalidSessionKey = &AuthenticationError{
+		Type:    "invalid_session_key",
+		Message: "The session key is invalid or expired",
+		Code:    http.StatusUnauthorized,
+	}
+
+	// ErrSessionKeyExchangeFailed represents an error when the session key cannot be exchanged for an authorization code.
+	ErrSessionKeyExchangeFailed = &AuthenticationError{
+		Type:    "session_key_exchange_failed",
+		Message: "Failed to exchange session key for authorization code",
+		Code:    http.StatusBadRequest,
+	}
 )
 
 // NewAuthenticationError creates a new authentication error with a cause based on a base error.
@@ -143,6 +157,10 @@ func GetUserFriendlyMessage(err error) string {
 			return "The required port is already in use. Please close any applications using port 3000 and try again."
 		case "callback_timeout":
 			return "Authentication timed out. Please try again."
+		case "invalid_session_key":
+			return "Session key is invalid or expired. Please obtain a fresh session key from claude.ai."
+		case "session_key_exchange_failed":
+			return "Failed to convert session key to OAuth token. Please try again or use browser-based login."
 		case "browser_open_failed":
 			return "Could not open your browser automatically. Please copy and paste the URL manually."
 		default:

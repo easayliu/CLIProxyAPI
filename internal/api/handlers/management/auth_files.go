@@ -250,6 +250,22 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 			files = append(files, entry)
 		}
 	}
+
+	// Enrich auth file entries with per-auth usage statistics.
+	if h.usageStats != nil {
+		byAuth := h.usageStats.SnapshotByAuthIndex()
+		for _, entry := range files {
+			authIndex, _ := entry["auth_index"].(string)
+			if authIndex == "" {
+				continue
+			}
+			if snap, ok := byAuth[authIndex]; ok {
+				entry["request_count"] = snap.TotalRequests
+				entry["total_tokens"] = snap.TotalTokens
+			}
+		}
+	}
+
 	sort.Slice(files, func(i, j int) bool {
 		nameI, _ := files[i]["name"].(string)
 		nameJ, _ := files[j]["name"].(string)
@@ -460,6 +476,60 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 				entry["note"] = trimmed
 			}
 		}
+	}
+	// Expose quota state so management dashboards can display it.
+	if auth.Quota.Exceeded || auth.Quota.Reason != "" || !auth.Quota.NextRecoverAt.IsZero() {
+		q := gin.H{"exceeded": auth.Quota.Exceeded}
+		if auth.Quota.Reason != "" {
+			q["reason"] = auth.Quota.Reason
+		}
+		if !auth.Quota.NextRecoverAt.IsZero() {
+			q["next_recover_at"] = auth.Quota.NextRecoverAt
+		}
+		if auth.Quota.BackoffLevel > 0 {
+			q["backoff_level"] = auth.Quota.BackoffLevel
+		}
+		entry["quota"] = q
+	}
+	if auth.LastError != nil {
+		le := gin.H{"message": auth.LastError.Message}
+		if auth.LastError.Code != "" {
+			le["code"] = auth.LastError.Code
+		}
+		if auth.LastError.HTTPStatus != 0 {
+			le["http_status"] = auth.LastError.HTTPStatus
+		}
+		entry["last_error"] = le
+	}
+	if len(auth.ModelStates) > 0 {
+		ms := make(gin.H, len(auth.ModelStates))
+		for model, state := range auth.ModelStates {
+			if state == nil {
+				continue
+			}
+			m := gin.H{"status": state.Status, "unavailable": state.Unavailable}
+			if state.StatusMessage != "" {
+				m["status_message"] = state.StatusMessage
+			}
+			if state.Quota.Exceeded || state.Quota.Reason != "" {
+				mq := gin.H{"exceeded": state.Quota.Exceeded}
+				if state.Quota.Reason != "" {
+					mq["reason"] = state.Quota.Reason
+				}
+				if !state.Quota.NextRecoverAt.IsZero() {
+					mq["next_recover_at"] = state.Quota.NextRecoverAt
+				}
+				m["quota"] = mq
+			}
+			if !state.NextRetryAfter.IsZero() {
+				m["next_retry_after"] = state.NextRetryAfter
+			}
+			if state.LastError != nil {
+				m["last_error"] = gin.H{"message": state.LastError.Message, "code": state.LastError.Code, "http_status": state.LastError.HTTPStatus}
+			}
+			ms[model] = m
+		}
+		entry["model_states"] = ms
 	}
 	return entry
 }
@@ -1201,6 +1271,230 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+// RequestAnthropicSessionKeyToken imports a Claude account by converting a browser session key
+// into OAuth tokens via the PKCE authorization flow.
+func (h *Handler) RequestAnthropicSessionKeyToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	var payload struct {
+		SessionKey string `json:"session_key"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "session_key is required"})
+		return
+	}
+
+	sessionKey := strings.TrimSpace(payload.SessionKey)
+	if sessionKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "session_key is required"})
+		return
+	}
+
+	if !strings.Contains(sessionKey, "sk-ant-sid") {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid session key format (expected sk-ant-sid...)"})
+		return
+	}
+
+	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	bundle, err := anthropicAuth.ExchangeSessionKeyForTokens(ctx, sessionKey)
+	if err != nil {
+		log.Errorf("Session key exchange failed: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+	record := &coreauth.Auth{
+		ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+		Provider: "claude",
+		FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+		Storage:  tokenStorage,
+		Metadata: map[string]any{"email": tokenStorage.Email},
+	}
+	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	if errSave != nil {
+		log.Errorf("Failed to save authentication tokens: %v", errSave)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
+		return
+	}
+
+	fmt.Printf("Session key authentication successful! Token saved to %s\n", savedPath)
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"saved_path": savedPath,
+		"email":      tokenStorage.Email,
+		"type":       "claude",
+	})
+}
+
+// RequestAnthropicSessionKeyConsentToken imports a Claude account by using a browser
+// session key to navigate the standard OAuth authorize page flow, following redirects
+// through the consent/confirmation page until obtaining the authorization code.
+func (h *Handler) RequestAnthropicSessionKeyConsentToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	var payload struct {
+		SessionKey string `json:"session_key"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "session_key is required"})
+		return
+	}
+
+	sessionKey := strings.TrimSpace(payload.SessionKey)
+	if sessionKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "session_key is required"})
+		return
+	}
+
+	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	bundle, err := anthropicAuth.ExchangeSessionKeyViaOAuthPage(ctx, sessionKey)
+	if err != nil {
+		log.Errorf("Session key OAuth page exchange failed: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+	record := &coreauth.Auth{
+		ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+		Provider: "claude",
+		FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+		Storage:  tokenStorage,
+		Metadata: map[string]any{"email": tokenStorage.Email},
+	}
+	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	if errSave != nil {
+		log.Errorf("Failed to save authentication tokens: %v", errSave)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
+		return
+	}
+
+	fmt.Printf("Session key OAuth page authentication successful! Token saved to %s\n", savedPath)
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"saved_path": savedPath,
+		"email":      tokenStorage.Email,
+		"type":       "claude",
+	})
+}
+
+// RequestAnthropicSessionKeyBatchToken imports multiple Claude accounts by converting
+// a list of browser session keys into OAuth tokens concurrently.
+func (h *Handler) RequestAnthropicSessionKeyBatchToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	var payload struct {
+		SessionKeys []string `json:"session_keys"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "session_keys array is required"})
+		return
+	}
+
+	// Deduplicate and validate
+	seen := make(map[string]struct{})
+	var keys []string
+	for _, k := range payload.SessionKeys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if !strings.Contains(k, "sk-ant-sid") {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		keys = append(keys, k)
+	}
+
+	if len(keys) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "no valid session keys provided"})
+		return
+	}
+
+	type batchResult struct {
+		SessionKey string `json:"session_key"` // masked
+		Email      string `json:"email,omitempty"`
+		SavedPath  string `json:"saved_path,omitempty"`
+		Status     string `json:"status"` // "ok" or "error"
+		Error      string `json:"error,omitempty"`
+	}
+
+	results := make([]batchResult, len(keys))
+	var wg sync.WaitGroup
+
+	// Limit concurrency to avoid overwhelming upstream
+	sem := make(chan struct{}, 5)
+
+	for i, sk := range keys {
+		wg.Add(1)
+		go func(idx int, sessionKey string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			masked := sessionKey[:12] + "..." + sessionKey[len(sessionKey)-4:]
+
+			anthropicAuth := claude.NewClaudeAuth(h.cfg)
+			bundle, err := anthropicAuth.ExchangeSessionKeyForTokens(ctx, sessionKey)
+			if err != nil {
+				log.Errorf("Batch session key exchange failed for %s: %v", masked, err)
+				results[idx] = batchResult{SessionKey: masked, Status: "error", Error: err.Error()}
+				return
+			}
+
+			tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+			record := &coreauth.Auth{
+				ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+				Provider: "claude",
+				FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+				Storage:  tokenStorage,
+				Metadata: map[string]any{"email": tokenStorage.Email},
+			}
+			savedPath, errSave := h.saveTokenRecord(ctx, record)
+			if errSave != nil {
+				log.Errorf("Batch save failed for %s: %v", masked, errSave)
+				results[idx] = batchResult{SessionKey: masked, Status: "error", Error: "failed to save tokens"}
+				return
+			}
+
+			log.Infof("Batch session key import successful: %s -> %s", masked, tokenStorage.Email)
+			results[idx] = batchResult{
+				SessionKey: masked,
+				Email:      tokenStorage.Email,
+				SavedPath:  savedPath,
+				Status:     "ok",
+			}
+		}(i, sk)
+	}
+
+	wg.Wait()
+
+	succeeded := 0
+	failed := 0
+	for _, r := range results {
+		if r.Status == "ok" {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"total":     len(keys),
+		"succeeded": succeeded,
+		"failed":    failed,
+		"results":   results,
+	})
 }
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {

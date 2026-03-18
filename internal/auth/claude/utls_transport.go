@@ -160,3 +160,15 @@ func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
 		Transport: newUtlsRoundTripper(cfg),
 	}
 }
+
+// NewAnthropicHttpClientNoRedirect creates an HTTP client like NewAnthropicHttpClient
+// but does not follow redirects. The 302 response is returned directly so the caller
+// can inspect the Location header.
+func NewAnthropicHttpClientNoRedirect(cfg *config.SDKConfig) *http.Client {
+	return &http.Client{
+		Transport: newUtlsRoundTripper(cfg),
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}

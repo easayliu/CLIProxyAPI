@@ -631,6 +631,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
+		mgmt.POST("/anthropic-session-key", s.mgmt.RequestAnthropicSessionKeyToken)
+		mgmt.POST("/anthropic-session-key-consent", s.mgmt.RequestAnthropicSessionKeyConsentToken)
+		mgmt.POST("/anthropic-session-key-batch", s.mgmt.RequestAnthropicSessionKeyBatchToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
@@ -682,6 +685,7 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	c.File(filePath)
 }
+
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
 	if timeout <= 0 || onTimeout == nil {

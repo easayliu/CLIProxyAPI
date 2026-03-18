@@ -14,6 +14,9 @@ import (
 // ManagementTokenRequester exposes a limited subset of management endpoints for requesting tokens.
 type ManagementTokenRequester interface {
 	RequestAnthropicToken(*gin.Context)
+	RequestAnthropicSessionKeyToken(*gin.Context)
+	RequestAnthropicSessionKeyConsentToken(*gin.Context)
+	RequestAnthropicSessionKeyBatchToken(*gin.Context)
 	RequestGeminiCLIToken(*gin.Context)
 	RequestCodexToken(*gin.Context)
 	RequestAntigravityToken(*gin.Context)
@@ -38,6 +41,18 @@ func NewManagementTokenRequester(cfg *config.Config, manager *coreauth.Manager) 
 
 func (m *managementTokenRequester) RequestAnthropicToken(c *gin.Context) {
 	m.handler.RequestAnthropicToken(c)
+}
+
+func (m *managementTokenRequester) RequestAnthropicSessionKeyToken(c *gin.Context) {
+	m.handler.RequestAnthropicSessionKeyToken(c)
+}
+
+func (m *managementTokenRequester) RequestAnthropicSessionKeyConsentToken(c *gin.Context) {
+	m.handler.RequestAnthropicSessionKeyConsentToken(c)
+}
+
+func (m *managementTokenRequester) RequestAnthropicSessionKeyBatchToken(c *gin.Context) {
+	m.handler.RequestAnthropicSessionKeyBatchToken(c)
 }
 
 func (m *managementTokenRequester) RequestGeminiCLIToken(c *gin.Context) {

@@ -463,6 +463,50 @@ func normaliseTokenStats(tokens TokenStats) TokenStats {
 	return tokens
 }
 
+// SnapshotByAuthIndex aggregates usage statistics grouped by auth index
+// so that per-auth-file usage can be displayed in the management dashboard.
+func (s *RequestStatistics) SnapshotByAuthIndex() map[string]APISnapshot {
+	if s == nil {
+		return nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string]APISnapshot)
+	for _, stats := range s.apis {
+		if stats == nil {
+			continue
+		}
+		for modelName, ms := range stats.Models {
+			if ms == nil {
+				continue
+			}
+			for _, detail := range ms.Details {
+				authIdx := detail.AuthIndex
+				if authIdx == "" {
+					continue
+				}
+				snap, ok := result[authIdx]
+				if !ok {
+					snap = APISnapshot{Models: make(map[string]ModelSnapshot)}
+				}
+				snap.TotalRequests++
+				snap.TotalTokens += detail.Tokens.TotalTokens
+
+				modelSnap := snap.Models[modelName]
+				modelSnap.TotalRequests++
+				modelSnap.TotalTokens += detail.Tokens.TotalTokens
+				modelSnap.Details = append(modelSnap.Details, detail)
+				snap.Models[modelName] = modelSnap
+
+				result[authIdx] = snap
+			}
+		}
+	}
+	return result
+}
+
 func formatHour(hour int) string {
 	if hour < 0 {
 		hour = 0

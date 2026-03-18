@@ -6,7 +6,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -825,7 +824,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24"
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
@@ -865,7 +864,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
-	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
+	// Values below match Claude Code 2.1.78 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-18).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
@@ -884,7 +883,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if isClaudeCodeClient(clientUA) {
 		r.Header.Set("User-Agent", clientUA)
 	} else {
-		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.63 (external, cli)"))
+		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.78 (external, cli)"))
 	}
 	r.Header.Set("Connection", "keep-alive")
 	if stream {
@@ -929,7 +928,7 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithMode(payload, false)
+	return checkSystemInstructionsWithMode(payload, false, false)
 }
 
 func isClaudeOAuthToken(apiKey string) bool {
@@ -1206,36 +1205,77 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
+//
+// cc_version build hash (3-char) is derived from the first user message:
+//  1. Extract text of the first "user" role message (first text block if array)
+//  2. Take runes at positions 4, 7, 20 (default "0" if out of range)
+//  3. SHA-256(salt + chars + version), take first 3 hex chars
+//
+// cch is always "00000" (hardcoded static placeholder in v2.1.78 source).
 func generateBillingHeader(payload []byte) string {
-	// Generate a deterministic cch hash from the payload content (system + messages + tools).
-	// Real Claude Code uses a 5-char hex hash that varies per request.
-	h := sha256.Sum256(payload)
-	cch := hex.EncodeToString(h[:])[:5]
+	const salt = "59cf53e54c78"
+	const version = "2.1.78"
 
-	// Build hash: 3-char hex, matches the pattern seen in real requests (e.g. "a43")
-	buildBytes := make([]byte, 2)
-	_, _ = rand.Read(buildBytes)
-	buildHash := hex.EncodeToString(buildBytes)[:3]
+	// Extract text of the first user message from the messages array.
+	var firstUserText string
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() {
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			if msg.Get("role").String() != "user" {
+				return true
+			}
+			content := msg.Get("content")
+			if content.Type == gjson.String {
+				firstUserText = content.String()
+			} else if content.IsArray() {
+				content.ForEach(func(_, block gjson.Result) bool {
+					if block.Get("type").String() == "text" {
+						firstUserText = block.Get("text").String()
+						return false
+					}
+					return true
+				})
+			}
+			return false // stop at first user message
+		})
+	}
 
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=2.1.63.%s; cc_entrypoint=cli; cch=%s;", buildHash, cch)
+	// Take runes at positions 4, 7, 20 (default "0" if missing).
+	runes := []rune(firstUserText)
+	charAt := func(i int) string {
+		if i < len(runes) {
+			return string(runes[i])
+		}
+		return "0"
+	}
+	chars := charAt(4) + charAt(7) + charAt(20)
+
+	h := sha256.Sum256([]byte(salt + chars + version))
+	buildHash := hex.EncodeToString(h[:])[:3]
+
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", version, buildHash)
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:
 //
 //	system[0]: billing header (no cache_control)
-//	system[1]: agent identifier (no cache_control)
+//	system[1]: agent identifier (cache_control: ephemeral, +ttl if oauthMode)
 //	system[2..]: user system messages (cache_control added when missing)
-func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
+//
+// When oauthMode is true, cache_control blocks include ttl:"1h" to match the
+// real Claude Code CLI behaviour under OAuth + active quota (fQ/aFK logic).
+func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 
 	billingText := generateBillingHeader(payload)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
-	// No cache_control on the agent block. It is a cloaking artifact with zero cache
-	// value (the last system block is what actually triggers caching of all system content).
-	// Including any cache_control here creates an intra-system TTL ordering violation
-	// when the client's system blocks use ttl='1h' (prompt-caching-scope-2026-01-05 beta
-	// forbids 1h blocks after 5m blocks, and a no-TTL block defaults to 5m).
-	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}`
+
+	// Agent block matches real Claude Code v2.1.78 interactive mode system[1].
+	// In OAuth mode the real CLI adds ttl:"1h" via fQ when quota conditions are met.
+	agentBlock := `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral"}}`
+	if oauthMode {
+		agentBlock = `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"1h"}}`
+	}
 
 	if strictMode {
 		// Strict mode: billing header + agent identifier only
@@ -1255,12 +1295,12 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {
-				// Add cache_control to user system messages if not present.
-				// Do NOT add ttl — let it inherit the default (5m) to avoid
-				// TTL ordering violations with the prompt-caching-scope-2026-01-05 beta.
 				partJSON := part.Raw
 				if !part.Get("cache_control").Exists() {
 					partJSON, _ = sjson.Set(partJSON, "cache_control.type", "ephemeral")
+					if oauthMode {
+						partJSON, _ = sjson.Set(partJSON, "cache_control.ttl", "1h")
+					}
 				}
 				result += "," + partJSON
 			}
@@ -1268,6 +1308,9 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 		})
 	} else if system.Type == gjson.String && system.String() != "" {
 		partJSON := `{"type":"text","cache_control":{"type":"ephemeral"}}`
+		if oauthMode {
+			partJSON = `{"type":"text","cache_control":{"type":"ephemeral","ttl":"1h"}}`
+		}
 		partJSON, _ = sjson.Set(partJSON, "text", system.String())
 		result += "," + partJSON
 	}
@@ -1323,9 +1366,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		return payload
 	}
 
-	// Skip system instructions for claude-3-5-haiku models
+	// Skip system instructions for claude-3-5-haiku models.
+	// Cloaking always simulates an OAuth session (ttl:"1h" on cache_control).
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, strictMode)
+		payload = checkSystemInstructionsWithMode(payload, strictMode, true)
 	}
 
 	// Inject fake user ID

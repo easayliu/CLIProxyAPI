@@ -159,7 +159,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -322,7 +322,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg)
+	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, baseModel)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -489,7 +489,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -799,7 +799,13 @@ func mapStainlessArch() string {
 	}
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
+// modelSupports1MContext returns true if the model supports the context-1m beta.
+// Currently only claude-opus-4-6 variants support 1M context.
+func modelSupports1MContext(model string) bool {
+	return strings.Contains(model, "opus-4-6") || strings.Contains(model, "opus-4-6")
+}
+
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config, model string) {
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
 			return cfgVal
@@ -828,6 +834,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24"
+	if modelSupports1MContext(model) {
+		baseBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24"
+	}
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
@@ -867,7 +876,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
-	// Values below match Claude Code 2.1.78 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-18).
+	// Values below match Claude Code 2.1.79 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-19).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
@@ -886,19 +895,16 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if isClaudeCodeClient(clientUA) {
 		r.Header.Set("User-Agent", clientUA)
 	} else {
-		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.78 (external, cli)"))
+		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.79 (external, cli)"))
 	}
 	r.Header.Set("Connection", "keep-alive")
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-		// SSE streams must not be compressed: the downstream scanner reads
-		// line-delimited text and cannot parse compressed bytes.  Using
-		// "identity" tells the upstream to send an uncompressed stream.
-		r.Header.Set("Accept-Encoding", "identity")
-	} else {
-		r.Header.Set("Accept", "application/json")
-		r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	}
+	// Real Claude Code CLI 2.1.79 sends the same Accept and Accept-Encoding
+	// for both streaming and non-streaming requests.  The stream mode is
+	// controlled by the "stream" field in the JSON body, not by the Accept header.
+	// The response body is decompressed by decodeResponseBody before the SSE
+	// line scanner reads it, so compressed responses are handled correctly.
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	// Keep OS/Arch mapping dynamic (not configurable).
 	// They intentionally continue to derive from runtime.GOOS/runtime.GOARCH.
 	var attrs map[string]string
@@ -906,12 +912,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
-	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
-	// may override it with a user-configured value.  Compressed SSE breaks the line
-	// scanner regardless of user preference, so this is non-negotiable for streams.
-	if stream {
-		r.Header.Set("Accept-Encoding", "identity")
-	}
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1214,10 +1214,10 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 //  2. Take runes at positions 4, 7, 20 (default "0" if out of range)
 //  3. SHA-256(salt + chars + version), take first 3 hex chars
 //
-// cch is always "00000" (hardcoded static placeholder in v2.1.78 source).
+// cch is a 5-char hex hash derived from session-specific data (updated in v2.1.79).
 func generateBillingHeader(payload []byte) string {
 	const salt = "59cf53e54c78"
-	const version = "2.1.78"
+	const version = "2.1.79"
 
 	// Extract text of the first user message from the messages array.
 	var firstUserText string
@@ -1256,7 +1256,8 @@ func generateBillingHeader(payload []byte) string {
 	h := sha256.Sum256([]byte(salt + chars + version))
 	buildHash := hex.EncodeToString(h[:])[:3]
 
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", version, buildHash)
+	cch := generateCCH()
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:
@@ -1273,11 +1274,11 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 	billingText := generateBillingHeader(payload)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
-	// Agent block matches real Claude Code v2.1.78 interactive mode system[1].
+	// Agent block matches real Claude Code v2.1.79 interactive mode system[1].
 	// In OAuth mode the real CLI adds ttl:"1h" via fQ when quota conditions are met.
-	agentBlock := `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral"}}`
+	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral"}}`
 	if oauthMode {
-		agentBlock = `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"1h"}}`
+		agentBlock = `{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}`
 	}
 
 	if strictMode {

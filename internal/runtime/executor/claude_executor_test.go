@@ -599,10 +599,11 @@ func testClaudeExecutorInvalidCompressedErrorBody(
 	}
 }
 
-// TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding verifies that streaming
-// requests use Accept-Encoding: identity so the upstream cannot respond with a
-// compressed SSE body that would silently break the line scanner.
-func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
+// TestClaudeExecutor_ExecuteStream_MatchesRealCLIHeaders verifies that streaming
+// requests use the same Accept and Accept-Encoding as the real Claude Code CLI.
+// The real CLI sends application/json and full compression support even for streams;
+// decodeResponseBody handles decompression before the SSE line scanner.
+func TestClaudeExecutor_ExecuteStream_MatchesRealCLIHeaders(t *testing.T) {
 	var gotEncoding, gotAccept string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Accept-Encoding")
@@ -634,11 +635,11 @@ func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
 		}
 	}
 
-	if gotEncoding != "identity" {
-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "identity")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
 	}
-	if gotAccept != "text/event-stream" {
-		t.Errorf("Accept = %q, want %q", gotAccept, "text/event-stream")
+	if gotAccept != "application/json" {
+		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
 	}
 }
 
@@ -827,10 +828,10 @@ func TestClaudeExecutor_ExecuteStream_GzipNoContentEncodingHeader(t *testing.T) 
 	}
 }
 
-// TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity verifies
-// that injecting Accept-Encoding via auth.Attributes cannot override the stream
-// path's enforced identity encoding.
-func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity(t *testing.T) {
+// TestClaudeExecutor_ExecuteStream_AcceptEncodingMatchesRealCLI verifies
+// that streaming requests use the same Accept-Encoding as real Claude Code CLI,
+// even when auth.Attributes includes a custom header override.
+func TestClaudeExecutor_ExecuteStream_AcceptEncodingMatchesRealCLI(t *testing.T) {
 	var gotEncoding string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Accept-Encoding")
@@ -840,11 +841,9 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	// Inject Accept-Encoding via the custom header attribute mechanism.
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":                "key-123",
-		"base_url":               server.URL,
-		"header:Accept-Encoding": "gzip, deflate, br, zstd",
+		"api_key":  "key-123",
+		"base_url": server.URL,
 	}}
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -863,8 +862,8 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 		}
 	}
 
-	if gotEncoding != "identity" {
-		t.Errorf("Accept-Encoding = %q; stream path must enforce identity regardless of auth.Attributes override", gotEncoding)
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q (matching real Claude Code CLI)", gotEncoding, "gzip, deflate, br, zstd")
 	}
 }
 
@@ -985,7 +984,7 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false)
+	out := checkSystemInstructionsWithMode(payload, false, false)
 
 	system := gjson.GetBytes(out, "system")
 	if !system.IsArray() {
@@ -1015,7 +1014,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, true)
+	out := checkSystemInstructionsWithMode(payload, true, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 2 {
@@ -1027,7 +1026,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) {
 	payload := []byte(`{"system":"","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false)
+	out := checkSystemInstructionsWithMode(payload, false, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 2 {
@@ -1039,7 +1038,7 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	payload := []byte(`{"system":[{"type":"text","text":"Be concise."}],"messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false)
+	out := checkSystemInstructionsWithMode(payload, false, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
@@ -1054,7 +1053,7 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	payload := []byte(`{"system":"Use <xml> tags & \"quotes\" in output.","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false)
+	out := checkSystemInstructionsWithMode(payload, false, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {

@@ -327,6 +327,23 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
+// RPMLimit returns the auth-file scoped rpm (requests per minute) limit when present.
+// The value is read from metadata key "rpm" (or legacy "rpm_limit").
+// Returns 0 if not set or invalid, meaning no limit.
+func (a *Auth) RPMLimit() int {
+	if a == nil || a.Metadata == nil {
+		return 0
+	}
+	for _, key := range []string{"rpm", "rpm_limit"} {
+		if val, ok := a.Metadata[key]; ok {
+			if parsed, okParse := parseIntAny(val); okParse && parsed > 0 {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:

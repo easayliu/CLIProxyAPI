@@ -477,6 +477,10 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	// Expose rpm limit from Metadata for management dashboard display.
+	if rpm := auth.RPMLimit(); rpm > 0 {
+		entry["rpm"] = rpm
+	}
 	// Expose quota state so management dashboards can display it.
 	if auth.Quota.Exceeded || auth.Quota.Reason != "" || !auth.Quota.NextRecoverAt.IsZero() {
 		q := gin.H{"exceeded": auth.Quota.Exceeded}

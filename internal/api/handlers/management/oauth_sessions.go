@@ -23,10 +23,11 @@ var (
 )
 
 type oauthSession struct {
-	Provider  string
-	Status    string
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	Provider    string
+	Status      string
+	RedirectURI string
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
 }
 
 type oauthSessionStore struct {
@@ -53,7 +54,7 @@ func (s *oauthSessionStore) purgeExpiredLocked(now time.Time) {
 	}
 }
 
-func (s *oauthSessionStore) Register(state, provider string) {
+func (s *oauthSessionStore) Register(state, provider, redirectURI string) {
 	state = strings.TrimSpace(state)
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if state == "" || provider == "" {
@@ -66,10 +67,11 @@ func (s *oauthSessionStore) Register(state, provider string) {
 
 	s.purgeExpiredLocked(now)
 	s.sessions[state] = oauthSession{
-		Provider:  provider,
-		Status:    "",
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
+		Provider:    provider,
+		Status:      "",
+		RedirectURI: strings.TrimSpace(redirectURI),
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(s.ttl),
 	}
 }
 
@@ -168,7 +170,22 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 
 var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
 
-func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state, provider) }
+func RegisterOAuthSession(state, provider string, redirectURI ...string) {
+	uri := ""
+	if len(redirectURI) > 0 {
+		uri = redirectURI[0]
+	}
+	oauthSessions.Register(state, provider, uri)
+}
+
+// GetOAuthSessionRedirectURI returns the redirect URI stored for a given state.
+func GetOAuthSessionRedirectURI(state string) string {
+	session, ok := oauthSessions.Get(state)
+	if !ok {
+		return ""
+	}
+	return session.RedirectURI
+}
 
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
 

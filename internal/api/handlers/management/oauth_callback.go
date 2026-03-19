@@ -39,6 +39,17 @@ func (h *Handler) PostOAuthCallback(c *gin.Context) {
 	code := strings.TrimSpace(req.Code)
 	errMsg := strings.TrimSpace(req.Error)
 
+	// Handle "code#state" format from the official OAuth callback page.
+	// When the user copies the displayed code (which includes state after #),
+	// they may paste the entire string into the code field.
+	if strings.Contains(code, "#") {
+		parts := strings.SplitN(code, "#", 2)
+		code = strings.TrimSpace(parts[0])
+		if state == "" {
+			state = strings.TrimSpace(parts[1])
+		}
+	}
+
 	if rawRedirect := strings.TrimSpace(req.RedirectURL); rawRedirect != "" {
 		u, errParse := url.Parse(rawRedirect)
 		if errParse != nil {

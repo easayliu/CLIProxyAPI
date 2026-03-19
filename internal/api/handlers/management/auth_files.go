@@ -1153,38 +1153,21 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	// Initialize Claude auth service
 	anthropicAuth := claude.NewClaudeAuth(h.cfg)
 
-	// Generate authorization URL (then override redirect_uri to reuse server port)
-	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
+	// Always use the official redirect URI so the flow works for both local
+	// and remote deployments. The platform page displays "code#state" for the
+	// user to copy and submit via POST /v0/management/oauth-callback.
+	redirectURI := claude.OfficialRedirectURI
+
+	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes, redirectURI)
 	if err != nil {
 		log.Errorf("Failed to generate authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
 	}
 
-	RegisterOAuthSession(state, "anthropic")
-
-	isWebUI := isWebUIRequest(c)
-	var forwarder *callbackForwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/anthropic/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute anthropic callback target")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = startCallbackForwarder(anthropicCallbackPort, "anthropic", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start anthropic callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
-			return
-		}
-	}
+	RegisterOAuthSession(state, "anthropic", redirectURI)
 
 	go func() {
-		if isWebUI {
-			defer stopCallbackForwarderInstance(anthropicCallbackPort, forwarder)
-		}
-
 		// Helper: wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
 		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
@@ -1237,7 +1220,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		code := strings.Split(rawCode, "#")[0]
 
 		// Exchange code for tokens using internal auth service
-		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes, redirectURI)
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
@@ -1270,7 +1253,10 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		CompleteOAuthSessionsByProvider("anthropic")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	// needs_code tells the client that the user must manually submit the code
+	// via POST /v0/management/oauth-callback after copying it from the
+	// official callback page.
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "needs_code": true})
 }
 
 // RequestAnthropicSessionKeyToken imports a Claude account by converting a browser session key

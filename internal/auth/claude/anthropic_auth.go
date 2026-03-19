@@ -20,10 +20,11 @@ import (
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL     = "https://claude.ai/oauth/authorize"
-	TokenURL    = "https://platform.claude.com/v1/oauth/token"
-	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	RedirectURI = "http://localhost:54545/callback"
+	AuthURL             = "https://claude.ai/oauth/authorize"
+	TokenURL            = "https://platform.claude.com/v1/oauth/token"
+	ClientID            = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	RedirectURI         = "http://localhost:54545/callback"
+	OfficialRedirectURI = "https://platform.claude.com/oauth/code/callback"
 )
 
 // tokenResponse represents the response structure from Anthropic's OAuth token endpoint.
@@ -86,19 +87,30 @@ func NewClaudeAuth(cfg *config.Config, proxyURL ...string) *ClaudeAuth {
 //   - string: The complete authorization URL
 //   - string: The state parameter for verification
 //   - error: An error if PKCE codes are missing or URL generation fails
-func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string, string, error) {
+func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes, overrideRedirectURI ...string) (string, string, error) {
 	if pkceCodes == nil {
 		return "", "", fmt.Errorf("PKCE codes are required")
+	}
+
+	uri := RedirectURI
+	if len(overrideRedirectURI) > 0 && overrideRedirectURI[0] != "" {
+		uri = overrideRedirectURI[0]
 	}
 
 	params := url.Values{
 		"client_id":             {ClientID},
 		"response_type":         {"code"},
-		"redirect_uri":          {RedirectURI},
+		"redirect_uri":          {uri},
 		"scope":                 {"org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"},
 		"code_challenge":        {pkceCodes.CodeChallenge},
 		"code_challenge_method": {"S256"},
 		"state":                 {state},
+	}
+
+	// When using the official redirect URI, add code=true so the platform
+	// page displays the authorization code for the user to copy.
+	if uri == OfficialRedirectURI {
+		params.Set("code", "true")
 	}
 
 	authURL := fmt.Sprintf("%s?%s", AuthURL, params.Encode())
@@ -136,11 +148,16 @@ func (c *ClaudeAuth) parseCodeAndState(code string) (parsedCode, parsedState str
 // Returns:
 //   - *ClaudeAuthBundle: The complete authentication bundle with tokens
 //   - error: An error if token exchange fails
-func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state string, pkceCodes *PKCECodes) (*ClaudeAuthBundle, error) {
+func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state string, pkceCodes *PKCECodes, overrideRedirectURI ...string) (*ClaudeAuthBundle, error) {
 	if pkceCodes == nil {
 		return nil, fmt.Errorf("PKCE codes are required for token exchange")
 	}
 	newCode, newState := o.parseCodeAndState(code)
+
+	uri := RedirectURI
+	if len(overrideRedirectURI) > 0 && overrideRedirectURI[0] != "" {
+		uri = overrideRedirectURI[0]
+	}
 
 	// Prepare token exchange request
 	reqBody := map[string]interface{}{
@@ -148,7 +165,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		"state":         state,
 		"grant_type":    "authorization_code",
 		"client_id":     ClientID,
-		"redirect_uri":  RedirectURI,
+		"redirect_uri":  uri,
 		"code_verifier": pkceCodes.CodeVerifier,
 	}
 

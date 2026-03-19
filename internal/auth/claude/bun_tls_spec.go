@@ -53,7 +53,15 @@ func BunBoringSSLSpec() *tls.ClientHelloSpec {
 			&tls.SNIExtension{},
 
 			// 65037 - Encrypted Client Hello (BoringSSL-specific)
-			&tls.GenericExtension{Id: 65037},
+			// Use GREASEEncryptedClientHelloExtension to send a well-formed ECH
+			// outer extension. A bare GenericExtension{Id: 65037} sends an empty
+			// payload which causes "tls: error decoding message" on Cloudflare.
+			&tls.GREASEEncryptedClientHelloExtension{
+				CandidateCipherSuites: []tls.HPKESymmetricCipherSuite{
+					{KdfId: 0x0001, AeadId: 0x0001}, // HKDF-SHA256, AES-128-GCM
+				},
+				CandidatePayloadLens: []uint16{128},
+			},
 
 			// 23 - Extended Master Secret
 			&tls.ExtendedMasterSecretExtension{},

@@ -22,6 +22,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -1336,6 +1337,28 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 	return payload
 }
 
+// normalizeMaxTokensForCloaking ensures max_tokens matches the model's default value
+// when cloaking is active. Real Claude Code CLI always sends model-appropriate max_tokens
+// (e.g. 128000 for Opus 4.6, 64000 for Sonnet 4.6). A fixed value like 8192 across all
+// models is a detectable fingerprint. This function replaces missing or non-matching
+// max_tokens with the model's max_completion_tokens from the registry.
+func normalizeMaxTokensForCloaking(payload []byte, model string) []byte {
+	modelInfo := registry.LookupModelInfo(model, "claude")
+	if modelInfo == nil || modelInfo.MaxCompletionTokens <= 0 {
+		return payload
+	}
+	expected := modelInfo.MaxCompletionTokens
+	current := gjson.GetBytes(payload, "max_tokens")
+	if current.Exists() && int(current.Int()) == expected {
+		return payload
+	}
+	result, err := sjson.SetBytes(payload, "max_tokens", expected)
+	if err != nil {
+		return payload
+	}
+	return result
+}
+
 // applyCloaking applies cloaking transformations to the payload based on config and client.
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
 func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) []byte {
@@ -1381,6 +1404,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	if !shouldCloak(cloakMode, clientUserAgent) {
 		return payload
 	}
+
+	// Normalize max_tokens to match the model's default when cloaking is active.
+	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default
+	// (like 8192) for all models, which is a detectable fingerprint since real
+	// Claude Code CLI sends model-appropriate values (e.g. 128000 for Opus 4.6).
+	payload = normalizeMaxTokensForCloaking(payload, model)
 
 	// Skip system instructions for claude-3-5-haiku models.
 	// Cloaking always simulates an OAuth session (ttl:"1h" on cache_control).

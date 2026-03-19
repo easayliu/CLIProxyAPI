@@ -76,7 +76,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if proxyURL != "" {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
-			httpClient.Transport = wrapTransportWithFingerprint(transport)
+			httpClient.Transport = transport
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
@@ -86,11 +86,8 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 		httpClient.Transport = rt
-		return httpClient
 	}
 
-	// Default: direct connection with TLS fingerprint spoofing
-	httpClient.Transport = wrapTransportWithFingerprint(nil)
 	return httpClient
 }
 

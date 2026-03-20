@@ -1204,10 +1204,11 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.
 // When useCache is false, a new user ID is generated for every call.
-func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
+// realAccountUUID is the OAuth account UUID for maximum authenticity (may be empty).
+func injectFakeUserID(payload []byte, apiKey string, useCache bool, realAccountUUID string) []byte {
 	generateID := func() string {
 		if useCache {
-			return cachedUserID(apiKey)
+			return cachedUserID(apiKey, realAccountUUID)
 		}
 		return generateFakeUserID()
 	}
@@ -1490,8 +1491,14 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithMode(payload, true, true)
 	}
 
-	// Inject fake user ID
-	payload = injectFakeUserID(payload, apiKey, cacheUserID)
+	// Inject fake user ID, using real account UUID from OAuth if available.
+	realAccountUUID := ""
+	if auth != nil && auth.Metadata != nil {
+		if v, ok := auth.Metadata["account_uuid"].(string); ok {
+			realAccountUUID = v
+		}
+	}
+	payload = injectFakeUserID(payload, apiKey, cacheUserID, realAccountUUID)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {

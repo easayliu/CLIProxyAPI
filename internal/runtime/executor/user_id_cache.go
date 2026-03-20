@@ -108,16 +108,23 @@ func cachedSessionID(apiKey string) string {
 // cachedUserID builds a complete user_id with stable device_id/account_uuid
 // and a rotating session_id. This matches real Claude Code CLI behavior where
 // device_id and account_uuid are permanent, but session_id changes per CLI launch.
-func cachedUserID(apiKey string) string {
+// If realAccountUUID is provided (from OAuth token response), it is used instead
+// of the derived value for maximum authenticity.
+func cachedUserID(apiKey string, realAccountUUID string) string {
 	if apiKey == "" {
 		return generateFakeUserID()
 	}
 
 	sessionIDCacheCleanupOnce.Do(startSessionIDCacheCleanup)
 
+	accountUUID := deriveAccountUUID(apiKey)
+	if realAccountUUID != "" {
+		accountUUID = realAccountUUID
+	}
+
 	payload := userIDPayload{
 		DeviceID:    deriveDeviceID(apiKey),
-		AccountUUID: deriveAccountUUID(apiKey),
+		AccountUUID: accountUUID,
 		SessionID:   cachedSessionID(apiKey),
 	}
 	data, _ := json.Marshal(payload)

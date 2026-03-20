@@ -1461,6 +1461,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		cacheUserID = attrCache
 	}
 
+	// OAuth tokens always cloak: even real Claude Code CLI requests must be
+	// sanitized to prevent the upstream from correlating proxy users.
+	if cloakMode == "auto" && isClaudeOAuthToken(apiKey) {
+		cloakMode = "always"
+	}
+
 	// Determine if cloaking should be applied
 	if !shouldCloak(cloakMode, clientUserAgent) {
 		return payload

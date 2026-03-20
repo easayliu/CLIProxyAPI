@@ -1446,6 +1446,55 @@ func sanitizeContextManagementEdits(payload []byte) []byte {
 	return result
 }
 
+// stripInvalidThinkingSignatures removes ALL thinking blocks from assistant
+// messages during cloaking. The Claude API requires server-issued signatures on
+// thinking blocks in multi-turn conversations. When requests are proxied/forwarded,
+// signatures are always invalid (bound to the original session/account), regardless
+// of whether the signature field is present, empty, or populated with a stale value.
+// Removing thinking blocks is safe: the model regenerates its reasoning each turn.
+func stripInvalidThinkingSignatures(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	modified := false
+	result := payload
+
+	for i, msg := range messages.Array() {
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		// Remove all thinking blocks unconditionally: any signature from a
+		// proxied request is invalid for the upstream account/session.
+		var kept []interface{}
+		dropped := false
+		for _, block := range content.Array() {
+			if block.Get("type").String() == "thinking" {
+				dropped = true
+				continue
+			}
+			kept = append(kept, json.RawMessage(block.Raw))
+		}
+
+		if dropped {
+			modified = true
+			path := fmt.Sprintf("messages.%d.content", i)
+			result, _ = sjson.SetBytes(result, path, kept)
+		}
+	}
+
+	if !modified {
+		return payload
+	}
+	return result
+}
+
 // normalizeMaxTokensForCloaking ensures max_tokens matches the model's default value
 // when cloaking is active. Real Claude Code CLI always sends model-appropriate max_tokens
 // (e.g. 128000 for Opus 4.6, 64000 for Sonnet 4.6). A fixed value like 8192 across all
@@ -1529,6 +1578,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// the original CLI session. Non-CLI clients cannot have valid signatures,
 	// and forwarded requests will be rejected with 400 "signature: Field required".
 	payload, _ = sjson.DeleteBytes(payload, "context_management")
+
+	// Strip thinking blocks with invalid signatures from assistant messages.
+	// In multi-turn conversations, clients forward previous assistant thinking
+	// blocks with server-issued signatures. Forwarded/proxied requests carry
+	// stale or missing signatures, causing 400 "Invalid signature in thinking block".
+	payload = stripInvalidThinkingSignatures(payload)
 
 	// Normalize max_tokens to match the model's default when cloaking is active.
 	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default

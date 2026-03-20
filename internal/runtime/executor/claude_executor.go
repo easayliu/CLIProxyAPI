@@ -1735,12 +1735,22 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithMode(payload, true, true)
 	}
 
-	// Inject the full Claude Code CLI system prompt as system[2].
-	// Real CLI always sends: system[0]=billing, system[1]=agent, system[2]=full prompt.
-	// Without this block, the request is detectable as non-CLI even with correct headers.
+	// Inject the full Claude Code CLI system prompt as system[2] and migrate
+	// any extra system messages into the first user message as <system-reminder>.
+	// Real CLI always sends exactly 3 system blocks; extra blocks are a fingerprint.
 	oauthMode := isClaudeOAuthToken(apiKey)
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = injectCLISystemPrompt(payload, model, oauthMode, strictMode)
+		payload = injectCLISystemPrompt(payload, model, oauthMode)
+	}
+
+	// Inject thinking and output_config to match real CLI defaults.
+	// Real Claude Code CLI always sends thinking:{type:"adaptive"} and
+	// output_config:{effort:"medium"}. Missing fields are a fingerprint.
+	if !gjson.GetBytes(payload, "thinking").Exists() {
+		payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
+	}
+	if !gjson.GetBytes(payload, "output_config").Exists() {
+		payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
 	}
 
 	// Inject fake user ID, using real device_id and account_uuid from OAuth if available.

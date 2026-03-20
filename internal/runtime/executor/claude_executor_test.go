@@ -1120,9 +1120,9 @@ func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
 
 func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 	// Simulate a payload with billing + agent blocks already injected
-	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
-	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true, false)
+	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
@@ -1145,14 +1145,33 @@ func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 	}
 }
 
-func TestInjectCLISystemPrompt_StrictModeDropsUserMessages(t *testing.T) {
-	payload := []byte(`{"system":[{"type":"text","text":"billing"},{"type":"text","text":"agent"},{"type":"text","text":"user custom prompt"}],"messages":[{"role":"user","content":"hi"}]}`)
+func TestInjectCLISystemPrompt_MigratesExtraToUserMessage(t *testing.T) {
+	// Payload with billing + agent + extra user system message
+	payload := []byte(`{"system":[{"type":"text","text":"billing"},{"type":"text","text":"agent"},{"type":"text","text":"You are a helpful assistant."}],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
 
-	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", false, true)
+	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", false)
 
+	// System should have exactly 3 blocks
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
-		t.Fatalf("strict mode should have exactly 3 blocks (billing + agent + CLI prompt), got %d", len(blocks))
+		t.Fatalf("expected exactly 3 system blocks, got %d", len(blocks))
+	}
+
+	// The extra system message should be in the first user message content
+	userContent := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(userContent) != 2 {
+		t.Fatalf("expected 2 content blocks in first user message (reminder + original), got %d", len(userContent))
+	}
+	reminderText := userContent[0].Get("text").String()
+	if !strings.Contains(reminderText, "You are a helpful assistant.") {
+		t.Fatalf("migrated text should contain original system message, got: %s", reminderText)
+	}
+	if !strings.Contains(reminderText, "<system-reminder>") {
+		t.Fatalf("migrated text should be wrapped in system-reminder tags")
+	}
+	// Original user text should still be there
+	if userContent[1].Get("text").String() != "hello" {
+		t.Fatalf("original user content should be preserved")
 	}
 }
 

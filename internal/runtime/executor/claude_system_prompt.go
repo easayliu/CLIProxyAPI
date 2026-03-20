@@ -2,6 +2,9 @@ package executor
 
 import (
 	_ "embed"
+	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -41,11 +44,14 @@ func buildCLISystemPrompt(model string) string {
 }
 
 // injectCLISystemPrompt inserts the Claude Code CLI system prompt as system[2]
-// during cloaking. This makes the request indistinguishable from a real CLI request
-// which always includes the full system prompt after the billing and agent blocks.
-// In strict mode, only the CLI system prompt is kept (user system messages are dropped).
-// In non-strict mode, the CLI system prompt is prepended before any user messages.
-func injectCLISystemPrompt(payload []byte, model string, oauthMode, strictMode bool) []byte {
+// and migrates any extra system messages into the first user message content.
+// Real Claude Code CLI always sends exactly 3 system blocks: billing, agent, and
+// the full CLI system prompt. Any additional system messages from the client would
+// be a detectable fingerprint. To preserve the client's custom instructions without
+// breaking cloaking, extra system messages are wrapped in <system-reminder> tags
+// and prepended to the first user message's content, matching how the real CLI
+// handles CLAUDE.md and other injected context.
+func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 	if !system.Exists() || !system.IsArray() {
 		return payload
@@ -66,23 +72,81 @@ func injectCLISystemPrompt(payload []byte, model string, oauthMode, strictMode b
 	// Use sjson to safely set the text field (handles JSON escaping)
 	cliBlockJSON, _ := sjson.Set(cliBlock+"}", "text", promptText)
 
-	// Rebuild system array: [billing, agent, cli-prompt, ...user-messages]
+	// Collect extra system messages (beyond billing + agent) for migration
+	var extraTexts []string
+	for i := 2; i < len(blocks); i++ {
+		text := blocks[i].Get("text").String()
+		if text != "" {
+			extraTexts = append(extraTexts, text)
+		}
+	}
+
+	// Rebuild system array: exactly 3 blocks (matching real CLI)
 	billingBlock := blocks[0].Raw
 	agentBlock := blocks[1].Raw
+	result := "[" + billingBlock + "," + agentBlock + "," + cliBlockJSON + "]"
+	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 
-	if strictMode {
-		// Strict mode: only billing + agent + CLI prompt
-		result := "[" + billingBlock + "," + agentBlock + "," + cliBlockJSON + "]"
-		payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
+	// Migrate extra system messages into the first user message content
+	if len(extraTexts) > 0 {
+		payload = migrateSystemToUserMessage(payload, extraTexts)
+	}
+
+	return payload
+}
+
+// migrateSystemToUserMessage prepends extra system messages to the first user
+// message's content array, wrapped in <system-reminder> tags to match real CLI behavior.
+func migrateSystemToUserMessage(payload []byte, texts []string) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
 		return payload
 	}
 
-	// Non-strict mode: billing + agent + CLI prompt + existing user messages
-	result := "[" + billingBlock + "," + agentBlock + "," + cliBlockJSON
-	for i := 2; i < len(blocks); i++ {
-		result += "," + blocks[i].Raw
+	// Find the first user message
+	for i, msg := range messages.Array() {
+		if msg.Get("role").String() != "user" {
+			continue
+		}
+		content := msg.Get("content")
+
+		// Build reminder text block
+		var combined string
+		for _, t := range texts {
+			// Skip if already wrapped in system-reminder
+			if strings.Contains(t, "<system-reminder>") {
+				combined += t + "\n"
+			} else {
+				combined += "<system-reminder>\n" + t + "\n</system-reminder>\n"
+			}
+		}
+
+		reminderBlock := map[string]string{
+			"type": "text",
+			"text": combined,
+		}
+		reminderJSON, _ := json.Marshal(reminderBlock)
+
+		if content.IsArray() {
+			// Prepend to existing content array
+			var newContent []interface{}
+			newContent = append(newContent, json.RawMessage(reminderJSON))
+			for _, block := range content.Array() {
+				newContent = append(newContent, json.RawMessage(block.Raw))
+			}
+			path := fmt.Sprintf("messages.%d.content", i)
+			payload, _ = sjson.SetBytes(payload, path, newContent)
+		} else if content.Type == gjson.String {
+			// Convert string content to array with reminder prepended
+			var newContent []interface{}
+			newContent = append(newContent, json.RawMessage(reminderJSON))
+			textBlock := fmt.Sprintf(`{"type":"text","text":%s}`, strconv.Quote(content.String()))
+			newContent = append(newContent, json.RawMessage(textBlock))
+			path := fmt.Sprintf("messages.%d.content", i)
+			payload, _ = sjson.SetBytes(payload, path, newContent)
+		}
+		break // only prepend to first user message
 	}
-	result += "]"
-	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
+
 	return payload
 }

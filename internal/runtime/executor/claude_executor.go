@@ -136,6 +136,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		body = checkSystemInstructionsWithMode(body, false, oauthMode)
 	}
 
+	// Sanitize context_management.edits: remove unsupported edit types before
+	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
+	body = sanitizeContextManagementEdits(body)
+
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
@@ -314,6 +318,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		oauthMode := isClaudeOAuthToken(apiKey)
 		body = checkSystemInstructionsWithMode(body, false, oauthMode)
 	}
+
+	// Sanitize context_management.edits: remove unsupported edit types before
+	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
+	body = sanitizeContextManagementEdits(body)
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
@@ -1395,6 +1403,46 @@ func stripNonStandardFields(payload []byte) []byte {
 			result, _ = sjson.SetBytes(result, "metadata.user_id", userID)
 		}
 	}
+	return result
+}
+
+// sanitizeContextManagementEdits validates context_management.edits entries.
+// Each edit requires a server-issued "signature" field; entries without a valid
+// signature will be rejected with 400 by the Claude API. Edits with unsupported
+// type tags are also removed. If no valid edits remain, the entire
+// context_management field is deleted.
+func sanitizeContextManagementEdits(payload []byte) []byte {
+	cm := gjson.GetBytes(payload, "context_management")
+	if !cm.Exists() {
+		return payload
+	}
+
+	edits := cm.Get("edits")
+	if !edits.Exists() || !edits.IsArray() {
+		return payload
+	}
+
+	var kept []interface{}
+	edits.ForEach(func(_, val gjson.Result) bool {
+		// Each edit must have a signature from the server
+		if val.Get("signature").String() == "" {
+			return true // skip: missing signature → API will reject
+		}
+		kept = append(kept, json.RawMessage(val.Raw))
+		return true
+	})
+
+	if len(kept) == len(edits.Array()) {
+		return payload // nothing filtered
+	}
+
+	if len(kept) == 0 {
+		// Remove context_management entirely if no valid edits remain
+		result, _ := sjson.DeleteBytes(payload, "context_management")
+		return result
+	}
+
+	result, _ := sjson.SetBytes(payload, "context_management.edits", kept)
 	return result
 }
 

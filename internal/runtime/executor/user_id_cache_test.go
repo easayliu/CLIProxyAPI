@@ -1,61 +1,55 @@
 package executor
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"testing"
-	"time"
 )
 
-func resetSessionIDCache() {
-	sessionIDCacheMu.Lock()
-	sessionIDCache = make(map[string]sessionIDCacheEntry)
-	sessionIDCacheMu.Unlock()
+func resetSessionPool() {
+	sessionPoolsMu.Lock()
+	sessionPools = make(map[string]*sessionPool)
+	sessionPoolsMu.Unlock()
 }
 
-func sessionCacheKey(apiKey string) string {
-	key := sha256.Sum256([]byte("session:" + apiKey))
-	return hex.EncodeToString(key[:])
-}
-
-func TestCachedUserID_ReusesWithinTTL(t *testing.T) {
-	resetSessionIDCache()
+func TestCachedUserID_ReusesWithinPool(t *testing.T) {
+	resetSessionPool()
 
 	first := cachedUserID("api-key-1", "", "")
-	second := cachedUserID("api-key-1", "", "")
-
 	if first == "" {
 		t.Fatal("expected generated user_id to be non-empty")
 	}
-	if first != second {
-		t.Fatalf("expected cached user_id to be reused, got %q and %q", first, second)
+
+	// Multiple calls should produce valid user_ids (may differ due to pool rotation)
+	for i := 0; i < 5; i++ {
+		id := cachedUserID("api-key-1", "", "")
+		if id == "" {
+			t.Fatalf("iteration %d: expected non-empty user_id", i)
+		}
 	}
 }
 
-func TestCachedUserID_ExpiresAfterTTL(t *testing.T) {
-	resetSessionIDCache()
+func TestCachedUserID_PoolUsesMultipleSessions(t *testing.T) {
+	resetSessionPool()
 
-	expiredID := cachedUserID("api-key-expired", "", "")
-	cacheKey := sessionCacheKey("api-key-expired")
-	sessionIDCacheMu.Lock()
-	sessionIDCache[cacheKey] = sessionIDCacheEntry{
-		sessionID: "",
-		expire:    time.Now().Add(-time.Minute),
+	seen := make(map[string]bool)
+	// With 2-4 pool slots, after enough requests we should see multiple session_ids.
+	for i := 0; i < 100; i++ {
+		id := cachedUserID("api-key-multi", "", "")
+		sid := extractSessionID(id)
+		if sid == "" {
+			t.Fatalf("iteration %d: empty session_id", i)
+		}
+		seen[sid] = true
 	}
-	sessionIDCacheMu.Unlock()
 
-	newID := cachedUserID("api-key-expired", "", "")
-	if newID == expiredID {
-		t.Fatalf("expected expired session to produce different user_id, got %q", newID)
+	if len(seen) < 2 {
+		t.Fatalf("expected multiple session_ids from pool, got %d unique", len(seen))
 	}
-	if newID == "" {
-		t.Fatal("expected regenerated user_id to be non-empty")
-	}
+	t.Logf("saw %d unique session_ids across 100 requests", len(seen))
 }
 
 func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
-	resetSessionIDCache()
+	resetSessionPool()
 
 	first := cachedUserID("api-key-1", "", "")
 	second := cachedUserID("api-key-2", "", "")
@@ -65,36 +59,33 @@ func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
 	}
 }
 
-func TestCachedUserID_RenewsTTLOnHit(t *testing.T) {
-	resetSessionIDCache()
+func TestCachedUserID_StableDeviceAndAccount(t *testing.T) {
+	resetSessionPool()
 
-	key := "api-key-renew"
-	id := cachedUserID(key, "", "")
-	cacheKey := sessionCacheKey(key)
-
-	soon := time.Now()
-	sessionIDCacheMu.Lock()
-	sessionIDCache[cacheKey] = sessionIDCacheEntry{
-		sessionID: extractSessionID(id),
-		expire:    soon.Add(2 * time.Second),
-	}
-	sessionIDCacheMu.Unlock()
-
-	if refreshed := cachedUserID(key, "", ""); refreshed != id {
-		t.Fatalf("expected cached user_id to be reused before expiry, got %q", refreshed)
+	// device_id and account_uuid should be stable across calls for the same API key.
+	var deviceIDs, accountIDs []string
+	for i := 0; i < 10; i++ {
+		id := cachedUserID("api-key-stable", "", "")
+		var p userIDPayload
+		if err := json.Unmarshal([]byte(id), &p); err != nil {
+			t.Fatalf("failed to parse user_id: %v", err)
+		}
+		deviceIDs = append(deviceIDs, p.DeviceID)
+		accountIDs = append(accountIDs, p.AccountUUID)
 	}
 
-	sessionIDCacheMu.RLock()
-	entry := sessionIDCache[cacheKey]
-	sessionIDCacheMu.RUnlock()
-
-	if entry.expire.Sub(soon) < 30*time.Minute {
-		t.Fatalf("expected TTL to renew, got %v remaining", entry.expire.Sub(soon))
+	for i := 1; i < len(deviceIDs); i++ {
+		if deviceIDs[i] != deviceIDs[0] {
+			t.Fatalf("device_id changed: %q vs %q", deviceIDs[0], deviceIDs[i])
+		}
+		if accountIDs[i] != accountIDs[0] {
+			t.Fatalf("account_uuid changed: %q vs %q", accountIDs[0], accountIDs[i])
+		}
 	}
 }
 
 func TestCachedUserID_UsesRealDeviceID(t *testing.T) {
-	resetSessionIDCache()
+	resetSessionPool()
 
 	realDevice := "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd"
 	id := cachedUserID("api-key-real", realDevice, "")
@@ -109,7 +100,7 @@ func TestCachedUserID_UsesRealDeviceID(t *testing.T) {
 }
 
 func TestCachedUserID_UsesRealAccountUUID(t *testing.T) {
-	resetSessionIDCache()
+	resetSessionPool()
 
 	realAccount := "12345678-1234-1234-1234-123456789abc"
 	id := cachedUserID("api-key-real", "", realAccount)

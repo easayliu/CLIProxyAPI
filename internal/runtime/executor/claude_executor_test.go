@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -212,7 +213,7 @@ func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
 }
 
 func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
-	resetSessionIDCache()
+	resetSessionPool()
 
 	var userIDs []string
 	var requestModels []string
@@ -280,7 +281,7 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 }
 
 func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
-	resetSessionIDCache()
+	resetSessionPool()
 
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -316,10 +317,20 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	if userIDs[0] == "" || userIDs[1] == "" {
 		t.Fatal("expected user_id to be populated")
 	}
-	// With cacheUserID defaulting to true, the same apiKey should produce the same
-	// device_id/account_uuid/session_id within the TTL window.
-	if userIDs[0] != userIDs[1] {
-		t.Fatalf("expected user_id to be stable with default caching, got %q and %q", userIDs[0], userIDs[1])
+	// With cacheUserID defaulting to true, the same apiKey should produce stable
+	// device_id and account_uuid. session_id may differ due to session pool rotation.
+	var p0, p1 userIDPayload
+	if err := json.Unmarshal([]byte(userIDs[0]), &p0); err != nil {
+		t.Fatalf("failed to parse user_id[0]: %v", err)
+	}
+	if err := json.Unmarshal([]byte(userIDs[1]), &p1); err != nil {
+		t.Fatalf("failed to parse user_id[1]: %v", err)
+	}
+	if p0.DeviceID != p1.DeviceID {
+		t.Fatalf("expected stable device_id, got %q and %q", p0.DeviceID, p1.DeviceID)
+	}
+	if p0.AccountUUID != p1.AccountUUID {
+		t.Fatalf("expected stable account_uuid, got %q and %q", p0.AccountUUID, p1.AccountUUID)
 	}
 	if !isValidUserID(userIDs[0]) || !isValidUserID(userIDs[1]) {
 		t.Fatalf("user_ids should be valid, got %q and %q", userIDs[0], userIDs[1])

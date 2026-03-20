@@ -1524,6 +1524,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// upstream proxies from injecting identifiable fields into the request body.
 	payload = stripNonStandardFields(payload)
 
+	// Remove context_management entirely during cloaking. This field contains
+	// server-signed edits (compact, clear_tool_uses) that are only valid for
+	// the original CLI session. Non-CLI clients cannot have valid signatures,
+	// and forwarded requests will be rejected with 400 "signature: Field required".
+	payload, _ = sjson.DeleteBytes(payload, "context_management")
+
 	// Normalize max_tokens to match the model's default when cloaking is active.
 	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default
 	// (like 8192) for all models, which is a detectable fingerprint since real

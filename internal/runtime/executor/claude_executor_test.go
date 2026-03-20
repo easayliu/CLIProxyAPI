@@ -1065,3 +1065,140 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 		t.Fatalf("blocks[2] text mangled, got %q", blocks[2].Get("text").String())
 	}
 }
+
+// --- context_management sanitization tests ---
+
+func TestSanitizeContextManagementEdits_NoContextManagement(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`)
+	out := sanitizeContextManagementEdits(payload)
+	if string(out) != string(payload) {
+		t.Fatalf("payload without context_management should be unchanged")
+	}
+}
+
+func TestSanitizeContextManagementEdits_AllEditsHaveSignature(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","context_management":{"edits":[{"type":"compact_20260112","signature":"abc123"}]},"messages":[{"role":"user","content":"hi"}]}`)
+	out := sanitizeContextManagementEdits(payload)
+	if !gjson.GetBytes(out, "context_management.edits").Exists() {
+		t.Fatal("edits with valid signatures should be preserved")
+	}
+	if len(gjson.GetBytes(out, "context_management.edits").Array()) != 1 {
+		t.Fatal("expected 1 edit to remain")
+	}
+}
+
+func TestSanitizeContextManagementEdits_RemovesEditsWithoutSignature(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","context_management":{"edits":[{"type":"clear_thinking_20251015"},{"type":"compact_20260112","signature":"valid"}]},"messages":[{"role":"user","content":"hi"}]}`)
+	out := sanitizeContextManagementEdits(payload)
+	edits := gjson.GetBytes(out, "context_management.edits").Array()
+	if len(edits) != 1 {
+		t.Fatalf("expected 1 edit after filtering, got %d", len(edits))
+	}
+	if edits[0].Get("type").String() != "compact_20260112" {
+		t.Fatalf("remaining edit type = %q, want compact_20260112", edits[0].Get("type").String())
+	}
+}
+
+func TestSanitizeContextManagementEdits_RemovesEntireFieldWhenAllInvalid(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","context_management":{"edits":[{"type":"clear_thinking_20251015"},{"type":"unknown_type"}]},"messages":[{"role":"user","content":"hi"}]}`)
+	out := sanitizeContextManagementEdits(payload)
+	if gjson.GetBytes(out, "context_management").Exists() {
+		t.Fatal("context_management should be removed when all edits lack signatures")
+	}
+}
+
+func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","context_management":{"edits":[]},"messages":[{"role":"user","content":"hi"}]}`)
+	out := sanitizeContextManagementEdits(payload)
+	// Empty array = nothing to filter, should pass through unchanged
+	if string(out) != string(payload) {
+		t.Fatal("empty edits array should be unchanged")
+	}
+}
+
+// TestCloaking_StripsContextManagement verifies that when cloaking is active
+// (non-claude-cli client), context_management is completely removed from the
+// request body sent to upstream. This prevents 400 errors caused by missing
+// server-issued signatures.
+func TestCloaking_StripsContextManagement(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-api03-test-key",
+		"base_url": server.URL,
+	}}
+
+	// Payload with context_management containing edits (some with signature, some without)
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"server-sig"},{"type":"clear_thinking_20251015"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	// context.Background() has no gin context → getClientUserAgent returns ""
+	// → shouldCloak("auto", "") returns true → cloaking is active
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if len(receivedBody) == 0 {
+		t.Fatal("expected upstream to receive a request body")
+	}
+
+	if gjson.GetBytes(receivedBody, "context_management").Exists() {
+		t.Fatalf("context_management should be stripped during cloaking, but found in upstream body: %s", string(receivedBody))
+	}
+}
+
+// TestCloaking_StripsContextManagement_Stream verifies the same for streaming requests.
+func TestCloaking_StripsContextManagement_Stream(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-api03-test-key",
+		"base_url": server.URL,
+	}}
+
+	payload := []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("chunk error: %v", chunk.Err)
+		}
+	}
+
+	if len(receivedBody) == 0 {
+		t.Fatal("expected upstream to receive a request body")
+	}
+
+	if gjson.GetBytes(receivedBody, "context_management").Exists() {
+		t.Fatalf("context_management should be stripped during cloaking in stream mode, but found: %s", string(receivedBody))
+	}
+}

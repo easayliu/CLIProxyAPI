@@ -1116,6 +1116,114 @@ func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
 	}
 }
 
+// --- tool_use/tool_result pairing repair tests ---
+
+func TestRepairToolUsePairing_NothingToRepair(t *testing.T) {
+	// Normal conversation with proper pairing
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hi"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"foo","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"done"}]},
+		{"role":"assistant","content":[{"type":"text","text":"ok"}]}
+	]}`)
+	out := repairToolUsePairing(payload)
+	// Should be unchanged
+	if gjson.GetBytes(out, "messages").Array()[2].Get("content").Array()[0].Get("tool_use_id").String() != "tu_1" {
+		t.Fatal("expected original pairing to be preserved")
+	}
+}
+
+func TestRepairToolUsePairing_OrphanedToolUseInjectStub(t *testing.T) {
+	// Assistant has tool_use but next user message lacks tool_result
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hi"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"tu_orphan","name":"foo","input":{}}]},
+		{"role":"user","content":[{"type":"text","text":"continue"}]},
+		{"role":"assistant","content":[{"type":"text","text":"ok"}]}
+	]}`)
+	out := repairToolUsePairing(payload)
+	// The user message at index 2 should now contain a tool_result stub
+	userContent := gjson.GetBytes(out, "messages.2.content").Array()
+	found := false
+	for _, block := range userContent {
+		if block.Get("type").String() == "tool_result" && block.Get("tool_use_id").String() == "tu_orphan" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected stub tool_result for tu_orphan in user message, got: %s", gjson.GetBytes(out, "messages.2.content").Raw)
+	}
+}
+
+func TestRepairToolUsePairing_OrphanedToolUseAtEnd(t *testing.T) {
+	// Last message is assistant with tool_use, no following message
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hi"}]},
+		{"role":"assistant","content":[{"type":"text","text":"let me check"},{"type":"tool_use","id":"tu_end","name":"foo","input":{}}]}
+	]}`)
+	out := repairToolUsePairing(payload)
+	// tool_use should be removed, text should remain
+	assistantContent := gjson.GetBytes(out, "messages.1.content").Array()
+	for _, block := range assistantContent {
+		if block.Get("type").String() == "tool_use" {
+			t.Fatalf("orphaned tool_use at end should be removed, found: %s", block.Raw)
+		}
+	}
+	if len(assistantContent) != 1 || assistantContent[0].Get("type").String() != "text" {
+		t.Fatalf("expected only text block to remain, got: %s", gjson.GetBytes(out, "messages.1.content").Raw)
+	}
+}
+
+func TestRepairToolUsePairing_MultipleOrphans(t *testing.T) {
+	// Two tool_use blocks, only one has matching tool_result
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hi"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"foo","input":{}},{"type":"tool_use","id":"tu_2","name":"bar","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"done"}]},
+		{"role":"assistant","content":[{"type":"text","text":"ok"}]}
+	]}`)
+	out := repairToolUsePairing(payload)
+	userContent := gjson.GetBytes(out, "messages.2.content").Array()
+	hasOriginal := false
+	hasStub := false
+	for _, block := range userContent {
+		if block.Get("type").String() == "tool_result" {
+			id := block.Get("tool_use_id").String()
+			if id == "tu_1" {
+				hasOriginal = true
+			}
+			if id == "tu_2" {
+				hasStub = true
+			}
+		}
+	}
+	if !hasOriginal || !hasStub {
+		t.Fatalf("expected both tu_1 (original) and tu_2 (stub) tool_results, got: %s", gjson.GetBytes(out, "messages.2.content").Raw)
+	}
+}
+
+func TestRepairToolUsePairing_NextMessageNotUser(t *testing.T) {
+	// tool_use followed by another assistant message (unusual but possible in truncated convos)
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hi"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"tu_x","name":"foo","input":{}}]},
+		{"role":"assistant","content":[{"type":"text","text":"oops"}]}
+	]}`)
+	out := repairToolUsePairing(payload)
+	msgs := gjson.GetBytes(out, "messages").Array()
+	// Should have inserted a user message between the two assistants
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages after inserting stub, got %d", len(msgs))
+	}
+	if msgs[2].Get("role").String() != "user" {
+		t.Fatalf("inserted message should be user role, got %q", msgs[2].Get("role").String())
+	}
+	stubContent := msgs[2].Get("content").Array()
+	if len(stubContent) != 1 || stubContent[0].Get("tool_use_id").String() != "tu_x" {
+		t.Fatalf("inserted user message should contain tool_result for tu_x, got: %s", msgs[2].Get("content").Raw)
+	}
+}
+
 // --- thinking signature sanitization tests ---
 
 func TestStripInvalidThinkingSignatures_NoMessages(t *testing.T) {

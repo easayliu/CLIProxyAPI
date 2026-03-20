@@ -140,6 +140,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
 	body = sanitizeContextManagementEdits(body)
 
+	// Repair tool_use/tool_result pairing: inject stub tool_result for any
+	// orphaned tool_use blocks. Clients may forward truncated conversations.
+	body = repairToolUsePairing(body)
+
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
@@ -322,6 +326,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
 	body = sanitizeContextManagementEdits(body)
+
+	// Repair tool_use/tool_result pairing: inject stub tool_result for any
+	// orphaned tool_use blocks. Clients may forward truncated conversations.
+	body = repairToolUsePairing(body)
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
@@ -1443,6 +1451,135 @@ func sanitizeContextManagementEdits(payload []byte) []byte {
 	}
 
 	result, _ := sjson.SetBytes(payload, "context_management.edits", kept)
+	return result
+}
+
+// repairToolUsePairing ensures every tool_use block in an assistant message has
+// a corresponding tool_result in the immediately following user message.
+// The Claude API requires strict pairing: each tool_use must be answered by a
+// tool_result with the same id. Clients may forward truncated conversations
+// (e.g. context window management) that break this invariant, causing 400 errors.
+// This function injects stub tool_result blocks for any orphaned tool_use ids.
+func repairToolUsePairing(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	msgArr := messages.Array()
+	modified := false
+	result := payload
+
+	for i := 0; i < len(msgArr); i++ {
+		msg := msgArr[i]
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+
+		// Collect tool_use ids from this assistant message
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		var toolUseIDs []string
+		for _, block := range content.Array() {
+			if block.Get("type").String() == "tool_use" {
+				if id := block.Get("id").String(); id != "" {
+					toolUseIDs = append(toolUseIDs, id)
+				}
+			}
+		}
+		if len(toolUseIDs) == 0 {
+			continue
+		}
+
+		// Check the next message for matching tool_result blocks
+		nextIdx := i + 1
+		if nextIdx >= len(msgArr) {
+			// No next message at all: remove orphaned tool_use blocks from
+			// the assistant message (last message in conversation).
+			var kept []interface{}
+			for _, block := range content.Array() {
+				if block.Get("type").String() == "tool_use" {
+					continue
+				}
+				kept = append(kept, json.RawMessage(block.Raw))
+			}
+			if len(kept) == 0 {
+				// If the entire assistant message was tool_use blocks, replace with
+				// a minimal text block to avoid an empty content array.
+				kept = append(kept, json.RawMessage(`{"type":"text","text":""}`))
+			}
+			modified = true
+			path := fmt.Sprintf("messages.%d.content", i)
+			result, _ = sjson.SetBytes(result, path, kept)
+			// Re-parse messages after modification
+			msgArr = gjson.GetBytes(result, "messages").Array()
+			continue
+		}
+
+		nextMsg := msgArr[nextIdx]
+
+		// Build set of tool_result ids in the next message
+		answeredIDs := make(map[string]bool)
+		nextContent := nextMsg.Get("content")
+		if nextContent.Exists() && nextContent.IsArray() {
+			for _, block := range nextContent.Array() {
+				if block.Get("type").String() == "tool_result" {
+					if id := block.Get("tool_use_id").String(); id != "" {
+						answeredIDs[id] = true
+					}
+				}
+			}
+		}
+
+		// Find orphaned tool_use ids
+		var orphanIDs []string
+		for _, id := range toolUseIDs {
+			if !answeredIDs[id] {
+				orphanIDs = append(orphanIDs, id)
+			}
+		}
+		if len(orphanIDs) == 0 {
+			continue
+		}
+
+		// If the next message is not a user message, or we need to inject
+		// tool_results, add stub tool_result blocks.
+		if nextMsg.Get("role").String() == "user" {
+			// Inject into existing user message
+			for _, id := range orphanIDs {
+				stub := fmt.Sprintf(`{"type":"tool_result","tool_use_id":"%s","content":""}`, id)
+				path := fmt.Sprintf("messages.%d.content.-1", nextIdx)
+				result, _ = sjson.SetRawBytes(result, path, []byte(stub))
+			}
+		} else {
+			// Next message is not user role: insert a new user message with tool_results
+			var stubs []string
+			for _, id := range orphanIDs {
+				stubs = append(stubs, fmt.Sprintf(`{"type":"tool_result","tool_use_id":"%s","content":""}`, id))
+			}
+			newMsg := fmt.Sprintf(`{"role":"user","content":[%s]}`, strings.Join(stubs, ","))
+			// sjson doesn't support array insert, so we rebuild
+			var newMessages []interface{}
+			for j, m := range msgArr {
+				newMessages = append(newMessages, json.RawMessage(m.Raw))
+				if j == i {
+					newMessages = append(newMessages, json.RawMessage(newMsg))
+				}
+			}
+			result, _ = sjson.SetBytes(result, "messages", newMessages)
+		}
+
+		modified = true
+		// Re-parse messages after modification
+		msgArr = gjson.GetBytes(result, "messages").Array()
+	}
+
+	if !modified {
+		return payload
+	}
 	return result
 }
 

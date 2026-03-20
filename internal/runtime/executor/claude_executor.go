@@ -128,7 +128,16 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
+	// Always regenerate system[0] (billing header) and system[1] (agent block)
+	// to ensure version consistency with our template, regardless of cloaking.
+	// This prevents version mismatch when a real Claude Code CLI with a different
+	// version connects through an upstream proxy like NewAPI.
+	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+		oauthMode := isClaudeOAuthToken(apiKey)
+		body = checkSystemInstructionsWithMode(body, false, oauthMode)
+	}
+
+	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
 
@@ -300,7 +309,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
+	// Always regenerate system[0] (billing header) and system[1] (agent block)
+	// to ensure version consistency with our template, regardless of cloaking.
+	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+		oauthMode := isClaudeOAuthToken(apiKey)
+		body = checkSystemInstructionsWithMode(body, false, oauthMode)
+	}
+
+	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
 
@@ -1129,7 +1145,7 @@ func getClientUserAgent(ctx context.Context) string {
 // Returns (cloakMode, strictMode, sensitiveWords, cacheUserID).
 func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bool) {
 	if auth == nil || auth.Attributes == nil {
-		return "auto", false, nil, false
+		return "auto", false, nil, true
 	}
 
 	cloakMode := auth.Attributes["cloak_mode"]
@@ -1147,7 +1163,12 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bo
 		}
 	}
 
-	cacheUserID := strings.EqualFold(strings.TrimSpace(auth.Attributes["cloak_cache_user_id"]), "true")
+	// Default to true: real Claude Code CLI reuses the same user_id across requests.
+	// Only disable if explicitly set to "false".
+	cacheUserID := true
+	if v, ok := auth.Attributes["cloak_cache_user_id"]; ok && strings.EqualFold(strings.TrimSpace(v), "false") {
+		cacheUserID = false
+	}
 
 	return cloakMode, strictMode, sensitiveWords, cacheUserID
 }
@@ -1288,16 +1309,22 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 	}
 
 	// Non-strict mode: billing header + agent identifier + user system messages
-	// Skip if already injected
-	firstText := gjson.GetBytes(payload, "system.0.text").String()
-	if strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
-		return payload
-	}
-
+	// Always regenerate to ensure version consistency with our template (2.1.79).
+	// If the client already injected a billing header (e.g. real Claude Code CLI
+	// with a different version), strip it to prevent version mismatch fingerprints.
 	result := "[" + billingBlock + "," + agentBlock
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {
+				text := part.Get("text").String()
+				// Skip existing billing header or agent block from upstream client
+				// to avoid duplication when regenerating.
+				if strings.HasPrefix(text, "x-anthropic-billing-header:") {
+					return true
+				}
+				if strings.HasPrefix(text, "You are a Claude agent") {
+					return true
+				}
 				partJSON := part.Raw
 				if !part.Get("cache_control").Exists() {
 					partJSON, _ = sjson.Set(partJSON, "cache_control.type", "ephemeral")
@@ -1321,6 +1348,61 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 	return payload
+}
+
+// claudeAPIAllowedFields is the whitelist of top-level fields accepted by the Claude
+// Messages API. Any field not in this set is non-standard and will be stripped during
+// cloaking to prevent upstream proxies (e.g. NewAPI) from injecting identifiable fields.
+var claudeAPIAllowedFields = map[string]bool{
+	"model":          true,
+	"messages":       true,
+	"system":         true,
+	"max_tokens":     true,
+	"metadata":       true,
+	"stop_sequences": true,
+	"stream":         true,
+	"temperature":    true,
+	"top_p":          true,
+	"top_k":          true,
+	"tools":          true,
+	"tool_choice":    true,
+	"thinking":       true,
+	"output_config":  true,
+	// Internal fields used by CLIProxyAPI pipeline (added after translation).
+	"betas": true,
+}
+
+// stripNonStandardFields removes any top-level fields from the payload that are not
+// part of the Claude Messages API specification. This prevents upstream proxies from
+// injecting non-standard fields (e.g. custom tracking, request IDs) that could serve
+// as fingerprints distinguishing proxied requests from real Claude Code CLI requests.
+// Additionally, metadata is sanitized to only keep user_id.
+func stripNonStandardFields(payload []byte) []byte {
+	root := gjson.ParseBytes(payload)
+	if !root.IsObject() {
+		return payload
+	}
+	var toDelete []string
+	root.ForEach(func(key, _ gjson.Result) bool {
+		if !claudeAPIAllowedFields[key.String()] {
+			toDelete = append(toDelete, key.String())
+		}
+		return true
+	})
+	result := payload
+	for _, key := range toDelete {
+		result, _ = sjson.DeleteBytes(result, key)
+	}
+	// Sanitize metadata: only keep user_id, remove any extra fields injected by upstream.
+	metadata := gjson.GetBytes(result, "metadata")
+	if metadata.Exists() && metadata.IsObject() {
+		userID := gjson.GetBytes(result, "metadata.user_id").String()
+		result, _ = sjson.DeleteBytes(result, "metadata")
+		if userID != "" {
+			result, _ = sjson.SetBytes(result, "metadata.user_id", userID)
+		}
+	}
+	return result
 }
 
 // normalizeMaxTokensForCloaking ensures max_tokens matches the model's default value
@@ -1357,7 +1439,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	var cloakMode string
 	var strictMode bool
 	var sensitiveWords []string
-	var cacheUserID bool
+	cacheUserID := true
 
 	if cloakCfg != nil {
 		cloakMode = cloakCfg.Mode
@@ -1391,16 +1473,21 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		return payload
 	}
 
+	// Strip non-standard top-level fields and sanitize metadata to prevent
+	// upstream proxies from injecting identifiable fields into the request body.
+	payload = stripNonStandardFields(payload)
+
 	// Normalize max_tokens to match the model's default when cloaking is active.
 	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default
 	// (like 8192) for all models, which is a detectable fingerprint since real
 	// Claude Code CLI sends model-appropriate values (e.g. 128000 for Opus 4.6).
 	payload = normalizeMaxTokensForCloaking(payload, model)
 
-	// Skip system instructions for claude-3-5-haiku models.
-	// Cloaking always simulates an OAuth session (ttl:"1h" on cache_control).
-	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, strictMode, true)
+	// Note: system[0]/[1] injection is now handled in Execute/ExecuteStream
+	// before applyCloaking, so it applies to all requests regardless of cloaking.
+	// In strict mode, strip user system messages and keep only billing + agent blocks.
+	if strictMode && !strings.HasPrefix(model, "claude-3-5-haiku") {
+		payload = checkSystemInstructionsWithMode(payload, true, true)
 	}
 
 	// Inject fake user ID

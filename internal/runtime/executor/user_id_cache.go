@@ -3,87 +3,123 @@ package executor
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-type userIDCacheEntry struct {
-	value  string
-	expire time.Time
+// sessionIDCacheEntry caches only the session_id component, which rotates per session.
+// device_id and account_uuid are derived deterministically from the API key and never change.
+type sessionIDCacheEntry struct {
+	sessionID string
+	expire    time.Time
 }
 
 var (
-	userIDCache            = make(map[string]userIDCacheEntry)
-	userIDCacheMu          sync.RWMutex
-	userIDCacheCleanupOnce sync.Once
+	sessionIDCache            = make(map[string]sessionIDCacheEntry)
+	sessionIDCacheMu          sync.RWMutex
+	sessionIDCacheCleanupOnce sync.Once
 )
 
 const (
-	userIDTTL                = time.Hour
-	userIDCacheCleanupPeriod = 15 * time.Minute
+	sessionIDTTL             = time.Hour
+	sessionIDCacheCleanup    = 15 * time.Minute
 )
 
-func startUserIDCacheCleanup() {
+func startSessionIDCacheCleanup() {
 	go func() {
-		ticker := time.NewTicker(userIDCacheCleanupPeriod)
+		ticker := time.NewTicker(sessionIDCacheCleanup)
 		defer ticker.Stop()
 		for range ticker.C {
-			purgeExpiredUserIDs()
+			purgeExpiredSessionIDs()
 		}
 	}()
 }
 
-func purgeExpiredUserIDs() {
+func purgeExpiredSessionIDs() {
 	now := time.Now()
-	userIDCacheMu.Lock()
-	for key, entry := range userIDCache {
+	sessionIDCacheMu.Lock()
+	for key, entry := range sessionIDCache {
 		if !entry.expire.After(now) {
-			delete(userIDCache, key)
+			delete(sessionIDCache, key)
 		}
 	}
-	userIDCacheMu.Unlock()
+	sessionIDCacheMu.Unlock()
 }
 
-func userIDCacheKey(apiKey string) string {
-	sum := sha256.Sum256([]byte(apiKey))
-	return hex.EncodeToString(sum[:])
+// deriveDeviceID generates a stable device_id (64-hex) from the API key.
+// Real Claude Code CLI generates this once per device and persists it.
+func deriveDeviceID(apiKey string) string {
+	h := sha256.Sum256([]byte("device:" + apiKey))
+	return hex.EncodeToString(h[:])
 }
 
+// deriveAccountUUID generates a stable account_uuid from the API key.
+// Real Claude Code CLI gets this from the OAuth account info and it never changes.
+func deriveAccountUUID(apiKey string) string {
+	h := sha256.Sum256([]byte("account:" + apiKey))
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(h[0:4]),
+		hex.EncodeToString(h[4:6]),
+		hex.EncodeToString(h[6:8]),
+		hex.EncodeToString(h[8:10]),
+		hex.EncodeToString(h[10:16]),
+	)
+}
+
+// cachedSessionID returns a session_id that rotates every hour (simulating CLI restarts).
+func cachedSessionID(apiKey string) string {
+	key := sha256.Sum256([]byte("session:" + apiKey))
+	cacheKey := hex.EncodeToString(key[:])
+	now := time.Now()
+
+	sessionIDCacheMu.RLock()
+	entry, ok := sessionIDCache[cacheKey]
+	valid := ok && entry.sessionID != "" && entry.expire.After(now)
+	sessionIDCacheMu.RUnlock()
+	if valid {
+		sessionIDCacheMu.Lock()
+		entry = sessionIDCache[cacheKey]
+		if entry.sessionID != "" && entry.expire.After(now) {
+			entry.expire = now.Add(sessionIDTTL)
+			sessionIDCache[cacheKey] = entry
+			sessionIDCacheMu.Unlock()
+			return entry.sessionID
+		}
+		sessionIDCacheMu.Unlock()
+	}
+
+	newSessionID := uuid.New().String()
+
+	sessionIDCacheMu.Lock()
+	entry, ok = sessionIDCache[cacheKey]
+	if !ok || entry.sessionID == "" || !entry.expire.After(now) {
+		entry.sessionID = newSessionID
+	}
+	entry.expire = now.Add(sessionIDTTL)
+	sessionIDCache[cacheKey] = entry
+	sessionIDCacheMu.Unlock()
+	return entry.sessionID
+}
+
+// cachedUserID builds a complete user_id with stable device_id/account_uuid
+// and a rotating session_id. This matches real Claude Code CLI behavior where
+// device_id and account_uuid are permanent, but session_id changes per CLI launch.
 func cachedUserID(apiKey string) string {
 	if apiKey == "" {
 		return generateFakeUserID()
 	}
 
-	userIDCacheCleanupOnce.Do(startUserIDCacheCleanup)
+	sessionIDCacheCleanupOnce.Do(startSessionIDCacheCleanup)
 
-	key := userIDCacheKey(apiKey)
-	now := time.Now()
-
-	userIDCacheMu.RLock()
-	entry, ok := userIDCache[key]
-	valid := ok && entry.value != "" && entry.expire.After(now) && isValidUserID(entry.value)
-	userIDCacheMu.RUnlock()
-	if valid {
-		userIDCacheMu.Lock()
-		entry = userIDCache[key]
-		if entry.value != "" && entry.expire.After(now) && isValidUserID(entry.value) {
-			entry.expire = now.Add(userIDTTL)
-			userIDCache[key] = entry
-			userIDCacheMu.Unlock()
-			return entry.value
-		}
-		userIDCacheMu.Unlock()
+	payload := userIDPayload{
+		DeviceID:    deriveDeviceID(apiKey),
+		AccountUUID: deriveAccountUUID(apiKey),
+		SessionID:   cachedSessionID(apiKey),
 	}
-
-	newID := generateFakeUserID()
-
-	userIDCacheMu.Lock()
-	entry, ok = userIDCache[key]
-	if !ok || entry.value == "" || !entry.expire.After(now) || !isValidUserID(entry.value) {
-		entry.value = newID
-	}
-	entry.expire = now.Add(userIDTTL)
-	userIDCache[key] = entry
-	userIDCacheMu.Unlock()
-	return entry.value
+	data, _ := json.Marshal(payload)
+	return string(data)
 }

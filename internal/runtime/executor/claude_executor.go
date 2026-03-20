@@ -850,12 +850,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if modelSupports1MContext(model) {
 		baseBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24"
 	}
-	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
-		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
-		}
-	}
 
 	hasClaude1MHeader := false
 	if ginHeaders != nil {
@@ -886,30 +880,22 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
-	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
+	// Always use CLIProxyAPI's own template values for all identity-sensitive headers.
+	// Client-forwarded headers (e.g. from NewAPI pass_headers) are intentionally ignored
+	// to prevent version mismatches or non-standard values from leaking as fingerprints.
+	r.Header.Set("Anthropic-Version", "2023-06-01")
+	r.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
+	r.Header.Set("X-App", "cli")
 	// Values below match Claude Code 2.1.79 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-19).
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Arch", mapStainlessArch())
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Os", mapStainlessOS())
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
-	// For User-Agent, only forward the client's header if it's already a Claude Code client.
-	// Non-Claude-Code clients (e.g. curl, OpenAI SDKs) get the default Claude Code User-Agent
-	// to avoid leaking the real client identity during cloaking.
-	clientUA := ""
-	if ginHeaders != nil {
-		clientUA = ginHeaders.Get("User-Agent")
-	}
-	if isClaudeCodeClient(clientUA) {
-		r.Header.Set("User-Agent", clientUA)
-	} else {
-		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.79 (external, cli)"))
-	}
+	r.Header.Set("X-Stainless-Retry-Count", "0")
+	r.Header.Set("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
+	r.Header.Set("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
+	r.Header.Set("X-Stainless-Runtime", "node")
+	r.Header.Set("X-Stainless-Lang", "js")
+	r.Header.Set("X-Stainless-Arch", mapStainlessArch())
+	r.Header.Set("X-Stainless-Os", mapStainlessOS())
+	r.Header.Set("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
+	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.79 (external, cli)"))
 	r.Header.Set("Connection", "keep-alive")
 	// Real Claude Code CLI 2.1.79 sends the same Accept and Accept-Encoding
 	// for both streaming and non-streaming requests.  The stream mode is

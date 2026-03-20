@@ -64,6 +64,13 @@ func isClaudeCodeClient(userAgent string) bool {
 	return strings.HasPrefix(userAgent, "claude-cli")
 }
 
+// supportsAdaptiveThinking returns true if the model supports thinking:{type:"adaptive"}.
+// Only Claude 4.6 models (opus-4-6, sonnet-4-6) support adaptive thinking.
+// Older models like sonnet-4, claude-3-5-sonnet, haiku etc. do not.
+func supportsAdaptiveThinking(model string) bool {
+	return strings.Contains(model, "opus-4-6") || strings.Contains(model, "sonnet-4-6")
+}
+
 // extractFieldFromUserID extracts a named field from a JSON-format user_id string.
 // Returns empty string if parsing fails or the field is missing.
 func extractFieldFromUserID(userID string, field string) string {

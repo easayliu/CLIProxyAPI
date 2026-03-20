@@ -1745,9 +1745,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Inject thinking and output_config to match real CLI defaults.
 	// Real Claude Code CLI always sends thinking:{type:"adaptive"} and
-	// output_config:{effort:"medium"}. Missing fields are a fingerprint.
-	// Skip for Haiku which doesn't support these features.
-	if !strings.HasPrefix(model, "claude-4-5-haiku") {
+	// output_config:{effort:"medium"}. Adaptive thinking is only supported
+	// on Claude 4.6 models (opus-4-6, sonnet-4-6). Older models (sonnet-4,
+	// claude-3-5-*) will reject adaptive thinking with 400 errors.
+	if supportsAdaptiveThinking(model) {
 		if !gjson.GetBytes(payload, "thinking").Exists() {
 			payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
 		}

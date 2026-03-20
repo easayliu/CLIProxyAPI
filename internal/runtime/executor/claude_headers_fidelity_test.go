@@ -47,11 +47,11 @@ func captureFromRequest(r *http.Request) capturedHeaders {
 	}
 }
 
-// realCLIHeaders returns the expected header values from real Claude Code CLI 2.1.79.
+// realCLIHeaders returns the expected header values from real Claude Code CLI 2.1.80.
 var realCLIHeaders = capturedHeaders{
 	Accept:         "application/json",
 	AcceptEncoding: "gzip, deflate, br, zstd",
-	UserAgent:      "claude-cli/2.1.79 (external, cli)",
+	UserAgent:      "claude-cli/2.1.80 (external, cli)",
 	XApp:           "cli",
 	Version:        "2023-06-01",
 	DangerousDBA:   "true",
@@ -81,7 +81,7 @@ var realCLIBetas1M = []string{
 }
 
 // TestHeaderFidelity_StreamingMatchesRealCLI verifies that a streaming request
-// through ClaudeExecutor sends headers identical to the real Claude Code CLI 2.1.79.
+// through ClaudeExecutor sends headers identical to the real Claude Code CLI 2.1.80.
 func TestHeaderFidelity_StreamingMatchesRealCLI(t *testing.T) {
 	var captured capturedHeaders
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -303,7 +303,7 @@ func TestHeaderFidelity_GzipCompressedSSEStream(t *testing.T) {
 }
 
 // TestHeaderFidelity_UserIDNewJSONFormat verifies that the injected user_id
-// matches the new Claude Code 2.1.79 JSON format.
+// matches the new Claude Code 2.1.80 JSON format.
 func TestHeaderFidelity_UserIDNewJSONFormat(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -363,7 +363,7 @@ func TestHeaderFidelity_UserIDNewJSONFormat(t *testing.T) {
 }
 
 // TestHeaderFidelity_BillingHeaderFormat verifies the billing header matches
-// Claude Code 2.1.79 format with dynamic cch.
+// Claude Code 2.1.80 format with dynamic cch.
 func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -395,9 +395,9 @@ func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
 		t.Fatalf("system[0] is not billing header: %s", system0Text)
 	}
 
-	// Verify format: cc_version=2.1.79.XXX; cc_entrypoint=cli; cch=XXXXX;
-	if !strings.Contains(system0Text, "cc_version=2.1.79.") {
-		t.Errorf("billing header missing cc_version=2.1.79: %s", system0Text)
+	// Verify format: cc_version=2.1.80.XXX; cc_entrypoint=cli; cch=XXXXX;
+	if !strings.Contains(system0Text, "cc_version=2.1.80.") {
+		t.Errorf("billing header missing cc_version=2.1.80: %s", system0Text)
 	}
 	if !strings.Contains(system0Text, "cc_entrypoint=cli") {
 		t.Errorf("billing header missing cc_entrypoint=cli: %s", system0Text)

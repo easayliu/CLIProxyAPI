@@ -108,24 +108,42 @@ func cachedSessionID(apiKey string) string {
 // cachedUserID builds a complete user_id with stable device_id/account_uuid
 // and a rotating session_id. This matches real Claude Code CLI behavior where
 // device_id and account_uuid are permanent, but session_id changes per CLI launch.
-// If realAccountUUID is provided (from OAuth token response), it is used instead
-// of the derived value for maximum authenticity.
-func cachedUserID(apiKey string, realAccountUUID string) string {
+// If realDeviceID or realAccountUUID is provided (from persisted OAuth auth file),
+// it is used instead of the derived value for maximum authenticity.
+func cachedUserID(apiKey string, realDeviceID string, realAccountUUID string) string {
+	return cachedUserIDWithSession(apiKey, realDeviceID, realAccountUUID, "")
+}
+
+// cachedUserIDWithSession is like cachedUserID but allows preserving a client-provided
+// session_id. When clientSessionID is non-empty, it is used directly instead of the
+// cached/generated value, matching real Claude Code CLI behavior where the client
+// maintains its own session_id across requests within the same CLI session.
+func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID string, clientSessionID string) string {
 	if apiKey == "" {
 		return generateFakeUserID()
 	}
 
 	sessionIDCacheCleanupOnce.Do(startSessionIDCacheCleanup)
 
+	deviceID := deriveDeviceID(apiKey)
+	if realDeviceID != "" {
+		deviceID = realDeviceID
+	}
+
 	accountUUID := deriveAccountUUID(apiKey)
 	if realAccountUUID != "" {
 		accountUUID = realAccountUUID
 	}
 
+	sessionID := cachedSessionID(apiKey)
+	if clientSessionID != "" {
+		sessionID = clientSessionID
+	}
+
 	payload := userIDPayload{
-		DeviceID:    deriveDeviceID(apiKey),
+		DeviceID:    deviceID,
 		AccountUUID: accountUUID,
-		SessionID:   cachedSessionID(apiKey),
+		SessionID:   sessionID,
 	}
 	data, _ := json.Marshal(payload)
 	return string(data)

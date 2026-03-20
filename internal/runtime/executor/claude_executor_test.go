@@ -212,7 +212,7 @@ func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
 }
 
 func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
-	resetUserIDCache()
+	resetSessionIDCache()
 
 	var userIDs []string
 	var requestModels []string
@@ -280,7 +280,7 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 }
 
 func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
-	resetUserIDCache()
+	resetSessionIDCache()
 
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -316,8 +316,10 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	if userIDs[0] == "" || userIDs[1] == "" {
 		t.Fatal("expected user_id to be populated")
 	}
-	if userIDs[0] == userIDs[1] {
-		t.Fatalf("expected user_id to change when caching is not enabled, got identical values %q", userIDs[0])
+	// With cacheUserID defaulting to true, the same apiKey should produce the same
+	// device_id/account_uuid/session_id within the TTL window.
+	if userIDs[0] != userIDs[1] {
+		t.Fatalf("expected user_id to be stable with default caching, got %q and %q", userIDs[0], userIDs[1])
 	}
 	if !isValidUserID(userIDs[0]) || !isValidUserID(userIDs[1]) {
 		t.Fatalf("user_ids should be valid, got %q and %q", userIDs[0], userIDs[1])

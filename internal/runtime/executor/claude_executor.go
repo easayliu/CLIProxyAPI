@@ -21,7 +21,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -902,7 +901,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("Anthropic-Version", "2023-06-01")
 	r.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	r.Header.Set("X-App", "cli")
-	// Values below match Claude Code 2.1.79 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-19).
+	// Values below match Claude Code 2.1.80 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-19).
 	r.Header.Set("X-Stainless-Retry-Count", "0")
 	r.Header.Set("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	r.Header.Set("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
@@ -911,9 +910,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("X-Stainless-Arch", mapStainlessArch())
 	r.Header.Set("X-Stainless-Os", mapStainlessOS())
 	r.Header.Set("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
-	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.79 (external, cli)"))
+	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.80 (external, cli)"))
 	r.Header.Set("Connection", "keep-alive")
-	// Real Claude Code CLI 2.1.79 sends the same Accept and Accept-Encoding
+	// Real Claude Code CLI 2.1.80 sends the same Accept and Accept-Encoding
 	// for both streaming and non-streaming requests.  The stream mode is
 	// controlled by the "stream" field in the JSON body, not by the Accept header.
 	// The response body is decompressed by decodeResponseBody before the SSE
@@ -1203,26 +1202,18 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 }
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.
+// All three fields (device_id, account_uuid, session_id) are replaced to prevent
+// cross-referencing between client telemetry and proxied API requests.
 // When useCache is false, a new user ID is generated for every call.
-// realAccountUUID is the OAuth account UUID for maximum authenticity (may be empty).
-func injectFakeUserID(payload []byte, apiKey string, useCache bool, realAccountUUID string) []byte {
+func injectFakeUserID(payload []byte, apiKey string, useCache bool, realDeviceID string, realAccountUUID string) []byte {
 	generateID := func() string {
 		if useCache {
-			return cachedUserID(apiKey, realAccountUUID)
+			return cachedUserIDWithSession(apiKey, realDeviceID, realAccountUUID, "")
 		}
 		return generateFakeUserID()
 	}
 
-	metadata := gjson.GetBytes(payload, "metadata")
-	if !metadata.Exists() {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-		return payload
-	}
-
-	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if existingUserID == "" || !isValidUserID(existingUserID) {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-	}
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
 	return payload
 }
 
@@ -1235,10 +1226,10 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool, realAccountU
 //  2. Take runes at positions 4, 7, 20 (default "0" if out of range)
 //  3. SHA-256(salt + chars + version), take first 3 hex chars
 //
-// cch is a 5-char hex hash derived from session-specific data (updated in v2.1.79).
+// cch is a 5-char hex hash derived from session-specific data (updated in v2.1.80).
 func generateBillingHeader(payload []byte) string {
 	const salt = "59cf53e54c78"
-	const version = "2.1.79"
+	const version = "2.1.80"
 
 	// Extract text of the first user message from the messages array.
 	var firstUserText string
@@ -1295,7 +1286,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 	billingText := generateBillingHeader(payload)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
-	// Agent block matches real Claude Code v2.1.79 interactive mode system[1].
+	// Agent block matches real Claude Code v2.1.80 interactive mode system[1].
 	// In OAuth mode the real CLI adds ttl:"1h" via fQ when quota conditions are met.
 	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral"}}`
 	if oauthMode {
@@ -1310,7 +1301,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 	}
 
 	// Non-strict mode: billing header + agent identifier + user system messages
-	// Always regenerate to ensure version consistency with our template (2.1.79).
+	// Always regenerate to ensure version consistency with our template (2.1.80).
 	// If the client already injected a billing header (e.g. real Claude Code CLI
 	// with a different version), strip it to prevent version mismatch fingerprints.
 	result := "[" + billingBlock + "," + agentBlock
@@ -1367,8 +1358,9 @@ var claudeAPIAllowedFields = map[string]bool{
 	"top_k":          true,
 	"tools":          true,
 	"tool_choice":    true,
-	"thinking":       true,
-	"output_config":  true,
+	"thinking":            true,
+	"output_config":       true,
+	"context_management":  true,
 	// Internal fields used by CLIProxyAPI pipeline (added after translation).
 	"betas": true,
 }
@@ -1491,14 +1483,18 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithMode(payload, true, true)
 	}
 
-	// Inject fake user ID, using real account UUID from OAuth if available.
+	// Inject fake user ID, using real device_id and account_uuid from OAuth if available.
+	realDeviceID := ""
 	realAccountUUID := ""
 	if auth != nil && auth.Metadata != nil {
+		if v, ok := auth.Metadata["device_id"].(string); ok {
+			realDeviceID = v
+		}
 		if v, ok := auth.Metadata["account_uuid"].(string); ok {
 			realAccountUUID = v
 		}
 	}
-	payload = injectFakeUserID(payload, apiKey, cacheUserID, realAccountUUID)
+	payload = injectFakeUserID(payload, apiKey, cacheUserID, realDeviceID, realAccountUUID)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {

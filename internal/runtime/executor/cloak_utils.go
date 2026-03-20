@@ -64,6 +64,28 @@ func isClaudeCodeClient(userAgent string) bool {
 	return strings.HasPrefix(userAgent, "claude-cli")
 }
 
+// extractFieldFromUserID extracts a named field from a JSON-format user_id string.
+// Returns empty string if parsing fails or the field is missing.
+func extractFieldFromUserID(userID string, field string) string {
+	if !strings.HasPrefix(userID, "{") {
+		return ""
+	}
+	var p userIDPayload
+	if err := json.Unmarshal([]byte(userID), &p); err != nil {
+		return ""
+	}
+	switch field {
+	case "device_id":
+		return p.DeviceID
+	case "account_uuid":
+		return p.AccountUUID
+	case "session_id":
+		return p.SessionID
+	default:
+		return ""
+	}
+}
+
 // generateCCH generates a 5-char hex hash for the billing header cch field.
 // In Claude Code 2.1.79+ this is derived from session-specific data.
 // We generate a random value since the exact derivation is internal to Claude Code.

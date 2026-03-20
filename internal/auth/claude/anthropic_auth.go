@@ -5,6 +5,8 @@ package claude
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -214,6 +216,11 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
+	// Generate a stable device_id (64-hex) for this auth, matching real Claude Code behavior.
+	deviceIDBytes := make([]byte, 32)
+	_, _ = rand.Read(deviceIDBytes)
+	deviceID := hex.EncodeToString(deviceIDBytes)
+
 	// Create token data
 	tokenData := ClaudeTokenData{
 		AccessToken:  tokenResp.AccessToken,
@@ -221,6 +228,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		Email:        tokenResp.Account.EmailAddress,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 		AccountUUID:  tokenResp.Account.UUID,
+		DeviceID:     deviceID,
 	}
 
 	// Create auth bundle
@@ -318,6 +326,7 @@ func (o *ClaudeAuth) CreateTokenStorage(bundle *ClaudeAuthBundle) *ClaudeTokenSt
 		Email:        bundle.TokenData.Email,
 		Expire:       bundle.TokenData.Expire,
 		AccountUUID:  bundle.TokenData.AccountUUID,
+		DeviceID:     bundle.TokenData.DeviceID,
 	}
 
 	return storage

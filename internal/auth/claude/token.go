@@ -41,6 +41,11 @@ type ClaudeTokenStorage struct {
 	// Persisted to generate realistic metadata.user_id for cloaking.
 	AccountUUID string `json:"account_uuid,omitempty"`
 
+	// DeviceID is a random 64-hex string generated once per auth and persisted.
+	// Mirrors real Claude Code CLI behavior where device_id is generated via
+	// crypto.randomBytes(32).toString("hex") and stays fixed per device.
+	DeviceID string `json:"device_id,omitempty"`
+
 	// Metadata holds arbitrary key-value pairs injected via hooks.
 	// It is not exported to JSON directly to allow flattening during serialization.
 	Metadata map[string]any `json:"-"`

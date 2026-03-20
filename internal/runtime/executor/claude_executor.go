@@ -1362,21 +1362,21 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool)
 // Messages API. Any field not in this set is non-standard and will be stripped during
 // cloaking to prevent upstream proxies (e.g. NewAPI) from injecting identifiable fields.
 var claudeAPIAllowedFields = map[string]bool{
-	"model":          true,
-	"messages":       true,
-	"system":         true,
-	"max_tokens":     true,
-	"metadata":       true,
-	"stop_sequences": true,
-	"stream":         true,
-	"temperature":    true,
-	"top_p":          true,
-	"top_k":          true,
-	"tools":          true,
-	"tool_choice":    true,
-	"thinking":            true,
-	"output_config":       true,
-	"context_management":  true,
+	"model":              true,
+	"messages":           true,
+	"system":             true,
+	"max_tokens":         true,
+	"metadata":           true,
+	"stop_sequences":     true,
+	"stream":             true,
+	"temperature":        true,
+	"top_p":              true,
+	"top_k":              true,
+	"tools":              true,
+	"tool_choice":        true,
+	"thinking":           true,
+	"output_config":      true,
+	"context_management": true,
 	// Internal fields used by CLIProxyAPI pipeline (added after translation).
 	"betas": true,
 }
@@ -1746,11 +1746,14 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Inject thinking and output_config to match real CLI defaults.
 	// Real Claude Code CLI always sends thinking:{type:"adaptive"} and
 	// output_config:{effort:"medium"}. Missing fields are a fingerprint.
-	if !gjson.GetBytes(payload, "thinking").Exists() {
-		payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
-	}
-	if !gjson.GetBytes(payload, "output_config").Exists() {
-		payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
+	// Skip for Haiku which doesn't support these features.
+	if !strings.HasPrefix(model, "claude-4-5-haiku") {
+		if !gjson.GetBytes(payload, "thinking").Exists() {
+			payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
+		}
+		if !gjson.GetBytes(payload, "output_config").Exists() {
+			payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
+		}
 	}
 
 	// Inject fake user ID, using real device_id and account_uuid from OAuth if available.

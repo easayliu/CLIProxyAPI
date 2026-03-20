@@ -131,7 +131,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// to ensure version consistency with our template, regardless of cloaking.
 	// This prevents version mismatch when a real Claude Code CLI with a different
 	// version connects through an upstream proxy like NewAPI.
-	if !strings.HasPrefix(baseModel, "claude-4-5-haiku") {
+	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		oauthMode := isClaudeOAuthToken(apiKey)
 		body = checkSystemInstructionsWithMode(body, false, oauthMode)
 	}
@@ -318,7 +318,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Always regenerate system[0] (billing header) and system[1] (agent block)
 	// to ensure version consistency with our template, regardless of cloaking.
-	if !strings.HasPrefix(baseModel, "claude-4-5-haiku") {
+	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		oauthMode := isClaudeOAuthToken(apiKey)
 		body = checkSystemInstructionsWithMode(body, false, oauthMode)
 	}
@@ -513,7 +513,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	if !strings.HasPrefix(baseModel, "claude-4-5-haiku") {
+	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
 	}
 
@@ -1731,7 +1731,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Note: system[0]/[1] injection is now handled in Execute/ExecuteStream
 	// before applyCloaking, so it applies to all requests regardless of cloaking.
 	// In strict mode, strip user system messages and keep only billing + agent blocks.
-	if strictMode && !strings.HasPrefix(model, "claude-4-5-haiku") {
+	if strictMode && !strings.HasPrefix(model, "claude-3-5-haiku") {
 		payload = checkSystemInstructionsWithMode(payload, true, true)
 	}
 
@@ -1739,7 +1739,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// any extra system messages into the first user message as <system-reminder>.
 	// Real CLI always sends exactly 3 system blocks; extra blocks are a fingerprint.
 	oauthMode := isClaudeOAuthToken(apiKey)
-	if !strings.HasPrefix(model, "claude-4-5-haiku") {
+	if !strings.HasPrefix(model, "claude-3-5-haiku") {
 		payload = injectCLISystemPrompt(payload, model, oauthMode)
 	}
 

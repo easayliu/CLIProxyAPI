@@ -38,7 +38,7 @@
       "type": "claude",
       "display_name": "Claude 4.6 Sonnet",
       "context_length": 200000,
-      "max_completion_tokens": 64000,
+      "max_completion_tokens": 32000,
       "thinking": {
         "min": 1024,
         "max": 128000,
@@ -59,7 +59,7 @@
       "display_name": "Claude 4.6 Opus",
       "description": "Premium model combining maximum intelligence with practical performance",
       "context_length": 1000000,
-      "max_completion_tokens": 128000,
+      "max_completion_tokens": 64000,
       "thinking": {
         "min": 1024,
         "max": 128000,

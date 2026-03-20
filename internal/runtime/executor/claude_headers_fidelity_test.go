@@ -419,9 +419,10 @@ func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
 	t.Logf("billing header: %s", system0Text)
 }
 
-// TestHeaderFidelity_OpusIncludes1MBeta verifies that opus-4-6 models include
-// the context-1m beta, while non-opus models do not.
+// TestHeaderFidelity_OpusIncludes1MBeta verifies that only models with [1m] suffix
+// include the context-1m beta. Plain opus-4-6 and sonnet-4-6 do NOT include it.
 func TestHeaderFidelity_OpusIncludes1MBeta(t *testing.T) {
+	// Plain opus-4-6 should NOT include context-1m beta
 	var captured capturedHeaders
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		captured = captureFromRequest(r)
@@ -447,8 +448,39 @@ func TestHeaderFidelity_OpusIncludes1MBeta(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	// Opus should include context-1m beta
-	assertBetasInOrder(t, captured.AnthropicBeta, realCLIBetas1M)
+	// Plain opus should NOT include context-1m beta (matches real CLI behavior)
+	assertBetasInOrder(t, captured.AnthropicBeta, realCLIBetas)
+	if strings.Contains(captured.AnthropicBeta, "context-1m") {
+		t.Errorf("plain opus-4-6 should not have context-1m beta, got: %s", captured.AnthropicBeta)
+	}
+
+	// opus-4-6[1m] SHOULD include context-1m beta
+	var captured1M capturedHeaders
+	server1M := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured1M = captureFromRequest(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server1M.Close()
+
+	auth1M := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-api03-test-key",
+		"base_url": server1M.URL,
+	}}
+	payload1M := []byte(`{"model":"claude-opus-4-6[1m]","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err = executor.Execute(context.Background(), auth1M, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6[1m]",
+		Payload: payload1M,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	// [1m] model should include context-1m beta
+	assertBetasInOrder(t, captured1M.AnthropicBeta, realCLIBetas1M)
 
 	// Verify sonnet does NOT include context-1m
 	var capturedSonnet capturedHeaders

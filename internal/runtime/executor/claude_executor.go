@@ -843,10 +843,11 @@ func mapStainlessArch() string {
 	}
 }
 
-// modelSupports1MContext returns true if the model supports the context-1m beta.
-// Currently only claude-opus-4-6 variants support 1M context.
+// modelSupports1MContext returns true if the model name explicitly requests 1M context.
+// Real Claude CLI only adds context-1m-2025-08-07 beta when the model name contains "[1m]"
+// suffix (e.g. "claude-opus-4-6[1m]"). Without this suffix, even Opus 4.6 uses 200K context.
 func modelSupports1MContext(model string) bool {
-	return strings.Contains(model, "opus-4-6") || strings.Contains(model, "opus-4-6")
+	return strings.Contains(strings.ToLower(model), "[1m]")
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config, model string) {

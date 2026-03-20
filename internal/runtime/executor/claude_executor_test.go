@@ -1116,6 +1116,91 @@ func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
 	}
 }
 
+// --- CLI system prompt injection tests ---
+
+func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
+	// Simulate a payload with billing + agent blocks already injected
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":"hi"}]}`)
+
+	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true, false)
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks after injection, got %d", len(blocks))
+	}
+
+	// system[2] should contain the CLI system prompt
+	text := blocks[2].Get("text").String()
+	if !strings.Contains(text, "You are an interactive agent") {
+		t.Fatalf("system[2] should contain CLI system prompt, got: %.100s...", text)
+	}
+	if !strings.Contains(text, "Sonnet 4.6") {
+		t.Fatalf("system[2] should contain model display name 'Sonnet 4.6', got: %.200s...", text)
+	}
+
+	// Should have cache_control with ttl for OAuth
+	cc := blocks[2].Get("cache_control")
+	if cc.Get("ttl").String() != "1h" {
+		t.Fatalf("system[2] cache_control should have ttl=1h in oauth mode")
+	}
+}
+
+func TestInjectCLISystemPrompt_StrictModeDropsUserMessages(t *testing.T) {
+	payload := []byte(`{"system":[{"type":"text","text":"billing"},{"type":"text","text":"agent"},{"type":"text","text":"user custom prompt"}],"messages":[{"role":"user","content":"hi"}]}`)
+
+	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", false, true)
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 3 {
+		t.Fatalf("strict mode should have exactly 3 blocks (billing + agent + CLI prompt), got %d", len(blocks))
+	}
+}
+
+func TestCloaking_InjectsCLISystemPrompt(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-api03-test-key",
+		"base_url": server.URL,
+	}}
+
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if len(receivedBody) == 0 {
+		t.Fatal("expected upstream to receive a request body")
+	}
+
+	// Verify system has at least 3 blocks (billing + agent + CLI prompt)
+	systemBlocks := gjson.GetBytes(receivedBody, "system").Array()
+	if len(systemBlocks) < 3 {
+		t.Fatalf("expected at least 3 system blocks in cloaked request, got %d", len(systemBlocks))
+	}
+
+	// system[2] should be the CLI system prompt
+	text := systemBlocks[2].Get("text").String()
+	if !strings.Contains(text, "You are an interactive agent") {
+		t.Fatalf("system[2] should be CLI system prompt, got: %.100s...", text)
+	}
+}
+
 // --- tool_use/tool_result pairing repair tests ---
 
 func TestRepairToolUsePairing_NothingToRepair(t *testing.T) {

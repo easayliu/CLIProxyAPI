@@ -1735,6 +1735,14 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithMode(payload, true, true)
 	}
 
+	// Inject the full Claude Code CLI system prompt as system[2].
+	// Real CLI always sends: system[0]=billing, system[1]=agent, system[2]=full prompt.
+	// Without this block, the request is detectable as non-CLI even with correct headers.
+	oauthMode := isClaudeOAuthToken(apiKey)
+	if !strings.HasPrefix(model, "claude-3-5-haiku") {
+		payload = injectCLISystemPrompt(payload, model, oauthMode, strictMode)
+	}
+
 	// Inject fake user ID, using real device_id and account_uuid from OAuth if available.
 	realDeviceID := ""
 	realAccountUUID := ""

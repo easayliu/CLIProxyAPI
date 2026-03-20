@@ -997,7 +997,7 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false, false)
+	out := checkSystemInstructionsWithMode(payload, false, false, "")
 
 	system := gjson.GetBytes(out, "system")
 	if !system.IsArray() {
@@ -1027,7 +1027,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, true, false)
+	out := checkSystemInstructionsWithMode(payload, true, false, "")
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 2 {
@@ -1039,7 +1039,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) {
 	payload := []byte(`{"system":"","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false, false)
+	out := checkSystemInstructionsWithMode(payload, false, false, "")
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 2 {
@@ -1051,7 +1051,7 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	payload := []byte(`{"system":[{"type":"text","text":"Be concise."}],"messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false, false)
+	out := checkSystemInstructionsWithMode(payload, false, false, "")
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
@@ -1066,7 +1066,7 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	payload := []byte(`{"system":"Use <xml> tags & \"quotes\" in output.","messages":[{"role":"user","content":"hi"}]}`)
 
-	out := checkSystemInstructionsWithMode(payload, false, false)
+	out := checkSystemInstructionsWithMode(payload, false, false, "")
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {

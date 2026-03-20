@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func resetSessionPool() {
@@ -31,8 +34,18 @@ func TestCachedUserID_ReusesWithinPool(t *testing.T) {
 func TestCachedUserID_PoolUsesMultipleSessions(t *testing.T) {
 	resetSessionPool()
 
+	// Simulate high RPM by pre-seeding the window, then verify pool grows.
+	sessionPoolsMu.Lock()
+	h := sha256.Sum256([]byte("session-pool:api-key-multi"))
+	cacheKey := hex.EncodeToString(h[:])
+	sessionPools[cacheKey] = &sessionPool{
+		slots:       []sessionSlot{newSessionSlot(), newSessionSlot(), newSessionSlot()},
+		windowStart: time.Now().Add(-1 * time.Minute),
+		windowReqs:  100, // fake high RPM
+	}
+	sessionPoolsMu.Unlock()
+
 	seen := make(map[string]bool)
-	// With 2-4 pool slots, after enough requests we should see multiple session_ids.
 	for i := 0; i < 100; i++ {
 		id := cachedUserID("api-key-multi", "", "")
 		sid := extractSessionID(id)
@@ -43,9 +56,26 @@ func TestCachedUserID_PoolUsesMultipleSessions(t *testing.T) {
 	}
 
 	if len(seen) < 2 {
-		t.Fatalf("expected multiple session_ids from pool, got %d unique", len(seen))
+		t.Fatalf("expected multiple session_ids from pool with high RPM, got %d unique", len(seen))
 	}
-	t.Logf("saw %d unique session_ids across 100 requests", len(seen))
+	t.Logf("saw %d unique session_ids across 100 requests (high RPM)", len(seen))
+}
+
+func TestCachedUserID_LowRPMUsesSingleSession(t *testing.T) {
+	resetSessionPool()
+
+	// At low RPM (few requests, short burst), pool should have 1 slot.
+	seen := make(map[string]bool)
+	for i := 0; i < 5; i++ {
+		id := cachedUserID("api-key-low", "", "")
+		sid := extractSessionID(id)
+		seen[sid] = true
+	}
+
+	if len(seen) != 1 {
+		t.Fatalf("expected 1 session_id at low RPM, got %d unique", len(seen))
+	}
+	t.Logf("low RPM correctly uses single session")
 }
 
 func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {

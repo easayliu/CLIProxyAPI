@@ -133,7 +133,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// version connects through an upstream proxy like NewAPI.
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode)
+		body = checkSystemInstructionsWithMode(body, false, oauthMode, apiKey)
 	}
 
 	// Sanitize context_management.edits: remove unsupported edit types before
@@ -320,7 +320,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// to ensure version consistency with our template, regardless of cloaking.
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode)
+		body = checkSystemInstructionsWithMode(body, false, oauthMode, apiKey)
 	}
 
 	// Sanitize context_management.edits: remove unsupported edit types before
@@ -962,7 +962,7 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithMode(payload, false, false)
+	return checkSystemInstructionsWithMode(payload, false, false, "")
 }
 
 func isClaudeOAuthToken(apiKey string) bool {
@@ -1244,7 +1244,7 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool, realDeviceID
 //  3. SHA-256(salt + chars + version), take first 3 hex chars
 //
 // cch is a 5-char hex hash derived from session-specific data (updated in v2.1.80).
-func generateBillingHeader(payload []byte) string {
+func generateBillingHeader(payload []byte, apiKey string) string {
 	const salt = "59cf53e54c78"
 	const version = "2.1.80"
 
@@ -1285,7 +1285,7 @@ func generateBillingHeader(payload []byte) string {
 	h := sha256.Sum256([]byte(salt + chars + version))
 	buildHash := hex.EncodeToString(h[:])[:3]
 
-	cch := generateCCH()
+	cch := getLastPickedCCH(apiKey)
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
 }
 
@@ -1297,10 +1297,10 @@ func generateBillingHeader(payload []byte) string {
 //
 // When oauthMode is true, cache_control blocks include ttl:"1h" to match the
 // real Claude Code CLI behaviour under OAuth + active quota (fQ/aFK logic).
-func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool) []byte {
+func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, apiKey string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(payload)
+	billingText := generateBillingHeader(payload, apiKey)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
 	// Agent block matches real Claude Code v2.1.80 interactive mode system[1].
@@ -1733,7 +1733,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// before applyCloaking, so it applies to all requests regardless of cloaking.
 	// In strict mode, strip user system messages and keep only billing + agent blocks.
 	if strictMode && !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, true, true)
+		payload = checkSystemInstructionsWithMode(payload, true, true, apiKey)
 	}
 
 	// Inject the full Claude Code CLI system prompt as system[2] and migrate
@@ -1770,6 +1770,9 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		}
 	}
 	payload = injectFakeUserID(payload, apiKey, cacheUserID, realDeviceID, realAccountUUID)
+
+	// Inject standard CLI tools if client didn't send any.
+	payload = injectDefaultToolsIfMissing(payload)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {

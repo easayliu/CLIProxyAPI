@@ -92,12 +92,3 @@ func extractFieldFromUserID(userID string, field string) string {
 		return ""
 	}
 }
-
-// generateCCH generates a 5-char hex hash for the billing header cch field.
-// In Claude Code 2.1.79+ this is derived from session-specific data.
-// We generate a random value since the exact derivation is internal to Claude Code.
-func generateCCH() string {
-	b := make([]byte, 3)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)[:5]
-}

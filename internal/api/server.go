@@ -434,6 +434,51 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+
+	// CLI stub endpoints – simulate responses the Claude Code CLI expects
+	// from api.anthropic.com during startup and operation.
+	s.registerCLIStubRoutes()
+}
+
+// registerCLIStubRoutes registers stub endpoints that the Claude Code CLI
+// calls during startup and normal operation. These endpoints simulate the
+// responses that api.anthropic.com returns, allowing the proxy to serve as
+// a complete replacement without the CLI needing direct upstream access.
+func (s *Server) registerCLIStubRoutes() {
+	if s.mgmt == nil {
+		return
+	}
+
+	// /api/oauth/* endpoints
+	apiOAuth := s.engine.Group("/api/oauth")
+	{
+		apiOAuth.GET("/account/settings", s.mgmt.CLIAccountSettings)
+		apiOAuth.GET("/claude_cli/client_data", s.mgmt.CLIClientData)
+	}
+
+	// /api/claude_code/* endpoints (organization-level settings & policies)
+	apiCC := s.engine.Group("/api/claude_code")
+	{
+		apiCC.GET("/settings", s.mgmt.CLICodeSettings)
+		apiCC.GET("/policy_limits", s.mgmt.CLIPolicyLimits)
+		apiCC.GET("/organizations/metrics_enabled", s.mgmt.CLIMetricsEnabled)
+		apiCC.POST("/metrics", s.mgmt.CLIMetrics)
+	}
+
+	// /api/claude_code_* feature flags (legacy flat paths)
+	s.engine.GET("/api/claude_code_penguin_mode", s.mgmt.CLIPenguinMode)
+	s.engine.GET("/api/claude_code_grove", s.mgmt.CLIGrove)
+
+	// /v1/mcp_servers - remote MCP server list
+	s.engine.GET("/v1/mcp_servers", s.mgmt.CLIMCPServers)
+
+	// Telemetry sinks (accept and discard)
+	s.engine.POST("/api/eval/*path", s.mgmt.CLIEvalSDK)
+	s.engine.POST("/api/event_logging/v2/batch", s.mgmt.CLIEventLogging)
+
+	// Datadog log ingestion stub – only hit when proxy intercepts all
+	// traffic (HTTP_PROXY mode). Real target: http-intake.logs.us5.datadoghq.com
+	s.engine.POST("/api/v2/logs", s.mgmt.CLIDatadogLogs)
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.

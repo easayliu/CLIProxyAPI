@@ -211,6 +211,7 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		outReq.Header.Del("Proxy-Connection")
+		outReq.Header.Set("Accept-Encoding", "identity") // force uncompressed responses for capture
 
 		resp, err := http.DefaultClient.Do(outReq)
 		if err != nil {
@@ -324,12 +325,20 @@ func (p *httpProxy) logResponse(seq int64, ts time.Time, method, url string, req
 		dump["request"].(map[string]interface{})["body_raw"] = string(reqBody)
 	}
 
+	// Decompress response body if gzip-encoded
+	logBody := respBody
+	if isGzip(respBody) {
+		if d, err := decompressGzip(respBody); err == nil {
+			logBody = d
+		}
+	}
+
 	// Parse response body
 	var respJSON interface{}
-	if json.Unmarshal(respBody, &respJSON) == nil {
+	if json.Unmarshal(logBody, &respJSON) == nil {
 		dump["response"].(map[string]interface{})["body"] = respJSON
-	} else if len(respBody) > 0 {
-		s := string(respBody)
+	} else if len(logBody) > 0 {
+		s := string(logBody)
 		if len(s) > 100000 {
 			s = s[:100000] + "...(truncated)"
 		}

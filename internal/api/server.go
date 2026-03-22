@@ -449,15 +449,42 @@ func (s *Server) registerCLIStubRoutes() {
 		return
 	}
 
-	// /api/oauth/* endpoints
-	apiOAuth := s.engine.Group("/api/oauth")
+	authMW := AuthMiddleware(s.accessManager)
+
+	// --- No-auth endpoints (connectivity & telemetry sinks) ---
+
+	// Connectivity check
+	s.engine.GET("/api/hello", s.mgmt.CLIHello)
+
+	// Telemetry sinks (accept and discard, no auth required)
+	s.engine.POST("/api/eval/*path", s.mgmt.CLIEvalSDK)
+	s.engine.POST("/api/event_logging/v2/batch", s.mgmt.CLIEventLogging)
+	s.engine.POST("/api/event_logging/batch", s.mgmt.CLIEventLoggingLegacy)
+
+	// Datadog log ingestion stub – only hit when proxy intercepts all
+	// traffic (HTTP_PROXY mode). Real target: http-intake.logs.us5.datadoghq.com
+	s.engine.POST("/api/v2/logs", s.mgmt.CLIDatadogLogs)
+
+	// --- Auth-required endpoints (identity-aware) ---
+
+	// /api/oauth/* endpoints – return identity data consistent with cloaking layer
+	apiOAuth := s.engine.Group("/api/oauth", authMW)
 	{
 		apiOAuth.GET("/account/settings", s.mgmt.CLIAccountSettings)
 		apiOAuth.GET("/claude_cli/client_data", s.mgmt.CLIClientData)
+		apiOAuth.GET("/profile", s.mgmt.CLIOAuthProfile)
+		apiOAuth.GET("/claude_cli/roles", s.mgmt.CLIOAuthRoles)
+		apiOAuth.GET("/organizations/:uuid/referral/eligibility", s.mgmt.CLIReferralEligibility)
+	}
+
+	// /api/organization/* endpoints
+	apiOrg := s.engine.Group("/api/organization", authMW)
+	{
+		apiOrg.GET("/claude_code_first_token_date", s.mgmt.CLIFirstTokenDate)
 	}
 
 	// /api/claude_code/* endpoints (organization-level settings & policies)
-	apiCC := s.engine.Group("/api/claude_code")
+	apiCC := s.engine.Group("/api/claude_code", authMW)
 	{
 		apiCC.GET("/settings", s.mgmt.CLICodeSettings)
 		apiCC.GET("/policy_limits", s.mgmt.CLIPolicyLimits)
@@ -466,19 +493,11 @@ func (s *Server) registerCLIStubRoutes() {
 	}
 
 	// /api/claude_code_* feature flags (legacy flat paths)
-	s.engine.GET("/api/claude_code_penguin_mode", s.mgmt.CLIPenguinMode)
-	s.engine.GET("/api/claude_code_grove", s.mgmt.CLIGrove)
+	s.engine.GET("/api/claude_code_penguin_mode", authMW, s.mgmt.CLIPenguinMode)
+	s.engine.GET("/api/claude_code_grove", authMW, s.mgmt.CLIGrove)
 
 	// /v1/mcp_servers - remote MCP server list
-	s.engine.GET("/v1/mcp_servers", s.mgmt.CLIMCPServers)
-
-	// Telemetry sinks (accept and discard)
-	s.engine.POST("/api/eval/*path", s.mgmt.CLIEvalSDK)
-	s.engine.POST("/api/event_logging/v2/batch", s.mgmt.CLIEventLogging)
-
-	// Datadog log ingestion stub – only hit when proxy intercepts all
-	// traffic (HTTP_PROXY mode). Real target: http-intake.logs.us5.datadoghq.com
-	s.engine.POST("/api/v2/logs", s.mgmt.CLIDatadogLogs)
+	s.engine.GET("/v1/mcp_servers", authMW, s.mgmt.CLIMCPServers)
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.

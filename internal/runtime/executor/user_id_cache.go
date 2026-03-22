@@ -245,17 +245,29 @@ func getLastPickedCCH(apiKey string) string {
 	return randomCCH()
 }
 
-// deriveDeviceID generates a stable device_id (64-hex) from the API key.
+// DeriveDeviceID generates a stable device_id (64-hex) from the API key.
 // Real Claude Code CLI generates this once per device and persists it.
-func deriveDeviceID(apiKey string) string {
+func DeriveDeviceID(apiKey string) string {
 	h := sha256.Sum256([]byte("device:" + apiKey))
 	return hex.EncodeToString(h[:])
 }
 
-// deriveAccountUUID generates a stable account_uuid from the API key.
+// DeriveAccountUUID generates a stable account_uuid from the API key.
 // Real Claude Code CLI gets this from the OAuth account info and it never changes.
-func deriveAccountUUID(apiKey string) string {
+func DeriveAccountUUID(apiKey string) string {
 	h := sha256.Sum256([]byte("account:" + apiKey))
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(h[0:4]),
+		hex.EncodeToString(h[4:6]),
+		hex.EncodeToString(h[6:8]),
+		hex.EncodeToString(h[8:10]),
+		hex.EncodeToString(h[10:16]),
+	)
+}
+
+// DeriveOrganizationUUID generates a stable organization_uuid from the API key.
+func DeriveOrganizationUUID(apiKey string) string {
+	h := sha256.Sum256([]byte("organization:" + apiKey))
 	return fmt.Sprintf("%s-%s-%s-%s-%s",
 		hex.EncodeToString(h[0:4]),
 		hex.EncodeToString(h[4:6]),
@@ -281,12 +293,12 @@ func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID
 		return generateFakeUserID()
 	}
 
-	deviceID := deriveDeviceID(apiKey)
+	deviceID := DeriveDeviceID(apiKey)
 	if realDeviceID != "" {
 		deviceID = realDeviceID
 	}
 
-	accountUUID := deriveAccountUUID(apiKey)
+	accountUUID := DeriveAccountUUID(apiKey)
 	if realAccountUUID != "" {
 		accountUUID = realAccountUUID
 	}

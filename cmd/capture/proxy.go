@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,8 +24,9 @@ import (
 )
 
 const (
-	proxyAddr    = "127.0.0.1:19877"
-	proxyDumpDir = "/tmp/proxy_captures"
+	proxyAddr      = "127.0.0.1:19877"
+	proxyDumpDir   = "/tmp/proxy_captures"
+	upstreamProxy  = "http://127.0.0.1:6152"
 )
 
 // runHTTPProxy starts an HTTP/HTTPS forward proxy with MITM for TLS.
@@ -48,11 +50,20 @@ func runHTTPProxy() {
 	var counter atomic.Int64
 	var mu sync.Mutex
 
+	// Build HTTP client with upstream proxy
+	proxyURL, _ := url.Parse(upstreamProxy)
+	upstreamTransport := &http.Transport{
+		Proxy:           http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	upstreamClient := &http.Client{Transport: upstreamTransport}
+
 	proxy := &httpProxy{
 		ca:      ca,
 		caKey:   caKey,
 		counter: &counter,
 		mu:      &mu,
+		client:  upstreamClient,
 	}
 
 	fmt.Printf("HTTP/HTTPS Capture Proxy running on %s\n", proxyAddr)
@@ -77,10 +88,11 @@ func runHTTPProxy() {
 }
 
 type httpProxy struct {
-	ca      *x509.Certificate
-	caKey   *ecdsa.PrivateKey
-	counter *atomic.Int64
-	mu      *sync.Mutex
+	ca       *x509.Certificate
+	caKey    *ecdsa.PrivateKey
+	counter  *atomic.Int64
+	mu       *sync.Mutex
+	client   *http.Client
 }
 
 func (p *httpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +125,7 @@ func (p *httpProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	outReq.Header.Del("Proxy-Connection")
 
-	resp, err := http.DefaultTransport.(*http.Transport).RoundTrip(outReq)
+	resp, err := p.client.Do(outReq)
 	if err != nil {
 		p.logError(seq, "upstream error: %v", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -213,7 +225,7 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		outReq.Header.Del("Proxy-Connection")
 		outReq.Header.Set("Accept-Encoding", "identity") // force uncompressed responses for capture
 
-		resp, err := http.DefaultClient.Do(outReq)
+		resp, err := p.client.Do(outReq)
 		if err != nil {
 			p.logError(seq, "upstream HTTPS error: %v", err)
 			errResp := fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Length: %d\r\n\r\n%s",
@@ -228,18 +240,18 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 		// Write response back to client through TLS
 		var respBuf strings.Builder
-		respBuf.WriteString(fmt.Sprintf("HTTP/%d.%d %d %s\r\n", resp.ProtoMajor, resp.ProtoMinor, resp.StatusCode, resp.Status))
-		// Write headers
+		respBuf.WriteString(fmt.Sprintf("HTTP/%d.%d %s\r\n", resp.ProtoMajor, resp.ProtoMinor, resp.Status))
+		// Write headers, skip hop-by-hop and length headers we override
 		for k, vv := range resp.Header {
-			// Skip transfer-encoding since we're writing full body
-			if strings.EqualFold(k, "Transfer-Encoding") {
+			kl := strings.ToLower(k)
+			if kl == "transfer-encoding" || kl == "content-length" || kl == "content-encoding" {
 				continue
 			}
 			for _, v := range vv {
 				respBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 			}
 		}
-		// Override content-length with actual body size
+		// Set actual body size
 		respBuf.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(respBody)))
 		respBuf.WriteString("\r\n")
 		_, _ = tlsConn.Write([]byte(respBuf.String()))

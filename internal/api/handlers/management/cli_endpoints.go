@@ -3,18 +3,43 @@
 package management
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 )
+
+// --- Connectivity check ---
+
+// CLIHello handles GET /api/hello
+// Returns a simple connectivity check response.
+func (h *Handler) CLIHello(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"message": "hello",
+	})
+}
 
 // --- OAuth / account endpoints ---
 
 // CLIAccountSettings handles GET /api/oauth/account/settings
-// Returns managed/organization settings for the CLI.
+// Returns account-level settings. The real API returns a flat object
+// with feature flags and preferences (grove_enabled, tool_search_mode, etc.).
 func (h *Handler) CLIAccountSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"settings": gin.H{},
+		"grove_enabled":                    true,
+		"grove_notice_viewed_at":           nil,
+		"has_finished_claudeai_onboarding": true,
+		"has_started_claudeai_onboarding":  true,
+		"onboarding_use_case":              "personal",
+		"tool_search_mode":                 "auto",
+		"paprika_mode":                     "off",
+		"enabled_web_search":               true,
+		"enabled_artifacts_attachments":     false,
+		"dismissed_saffron_themes":          true,
 	})
 }
 
@@ -23,6 +48,75 @@ func (h *Handler) CLIAccountSettings(c *gin.Context) {
 func (h *Handler) CLIClientData(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"client_data": gin.H{},
+	})
+}
+
+// CLIOAuthProfile handles GET /api/oauth/profile
+// Returns account, application, and organization info consistent with
+// the cloaked identity derived from the authenticated API key.
+func (h *Handler) CLIOAuthProfile(c *gin.Context) {
+	apiKey, accountUUID, orgUUID := h.cliIdentity(c)
+	email := deriveEmail(apiKey)
+
+	c.JSON(http.StatusOK, gin.H{
+		"account": gin.H{
+			"created_at":     "2025-01-01T00:00:00.000000Z",
+			"display_name":   email,
+			"email":          email,
+			"full_name":      email,
+			"has_claude_max": true,
+			"has_claude_pro":  false,
+			"uuid":           accountUUID,
+		},
+		"application": gin.H{
+			"name": "Claude Code",
+			"slug": "claude-code",
+			"uuid": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		},
+		"organization": gin.H{
+			"billing_type":             "stripe_subscription",
+			"has_extra_usage_enabled":  false,
+			"name":                     email + "'s Organization",
+			"organization_type":        "claude_max",
+			"rate_limit_tier":          "default_claude_max_20x",
+			"subscription_created_at":  "2025-01-01T00:00:00.000000Z",
+			"subscription_status":      "active",
+			"uuid":                     orgUUID,
+		},
+	})
+}
+
+// CLIOAuthRoles handles GET /api/oauth/claude_cli/roles
+// Returns organization role info for the authenticated user.
+func (h *Handler) CLIOAuthRoles(c *gin.Context) {
+	_, _, orgUUID := h.cliIdentity(c)
+
+	c.JSON(http.StatusOK, gin.H{
+		"organization_name": "Organization",
+		"organization_role": "admin",
+		"organization_uuid": orgUUID,
+		"workspace_name":    nil,
+		"workspace_role":    nil,
+		"workspace_uuid":    nil,
+	})
+}
+
+// CLIFirstTokenDate handles GET /api/organization/claude_code_first_token_date
+// Returns the date of the first API token usage for this organization.
+func (h *Handler) CLIFirstTokenDate(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"first_token_date": time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// CLIReferralEligibility handles GET /api/oauth/organizations/:uuid/referral/eligibility
+// Returns guest pass referral eligibility status.
+func (h *Handler) CLIReferralEligibility(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"eligible":              false,
+		"referral_code_details": nil,
+		"referrer_reward":       nil,
+		"remaining_passes":      nil,
 	})
 }
 
@@ -144,8 +238,20 @@ func (h *Handler) CLIEventLogging(c *gin.Context) {
 	var req struct {
 		Events []any `json:"events"`
 	}
-	// BindJSON would abort with 400 on malformed input; use
-	// ShouldBindJSON and ignore errors so we always return 200.
+	// ShouldBindJSON ignores errors so we always return 200.
+	_ = c.ShouldBindJSON(&req)
+	c.JSON(http.StatusOK, gin.H{
+		"accepted_count": len(req.Events),
+		"rejected_count": 0,
+	})
+}
+
+// CLIEventLoggingLegacy handles POST /api/event_logging/batch
+// Legacy event logging endpoint used during first-time CLI setup.
+func (h *Handler) CLIEventLoggingLegacy(c *gin.Context) {
+	var req struct {
+		Events []any `json:"events"`
+	}
 	_ = c.ShouldBindJSON(&req)
 	c.JSON(http.StatusOK, gin.H{
 		"accepted_count": len(req.Events),
@@ -169,4 +275,29 @@ func (h *Handler) CLIMetrics(c *gin.Context) {
 // is only reached when the proxy intercepts all traffic (HTTP_PROXY mode).
 func (h *Handler) CLIDatadogLogs(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{})
+}
+
+// --- Identity helpers ---
+
+// cliIdentity extracts the API key from the gin context and derives
+// stable device_id, account_uuid, and organization_uuid using the same
+// derivation functions as the cloaking layer. This ensures all stub
+// endpoints return identity data consistent with v1/messages metadata.
+func (h *Handler) cliIdentity(c *gin.Context) (apiKey, accountUUID, orgUUID string) {
+	if v, ok := c.Get("apiKey"); ok {
+		apiKey, _ = v.(string)
+	}
+	if apiKey == "" {
+		apiKey = "default"
+	}
+	accountUUID = executor.DeriveAccountUUID(apiKey)
+	orgUUID = executor.DeriveOrganizationUUID(apiKey)
+	return
+}
+
+// deriveEmail generates a stable, plausible email from the API key.
+func deriveEmail(apiKey string) string {
+	h := sha256.Sum256([]byte("email:" + apiKey))
+	tag := hex.EncodeToString(h[:4])
+	return fmt.Sprintf("user_%s@claude.ai", tag)
 }

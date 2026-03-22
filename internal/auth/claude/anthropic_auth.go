@@ -377,11 +377,29 @@ func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken st
 //   - storage: The existing token storage to update
 //   - tokenData: The new token data to apply
 func (o *ClaudeAuth) UpdateTokenStorage(storage *ClaudeTokenStorage, tokenData *ClaudeTokenData) {
+	// Preserve the existing DeviceID — it was generated once at initial auth and must
+	// remain stable across token refreshes. Real Claude Code CLI persists device_id
+	// per device and never changes it. The refresh endpoint does not return a new one.
+	existingDeviceID := storage.DeviceID
+	existingAccountUUID := storage.AccountUUID
+
 	storage.AccessToken = tokenData.AccessToken
 	storage.RefreshToken = tokenData.RefreshToken
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
+
+	// Use refreshed AccountUUID if provided, otherwise keep existing.
+	if tokenData.AccountUUID != "" {
+		storage.AccountUUID = tokenData.AccountUUID
+	} else if existingAccountUUID != "" {
+		storage.AccountUUID = existingAccountUUID
+	}
+
+	// Always preserve the original DeviceID — refresh never generates a new one.
+	if existingDeviceID != "" {
+		storage.DeviceID = existingDeviceID
+	}
 }
 
 // ExchangeSessionKeyForTokens uses a browser session key to programmatically

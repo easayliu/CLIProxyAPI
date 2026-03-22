@@ -936,18 +936,18 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("Anthropic-Version", "2023-06-01")
 	r.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	r.Header.Set("X-App", "cli")
-	// Values below match Claude Code 2.1.80 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-19).
+	// Values below match Claude Code 2.1.81 / @anthropic-ai/sdk 0.74.0 (updated 2026-03-22).
 	r.Header.Set("X-Stainless-Retry-Count", "0")
 	r.Header.Set("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	r.Header.Set("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
 	r.Header.Set("X-Stainless-Runtime", "node")
 	r.Header.Set("X-Stainless-Lang", "js")
-	r.Header.Set("X-Stainless-Arch", mapStainlessArch())
-	r.Header.Set("X-Stainless-Os", mapStainlessOS())
+	r.Header.Set("X-Stainless-Arch", hdrDefault(hd.Arch, mapStainlessArch()))
+	r.Header.Set("X-Stainless-Os", hdrDefault(hd.Os, mapStainlessOS()))
 	r.Header.Set("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
-	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.80 (external, cli)"))
+	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.81 (external, cli)"))
 	r.Header.Set("Connection", "keep-alive")
-	// Real Claude Code CLI 2.1.80 sends the same Accept and Accept-Encoding
+	// Real Claude Code CLI 2.1.81 sends the same Accept and Accept-Encoding
 	// for both streaming and non-streaming requests.  The stream mode is
 	// controlled by the "stream" field in the JSON body, not by the Accept header.
 	// The response body is decompressed by decodeResponseBody before the SSE
@@ -1240,6 +1240,9 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 // All three fields (device_id, account_uuid, session_id) are replaced to prevent
 // cross-referencing between client telemetry and proxied API requests.
 // When useCache is false, a new user ID is generated for every call.
+//
+// Real Claude Code CLI sends ONLY metadata.user_id — no organization_uuid or other
+// fields in the metadata object. Verified via packet capture of real CLI traffic.
 func injectFakeUserID(payload []byte, apiKey string, useCache bool, realDeviceID string, realAccountUUID string) []byte {
 	generateID := func() string {
 		if useCache {
@@ -1261,10 +1264,10 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool, realDeviceID
 //  2. Take runes at positions 4, 7, 20 (default "0" if out of range)
 //  3. SHA-256(salt + chars + version), take first 3 hex chars
 //
-// cch is a 5-char hex hash derived from session-specific data (updated in v2.1.80).
+// cch is a 5-char hex hash derived from session-specific data (updated in v2.1.81).
 func generateBillingHeader(payload []byte, apiKey string) string {
 	const salt = "59cf53e54c78"
-	const version = "2.1.80"
+	const version = "2.1.81"
 
 	// Extract text of the first user message from the messages array.
 	var firstUserText string
@@ -1321,7 +1324,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 	billingText := generateBillingHeader(payload, apiKey)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
-	// Agent block matches real Claude Code v2.1.80 interactive mode system[1].
+	// Agent block matches real Claude Code v2.1.81 interactive mode system[1].
 	// In OAuth mode the real CLI adds ttl:"1h" via fQ when quota conditions are met.
 	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral"}}`
 	if oauthMode {
@@ -1336,7 +1339,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 	}
 
 	// Non-strict mode: billing header + agent identifier + user system messages
-	// Always regenerate to ensure version consistency with our template (2.1.80).
+	// Always regenerate to ensure version consistency with our template (2.1.81).
 	// If the client already injected a billing header (e.g. real Claude Code CLI
 	// with a different version), strip it to prevent version mismatch fingerprints.
 	result := "[" + billingBlock + "," + agentBlock
@@ -1421,7 +1424,9 @@ func stripNonStandardFields(payload []byte) []byte {
 	for _, key := range toDelete {
 		result, _ = sjson.DeleteBytes(result, key)
 	}
-	// Sanitize metadata: only keep user_id, remove any extra fields injected by upstream.
+	// Sanitize metadata: keep only user_id. Real Claude Code CLI sends ONLY
+	// metadata.user_id in the request body — no organization_uuid or other fields.
+	// Verified via packet capture of real CLI traffic.
 	metadata := gjson.GetBytes(result, "metadata")
 	if metadata.Exists() && metadata.IsObject() {
 		userID := gjson.GetBytes(result, "metadata.user_id").String()

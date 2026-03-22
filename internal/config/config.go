@@ -135,6 +135,13 @@ type ClaudeHeaderDefaults struct {
 	PackageVersion string `yaml:"package-version" json:"package-version"`
 	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
 	Timeout        string `yaml:"timeout" json:"timeout"`
+	// Os overrides X-Stainless-Os header (default: derived from runtime.GOOS).
+	// Set to "MacOS" or "Windows" to match typical CLI user environments
+	// when the proxy runs on Linux servers.
+	Os string `yaml:"os" json:"os"`
+	// Arch overrides X-Stainless-Arch header (default: derived from runtime.GOARCH).
+	// Set to "arm64" or "x64" to match typical CLI user environments.
+	Arch string `yaml:"arch" json:"arch"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex

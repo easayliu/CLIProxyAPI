@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -36,28 +38,46 @@ type telemetrySession struct {
 	initialized bool      // whether init events have been sent
 	msgCount    int       // messages sent in this session
 	createdAt   time.Time
+	expireAt    time.Time // randomized TTL, matching session pool range
 }
 
 const (
-	telemetrySessionTTL   = 2 * time.Hour
-	telemetryUserAgent    = "claude-code/2.1.81"
+	// telemetrySessionTTL matches the session pool TTL range (1-3h) at the midpoint.
+	// Using the same base+jitter as sessionSlotBaseTTL/sessionSlotJitter ensures
+	// telemetry sessions and session pool slots expire in a similar timeframe,
+	// preventing detectable TTL divergence between the two systems.
+	telemetrySessionBaseTTL = 1 * time.Hour
+	telemetrySessionJitter  = 2 * time.Hour // total range: 1-3 hours, same as session pool
+
+	// Real CLI telemetry uses a DIFFERENT header set from v1/messages API requests.
+	// Verified via MITM proxy capture: telemetry only sends 4 custom headers.
 	telemetryServiceName  = "claude-code"
 	telemetryBetaHeader   = "oauth-2025-04-20"
-	telemetryBetas        = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
-	telemetryVersion      = "2.1.81"
-	telemetryBuildTime    = "2026-03-20T21:26:18Z"
-	telemetryNodeVersion  = "v24.3.0"
+	// Event body betas differ from HTTP header beta — the body carries the full set.
+	telemetryEventBetas   = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
+
+	// Version constants matching real Claude Code CLI.
+	telemetryCliVersion  = "2.1.81"
+	telemetryBuildTime   = "2026-03-20T21:26:18Z"
+	telemetryNodeVersion = "v24.3.0"
 )
 
-// NewTelemetryEmitter creates a new TelemetryEmitter with a 5s timeout HTTP client.
+// NewTelemetryEmitter creates a new TelemetryEmitter using the same Bun BoringSSL
+// TLS-fingerprinted HTTP client as the main API requests. This ensures telemetry
+// requests have the same JA3/JA4 fingerprint, preventing detection via TLS mismatch.
 func NewTelemetryEmitter() *TelemetryEmitter {
+	client := claudeauth.NewAnthropicHttpClient("")
+	client.Timeout = 5 * time.Second
 	return &TelemetryEmitter{
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		client:   client,
 		upstream: "https://api.anthropic.com",
 		sessions: make(map[string]*telemetrySession),
 	}
+}
+
+// randomTelemetryTTL generates a random TTL in the same range as session pool slots (1-3h).
+func randomTelemetryTTL() time.Duration {
+	return telemetrySessionBaseTTL + time.Duration(rand.Int64N(int64(telemetrySessionJitter)))
 }
 
 // EmitForMessage is called after each successful v1/messages forwarding.
@@ -104,8 +124,8 @@ func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string) *tel
 	session, ok := te.sessions[apiKey]
 	now := time.Now()
 
-	// Expire sessions older than 2 hours
-	if ok && now.Sub(session.createdAt) > telemetrySessionTTL {
+	// Expire sessions using per-session randomized TTL (1-3h, matching session pool range).
+	if ok && now.After(session.expireAt) {
 		ok = false
 	}
 
@@ -121,6 +141,7 @@ func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string) *tel
 			initialized: false,
 			msgCount:    0,
 			createdAt:   now,
+			expireAt:    now.Add(randomTelemetryTTL()),
 		}
 		te.sessions[apiKey] = session
 	}
@@ -230,7 +251,7 @@ func (s *telemetrySession) buildEvent(eventName string, extraMetadata map[string
 	processB64 := base64.StdEncoding.EncodeToString(processJSON)
 
 	eventData := map[string]any{
-		"betas":                telemetryBetas,
+		"betas":                telemetryEventBetas,
 		"client_timestamp":    now.Format(time.RFC3339Nano),
 		"client_type":         "cli",
 		"device_id":           s.deviceID,
@@ -244,9 +265,9 @@ func (s *telemetrySession) buildEvent(eventName string, extraMetadata map[string
 		"additional_metadata": additionalMetadata,
 		"process":             processB64,
 		"env": map[string]any{
-			"arch":                    "arm64",
+			"arch":                    runtime.GOARCH,
 			"build_time":             telemetryBuildTime,
-			"deployment_environment":  "unknown-darwin",
+			"deployment_environment":  "unknown-" + runtime.GOOS,
 			"is_ci":                  false,
 			"is_claubbit":            false,
 			"is_claude_ai_auth":      false,
@@ -258,13 +279,13 @@ func (s *telemetrySession) buildEvent(eventName string, extraMetadata map[string
 			"is_running_with_bun":    true,
 			"node_version":           telemetryNodeVersion,
 			"package_managers":       "npm,pnpm",
-			"platform":              "darwin",
-			"platform_raw":          "darwin",
+			"platform":              runtime.GOOS,
+			"platform_raw":          runtime.GOOS,
 			"runtimes":              "node",
 			"terminal":              "vscode",
 			"vcs":                   "git",
-			"version":               telemetryVersion,
-			"version_base":          telemetryVersion,
+			"version":               telemetryCliVersion,
+			"version_base":          telemetryCliVersion,
 		},
 	}
 
@@ -306,10 +327,17 @@ func (te *TelemetryEmitter) sendEventBatch(authToken string, isOAuth bool, event
 		return
 	}
 
+	// Real CLI telemetry uses a minimal header set — completely different from
+	// the v1/messages API headers. Verified via MITM capture of real CLI 2.1.81.
+	// DO NOT add Stainless headers, Anthropic-Version, X-App, etc. here —
+	// the real CLI does not send them for telemetry, and adding them would be
+	// a detectable fingerprint (telemetry with API-style headers = proxy).
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", telemetryUserAgent)
+	req.Header.Set("User-Agent", "claude-code/"+telemetryCliVersion)
 	req.Header.Set("X-Service-Name", telemetryServiceName)
 	req.Header.Set("Anthropic-Beta", telemetryBetaHeader)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Encoding", "gzip, compress, deflate, br")
 
 	if isOAuth {
 		req.Header.Set("Authorization", "Bearer "+authToken)

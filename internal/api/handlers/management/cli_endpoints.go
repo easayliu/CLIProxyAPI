@@ -5,7 +5,9 @@ package management
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -209,7 +211,26 @@ func defaultFeatureFlag(val any) featureFlagEntry {
 // CLIEvalSDK handles POST /api/eval/sdk-*
 // Returns feature flags that control CLI behavior. The response mirrors
 // the real Statsig/LaunchDarkly format the CLI expects.
+// Also forwards the request body to the upstream Anthropic API asynchronously.
 func (h *Handler) CLIEvalSDK(c *gin.Context) {
+	// Read the request body for forwarding
+	body, _ := io.ReadAll(c.Request.Body)
+
+	// Forward to upstream if auth is available
+	apiKey, auth, ok := h.getUpstreamAuth(c)
+	if ok && auth != nil {
+		var email string
+		if auth.Metadata != nil {
+			if e, exists := auth.Metadata["email"]; exists {
+				email, _ = e.(string)
+			}
+		}
+		modifiedBody := replaceEvalSDKIdentity(body, apiKey, email)
+		// Use the original request path (e.g. /api/eval/sdk-xxx)
+		h.forwardTelemetry(c, c.Request.URL.Path, modifiedBody, auth)
+	}
+
+	// Always return feature flags immediately
 	c.JSON(http.StatusOK, gin.H{
 		"features": map[string]featureFlagEntry{
 			// Enable Datadog telemetry logging
@@ -234,34 +255,69 @@ func (h *Handler) CLIEvalSDK(c *gin.Context) {
 
 // CLIEventLogging handles POST /api/event_logging/v2/batch
 // Accepts telemetry event batches and returns accepted/rejected counts.
+// Also forwards the request body to the upstream Anthropic API asynchronously.
 func (h *Handler) CLIEventLogging(c *gin.Context) {
-	var req struct {
-		Events []any `json:"events"`
+	// Read the raw body for both parsing and forwarding
+	body, _ := io.ReadAll(c.Request.Body)
+
+	// Parse events count for the response
+	var parsed struct {
+		Events []json.RawMessage `json:"events"`
 	}
-	// ShouldBindJSON ignores errors so we always return 200.
-	_ = c.ShouldBindJSON(&req)
+	_ = json.Unmarshal(body, &parsed)
+
+	// Forward to upstream if auth is available
+	apiKey, auth, ok := h.getUpstreamAuth(c)
+	if ok && auth != nil {
+		modifiedBody := replaceEventLoggingIdentity(body, apiKey)
+		h.forwardTelemetry(c, "/api/event_logging/v2/batch", modifiedBody, auth)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"accepted_count": len(req.Events),
+		"accepted_count": len(parsed.Events),
 		"rejected_count": 0,
 	})
 }
 
 // CLIEventLoggingLegacy handles POST /api/event_logging/batch
 // Legacy event logging endpoint used during first-time CLI setup.
+// Also forwards the request body to the upstream Anthropic API asynchronously.
 func (h *Handler) CLIEventLoggingLegacy(c *gin.Context) {
-	var req struct {
-		Events []any `json:"events"`
+	// Read the raw body for both parsing and forwarding
+	body, _ := io.ReadAll(c.Request.Body)
+
+	// Parse events count for the response
+	var parsed struct {
+		Events []json.RawMessage `json:"events"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	_ = json.Unmarshal(body, &parsed)
+
+	// Forward to upstream if auth is available
+	apiKey, auth, ok := h.getUpstreamAuth(c)
+	if ok && auth != nil {
+		modifiedBody := replaceEventLoggingIdentity(body, apiKey)
+		h.forwardTelemetry(c, "/api/event_logging/batch", modifiedBody, auth)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"accepted_count": len(req.Events),
+		"accepted_count": len(parsed.Events),
 		"rejected_count": 0,
 	})
 }
 
 // CLIMetrics handles POST /api/claude_code/metrics
 // Accepts Claude Code usage metrics (OTLP-style) and acknowledges them.
+// Also forwards the request body to the upstream Anthropic API asynchronously.
 func (h *Handler) CLIMetrics(c *gin.Context) {
+	// Read the raw body for forwarding
+	body, _ := io.ReadAll(c.Request.Body)
+
+	// Forward to upstream if auth is available (no identity replacement needed for metrics)
+	_, auth, ok := h.getUpstreamAuth(c)
+	if ok && auth != nil {
+		h.forwardTelemetry(c, "/api/claude_code/metrics", body, auth)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"accepted_count": 1,
 		"rejected_count": 0,

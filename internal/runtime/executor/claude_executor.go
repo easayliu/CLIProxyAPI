@@ -37,14 +37,17 @@ import (
 // ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
-	cfg *config.Config
+	cfg              *config.Config
+	telemetryEmitter *TelemetryEmitter
 }
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
-func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
+func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
+	return &ClaudeExecutor{cfg: cfg, telemetryEmitter: NewTelemetryEmitter()}
+}
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
@@ -278,6 +281,21 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		&param,
 	)
 	resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
+
+	// Emit telemetry events to match this v1/messages request
+	if e.telemetryEmitter != nil && auth != nil {
+		upstreamKey, _ := claudeCreds(auth)
+		isOAuth := isClaudeOAuthToken(upstreamKey)
+		var email string
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["email"].(string); ok {
+				email = v
+			}
+		}
+		model := gjson.GetBytes(req.Payload, "model").String()
+		e.telemetryEmitter.EmitForMessage(upstreamKey, upstreamKey, isOAuth, model, email)
+	}
+
 	return resp, nil
 }
 

@@ -277,6 +277,19 @@ func DeriveOrganizationUUID(apiKey string) string {
 	)
 }
 
+// DeriveRH generates a stable 16-hex-char rh value from the API key.
+// Used in telemetry events' additional_metadata.rh field.
+func DeriveRH(apiKey string) string {
+	h := sha256.Sum256([]byte("rh:" + apiKey))
+	return hex.EncodeToString(h[:8])
+}
+
+// PickSessionID is the exported version of pickSessionID.
+// It selects a session_id from the adaptive pool for the given API key.
+func PickSessionID(apiKey string) string {
+	return pickSessionID(apiKey)
+}
+
 // cachedUserID builds a complete user_id with stable device_id/account_uuid
 // and a session_id picked from an adaptive pool of concurrent sessions.
 // If realDeviceID or realAccountUUID is provided (from persisted OAuth auth file),

@@ -456,10 +456,12 @@ func (s *Server) registerCLIStubRoutes() {
 	// Connectivity check
 	s.engine.GET("/api/hello", s.mgmt.CLIHello)
 
-	// Telemetry sinks (accept and discard, no auth required)
-	s.engine.POST("/api/eval/*path", s.mgmt.CLIEvalSDK)
-	s.engine.POST("/api/event_logging/v2/batch", s.mgmt.CLIEventLogging)
-	s.engine.POST("/api/event_logging/batch", s.mgmt.CLIEventLoggingLegacy)
+	// Telemetry sinks – use optional auth so forwarding works when auth is present,
+	// but requests without auth (e.g. pre-login) still get 200.
+	optAuthMW := OptionalAuthMiddleware(s.accessManager)
+	s.engine.POST("/api/eval/*path", optAuthMW, s.mgmt.CLIEvalSDK)
+	s.engine.POST("/api/event_logging/v2/batch", optAuthMW, s.mgmt.CLIEventLogging)
+	s.engine.POST("/api/event_logging/batch", optAuthMW, s.mgmt.CLIEventLoggingLegacy)
 
 	// Datadog log ingestion stub – only hit when proxy intercepts all
 	// traffic (HTTP_PROXY mode). Real target: http-intake.logs.us5.datadoghq.com
@@ -1118,5 +1120,29 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 			log.Errorf("authentication middleware error: %v", err)
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
+	}
+}
+
+// OptionalAuthMiddleware returns a Gin middleware that attempts authentication
+// but does NOT abort the request on failure. If auth succeeds, it sets apiKey
+// and other context values. If auth fails, the request proceeds without them.
+// This is used for telemetry endpoints that should work both with and without auth.
+func OptionalAuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if manager == nil {
+			c.Next()
+			return
+		}
+
+		result, err := manager.Authenticate(c.Request.Context(), c.Request)
+		if err == nil && result != nil {
+			c.Set("apiKey", result.Principal)
+			c.Set("accessProvider", result.Provider)
+			if len(result.Metadata) > 0 {
+				c.Set("accessMetadata", result.Metadata)
+			}
+		}
+		// Always continue regardless of auth result
+		c.Next()
 	}
 }

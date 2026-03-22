@@ -280,7 +280,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		data,
 		&param,
 	)
-	resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 
 	// Emit telemetry events to match this v1/messages request
 	if e.telemetryEmitter != nil && auth != nil {
@@ -504,7 +504,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				&param,
 			)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
@@ -622,7 +622,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	appendAPIResponseChunk(ctx, e.cfg, data)
 	count := gjson.GetBytes(data, "input_tokens").Int()
 	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
-	return cliproxyexecutor.Response{Payload: []byte(out), Headers: resp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
 }
 
 func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -1357,10 +1357,11 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 				}
 				partJSON := part.Raw
 				if !part.Get("cache_control").Exists() {
-					partJSON, _ = sjson.Set(partJSON, "cache_control.type", "ephemeral")
+					updated, _ := sjson.SetBytes([]byte(partJSON), "cache_control.type", "ephemeral")
 					if oauthMode {
-						partJSON, _ = sjson.Set(partJSON, "cache_control.ttl", "1h")
+						updated, _ = sjson.SetBytes(updated, "cache_control.ttl", "1h")
 					}
+					partJSON = string(updated)
 				}
 				result += "," + partJSON
 			}
@@ -1371,7 +1372,8 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 		if oauthMode {
 			partJSON = `{"type":"text","cache_control":{"type":"ephemeral","ttl":"1h"}}`
 		}
-		partJSON, _ = sjson.Set(partJSON, "text", system.String())
+		updated, _ := sjson.SetBytes([]byte(partJSON), "text", system.String())
+		partJSON = string(updated)
 		result += "," + partJSON
 	}
 	result += "]"

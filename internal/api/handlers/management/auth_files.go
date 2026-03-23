@@ -1132,6 +1132,20 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	return store.Save(ctx, record)
 }
 
+// buildClaudeAuthMetadata constructs the Metadata map for a Claude OAuth auth record.
+// It includes account_uuid and device_id so that cloaking can use the real values
+// from the OAuth token response instead of falling back to hash-derived fakes.
+func buildClaudeAuthMetadata(ts *claude.ClaudeTokenStorage) map[string]any {
+	meta := map[string]any{"email": ts.Email}
+	if ts.AccountUUID != "" {
+		meta["account_uuid"] = ts.AccountUUID
+	}
+	if ts.DeviceID != "" {
+		meta["device_id"] = ts.DeviceID
+	}
+	return meta
+}
+
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
@@ -1239,7 +1253,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			Provider: "claude",
 			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
 			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
+			Metadata: buildClaudeAuthMetadata(tokenStorage),
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
@@ -1302,7 +1316,7 @@ func (h *Handler) RequestAnthropicSessionKeyToken(c *gin.Context) {
 		Provider: "claude",
 		FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
 		Storage:  tokenStorage,
-		Metadata: map[string]any{"email": tokenStorage.Email},
+		Metadata: buildClaudeAuthMetadata(tokenStorage),
 	}
 	savedPath, errSave := h.saveTokenRecord(ctx, record)
 	if errSave != nil {
@@ -1355,7 +1369,7 @@ func (h *Handler) RequestAnthropicSessionKeyConsentToken(c *gin.Context) {
 		Provider: "claude",
 		FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
 		Storage:  tokenStorage,
-		Metadata: map[string]any{"email": tokenStorage.Email},
+		Metadata: buildClaudeAuthMetadata(tokenStorage),
 	}
 	savedPath, errSave := h.saveTokenRecord(ctx, record)
 	if errSave != nil {
@@ -1447,7 +1461,7 @@ func (h *Handler) RequestAnthropicSessionKeyBatchToken(c *gin.Context) {
 				Provider: "claude",
 				FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
 				Storage:  tokenStorage,
-				Metadata: map[string]any{"email": tokenStorage.Email},
+				Metadata: buildClaudeAuthMetadata(tokenStorage),
 			}
 			savedPath, errSave := h.saveTokenRecord(ctx, record)
 			if errSave != nil {

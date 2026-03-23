@@ -22,6 +22,9 @@ type ClaudeTokenData struct {
 	// AccountUUID is the Anthropic account UUID from the OAuth token response.
 	// Used to generate realistic metadata.user_id for cloaking.
 	AccountUUID string `json:"account_uuid,omitempty"`
+	// OrganizationUUID is the Anthropic organization UUID from the OAuth token response.
+	// Used in telemetry to match the real identity behind the OAuth token.
+	OrganizationUUID string `json:"organization_uuid,omitempty"`
 	// DeviceID is a random 64-hex string persisted per auth for stable cloaking.
 	DeviceID string `json:"device_id,omitempty"`
 }

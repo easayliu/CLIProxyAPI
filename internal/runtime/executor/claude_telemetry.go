@@ -80,15 +80,24 @@ func randomTelemetryTTL() time.Duration {
 	return telemetrySessionBaseTTL + time.Duration(rand.Int64N(int64(telemetrySessionJitter)))
 }
 
+// TelemetryIdentity carries real identity fields from the auth metadata.
+// When fields are non-empty, they override the hash-derived defaults.
+type TelemetryIdentity struct {
+	DeviceID         string
+	AccountUUID      string
+	OrganizationUUID string
+}
+
 // EmitForMessage is called after each successful v1/messages forwarding.
 // It generates appropriate telemetry events and sends them to Anthropic.
 // Parameters:
-//   - apiKey: the upstream auth's API key (used for identity derivation)
+//   - apiKey: the upstream auth's API key (used for identity derivation fallback)
 //   - authToken: the token to use in Authorization header (Bearer or x-api-key)
 //   - isOAuth: whether authToken is an OAuth token (use Bearer) or API key (use x-api-key)
 //   - model: the model used in the request
 //   - email: email from auth metadata (can be empty)
-func (te *TelemetryEmitter) EmitForMessage(apiKey, authToken string, isOAuth bool, model, email string) {
+//   - identity: real identity from OAuth auth metadata (fields may be empty)
+func (te *TelemetryEmitter) EmitForMessage(apiKey, authToken string, isOAuth bool, model, email string, identity TelemetryIdentity) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -96,7 +105,7 @@ func (te *TelemetryEmitter) EmitForMessage(apiKey, authToken string, isOAuth boo
 			}
 		}()
 
-		session := te.getOrCreateSession(apiKey, model, email)
+		session := te.getOrCreateSession(apiKey, model, email, identity)
 
 		if !session.initialized {
 			events := session.emitSessionInit()
@@ -117,7 +126,8 @@ func (te *TelemetryEmitter) EmitForMessage(apiKey, authToken string, isOAuth boo
 
 // getOrCreateSession looks up or creates a telemetry session for the given API key.
 // Sessions expire after 2 hours to simulate new terminal windows.
-func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string) *telemetrySession {
+// Real identity fields from OAuth auth override hash-derived defaults when available.
+func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string, identity TelemetryIdentity) *telemetrySession {
 	te.mu.Lock()
 	defer te.mu.Unlock()
 
@@ -130,10 +140,23 @@ func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string) *tel
 	}
 
 	if !ok {
+		// Use real identity from OAuth when available, fall back to hash-derived values.
+		deviceID := DeriveDeviceID(apiKey)
+		if identity.DeviceID != "" {
+			deviceID = identity.DeviceID
+		}
+		accountUUID := DeriveAccountUUID(apiKey)
+		if identity.AccountUUID != "" {
+			accountUUID = identity.AccountUUID
+		}
+		orgUUID := DeriveOrganizationUUID(apiKey)
+		if identity.OrganizationUUID != "" {
+			orgUUID = identity.OrganizationUUID
+		}
 		session = &telemetrySession{
-			deviceID:    DeriveDeviceID(apiKey),
-			accountUUID: DeriveAccountUUID(apiKey),
-			orgUUID:     DeriveOrganizationUUID(apiKey),
+			deviceID:    deviceID,
+			accountUUID: accountUUID,
+			orgUUID:     orgUUID,
 			sessionID:   PickSessionID(apiKey),
 			rh:          DeriveRH(apiKey),
 			email:       email,

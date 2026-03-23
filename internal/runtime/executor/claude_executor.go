@@ -287,13 +287,23 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		upstreamKey, _ := claudeCreds(auth)
 		isOAuth := isClaudeOAuthToken(upstreamKey)
 		var email string
+		var identity TelemetryIdentity
 		if auth.Metadata != nil {
 			if v, ok := auth.Metadata["email"].(string); ok {
 				email = v
 			}
+			if v, ok := auth.Metadata["device_id"].(string); ok {
+				identity.DeviceID = v
+			}
+			if v, ok := auth.Metadata["account_uuid"].(string); ok {
+				identity.AccountUUID = v
+			}
+			if v, ok := auth.Metadata["organization_uuid"].(string); ok {
+				identity.OrganizationUUID = v
+			}
 		}
 		model := gjson.GetBytes(req.Payload, "model").String()
-		e.telemetryEmitter.EmitForMessage(upstreamKey, upstreamKey, isOAuth, model, email)
+		e.telemetryEmitter.EmitForMessage(upstreamKey, upstreamKey, isOAuth, model, email, identity)
 	}
 
 	return resp, nil
@@ -659,9 +669,13 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	auth.Metadata["type"] = "claude"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
-	// Keep account_uuid up-to-date from refresh response so cloaking uses the real value.
+	// Keep account_uuid and organization_uuid up-to-date from refresh response
+	// so cloaking and telemetry use the real values.
 	if td.AccountUUID != "" {
 		auth.Metadata["account_uuid"] = td.AccountUUID
+	}
+	if td.OrganizationUUID != "" {
+		auth.Metadata["organization_uuid"] = td.OrganizationUUID
 	}
 	return auth, nil
 }

@@ -1155,6 +1155,9 @@ func buildClaudeAuthMetadata(ts *claude.ClaudeTokenStorage) map[string]any {
 	if ts.AccountUUID != "" {
 		meta["account_uuid"] = ts.AccountUUID
 	}
+	if ts.OrganizationUUID != "" {
+		meta["organization_uuid"] = ts.OrganizationUUID
+	}
 	if ts.DeviceID != "" {
 		meta["device_id"] = ts.DeviceID
 	}

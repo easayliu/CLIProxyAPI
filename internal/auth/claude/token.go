@@ -41,6 +41,10 @@ type ClaudeTokenStorage struct {
 	// Persisted to generate realistic metadata.user_id for cloaking.
 	AccountUUID string `json:"account_uuid,omitempty"`
 
+	// OrganizationUUID is the Anthropic organization UUID from the OAuth token response.
+	// Persisted for telemetry identity consistency.
+	OrganizationUUID string `json:"organization_uuid,omitempty"`
+
 	// DeviceID is a random 64-hex string generated once per auth and persisted.
 	// Mirrors real Claude Code CLI behavior where device_id is generated via
 	// crypto.randomBytes(32).toString("hex") and stays fixed per device.

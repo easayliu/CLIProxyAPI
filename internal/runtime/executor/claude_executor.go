@@ -147,6 +147,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// orphaned tool_use blocks. Clients may forward truncated conversations.
 	body = repairToolUsePairing(body)
 
+	// Remove empty/whitespace-only text blocks that Anthropic rejects with
+	// "text content blocks must contain non-whitespace text".
+	body = sanitizeEmptyTextBlocks(body)
+
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
@@ -358,6 +362,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Repair tool_use/tool_result pairing: inject stub tool_result for any
 	// orphaned tool_use blocks. Clients may forward truncated conversations.
 	body = repairToolUsePairing(body)
+
+	// Remove empty/whitespace-only text blocks that Anthropic rejects with
+	// "text content blocks must contain non-whitespace text".
+	body = sanitizeEmptyTextBlocks(body)
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
@@ -1498,16 +1506,93 @@ func sanitizeContextManagementEdits(payload []byte) []byte {
 	return result
 }
 
-// cloakingContextManagement is the standard context_management value that real
-// Claude Code CLI sends on every request. The clear_thinking edit does not
-// require a server-issued signature.
-var cloakingContextManagement = []byte(`{"edits":[{"keep":"all","type":"clear_thinking_20251015"}]}`)
+// cloakingContextManagementWithThinking includes clear_thinking for requests
+// that have thinking enabled/adaptive.
+var cloakingContextManagementWithThinking = []byte(`{"edits":[{"keep":"all","type":"clear_thinking_20251015"}]}`)
+
+// cloakingContextManagementNoThinking is an empty edits list for requests
+// without thinking. Anthropic rejects clear_thinking_20251015 when thinking
+// is not enabled.
+var cloakingContextManagementNoThinking = []byte(`{"edits":[]}`)
 
 // replaceContextManagementForCloaking replaces context_management with the standard
 // CLI value. Server-signed edits from the original client are discarded because
 // their signatures are session-bound and invalid when forwarded through a proxy.
+// The clear_thinking edit is only included when the request has thinking enabled,
+// as Anthropic rejects it otherwise with "clear_thinking_20251015 strategy requires
+// thinking to be enabled or adaptive".
 func replaceContextManagementForCloaking(payload []byte) []byte {
-	result, _ := sjson.SetRawBytes(payload, "context_management", cloakingContextManagement)
+	thinking := gjson.GetBytes(payload, "thinking")
+	hasThinking := thinking.Exists() && thinking.Get("type").String() != "disabled"
+	cm := cloakingContextManagementNoThinking
+	if hasThinking {
+		cm = cloakingContextManagementWithThinking
+	}
+	result, _ := sjson.SetRawBytes(payload, "context_management", cm)
+	return result
+}
+
+// sanitizeEmptyTextBlocks removes text content blocks that contain only whitespace
+// from messages. Anthropic rejects requests with "text content blocks must contain
+// non-whitespace text". This can happen when clients send truncated conversations
+// or when cloaking/translation strips content but leaves empty text blocks.
+func sanitizeEmptyTextBlocks(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	modified := false
+	result := payload
+	msgArr := messages.Array()
+
+	for i, msg := range msgArr {
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			// String content — check for whitespace-only.
+			if content.Type == gjson.String {
+				text := strings.TrimSpace(content.String())
+				if text == "" {
+					path := fmt.Sprintf("messages.%d.content", i)
+					result, _ = sjson.SetBytes(result, path, ".")
+					modified = true
+				}
+			}
+			continue
+		}
+
+		blocks := content.Array()
+		var kept []json.RawMessage
+		changed := false
+
+		for _, block := range blocks {
+			if block.Get("type").String() == "text" {
+				text := strings.TrimSpace(block.Get("text").String())
+				if text == "" {
+					changed = true
+					continue // drop this empty text block
+				}
+			}
+			kept = append(kept, json.RawMessage(block.Raw))
+		}
+
+		if !changed {
+			continue
+		}
+
+		// If all blocks were empty text, keep a minimal placeholder.
+		if len(kept) == 0 {
+			kept = append(kept, json.RawMessage(`{"type":"text","text":"."}`))
+		}
+
+		path := fmt.Sprintf("messages.%d.content", i)
+		result, _ = sjson.SetBytes(result, path, kept)
+		modified = true
+	}
+
+	if !modified {
+		return payload
+	}
 	return result
 }
 
@@ -1566,7 +1651,8 @@ func repairToolUsePairing(payload []byte) []byte {
 			if len(kept) == 0 {
 				// If the entire assistant message was tool_use blocks, replace with
 				// a minimal text block to avoid an empty content array.
-				kept = append(kept, json.RawMessage(`{"type":"text","text":""}`))
+				// Use a single dot — Anthropic rejects whitespace-only text blocks.
+				kept = append(kept, json.RawMessage(`{"type":"text","text":"."}`))
 			}
 			modified = true
 			path := fmt.Sprintf("messages.%d.content", i)
@@ -1767,12 +1853,6 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// upstream proxies from injecting identifiable fields into the request body.
 	payload = stripNonStandardFields(payload)
 
-	// Replace context_management with the standard CLI value during cloaking.
-	// Real CLI always sends context_management with a clear_thinking edit (no signature required).
-	// Server-signed edits (compact, clear_tool_uses) are stripped because their signatures
-	// are session-bound and will cause 400 "signature: Field required" if forwarded.
-	payload = replaceContextManagementForCloaking(payload)
-
 	// Strip thinking blocks with invalid signatures from assistant messages.
 	// In multi-turn conversations, clients forward previous assistant thinking
 	// blocks with server-issued signatures. Forwarded/proxied requests carry
@@ -1813,6 +1893,13 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 			payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
 		}
 	}
+
+	// Replace context_management with the standard CLI value during cloaking.
+	// Must run AFTER thinking injection so the function can check if thinking is
+	// enabled — Anthropic rejects clear_thinking_20251015 when thinking is off.
+	// Server-signed edits (compact, clear_tool_uses) are stripped because their
+	// signatures are session-bound and will cause 400 "signature: Field required".
+	payload = replaceContextManagementForCloaking(payload)
 
 	// Inject fake user ID, using real device_id and account_uuid from OAuth if available.
 	realDeviceID := ""

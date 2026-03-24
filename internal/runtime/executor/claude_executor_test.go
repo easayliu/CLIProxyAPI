@@ -1534,3 +1534,232 @@ func TestCloaking_ReplacesContextManagement_Stream(t *testing.T) {
 		t.Fatal("context_management should be present after cloaking in stream mode")
 	}
 }
+
+// TestCloaking_ContextManagement_NoThinking verifies that when the model does
+// not support adaptive thinking, context_management does NOT include
+// clear_thinking_20251015 (Anthropic rejects it with "requires thinking to be
+// enabled or adaptive").
+func TestCloaking_ContextManagement_NoThinking(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-haiku-20241022","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-api03-test-key",
+		"base_url": server.URL,
+	}}
+
+	// Use haiku model which does NOT support adaptive thinking.
+	payload := []byte(`{"model":"claude-3-5-haiku-20241022","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"sig"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-haiku-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if len(receivedBody) == 0 {
+		t.Fatal("expected upstream to receive a request body")
+	}
+
+	cm := gjson.GetBytes(receivedBody, "context_management")
+	if !cm.Exists() {
+		t.Fatal("context_management should be present")
+	}
+
+	edits := cm.Get("edits").Array()
+	for _, edit := range edits {
+		if edit.Get("type").String() == "clear_thinking_20251015" {
+			t.Fatal("clear_thinking_20251015 must NOT be present when thinking is not enabled")
+		}
+	}
+}
+
+// TestReplaceContextManagementForCloaking_Unit tests the function directly for
+// both thinking-enabled and thinking-disabled payloads.
+func TestReplaceContextManagementForCloaking_Unit(t *testing.T) {
+	tests := []struct {
+		name            string
+		payload         string
+		wantClearThink  bool
+	}{
+		{
+			name:           "thinking adaptive — include clear_thinking",
+			payload:        `{"thinking":{"type":"adaptive"},"context_management":{"edits":[{"type":"compact_20260112","signature":"sig"}]}}`,
+			wantClearThink: true,
+		},
+		{
+			name:           "thinking enabled — include clear_thinking",
+			payload:        `{"thinking":{"type":"enabled","budget_tokens":5000},"context_management":{"edits":[]}}`,
+			wantClearThink: true,
+		},
+		{
+			name:           "thinking disabled — no clear_thinking",
+			payload:        `{"thinking":{"type":"disabled"},"context_management":{"edits":[{"type":"compact_20260112"}]}}`,
+			wantClearThink: false,
+		},
+		{
+			name:           "no thinking field — no clear_thinking",
+			payload:        `{"context_management":{"edits":[{"type":"compact_20260112"}]}}`,
+			wantClearThink: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := replaceContextManagementForCloaking([]byte(tt.payload))
+			edits := gjson.GetBytes(result, "context_management.edits").Array()
+
+			hasClearThinking := false
+			for _, e := range edits {
+				if e.Get("type").String() == "clear_thinking_20251015" {
+					hasClearThinking = true
+				}
+				if e.Get("type").String() == "compact_20260112" {
+					t.Error("server-signed compact edit should have been stripped")
+				}
+			}
+
+			if hasClearThinking != tt.wantClearThink {
+				t.Errorf("clear_thinking present=%v, want %v. result: %s", hasClearThinking, tt.wantClearThink, string(result))
+			}
+		})
+	}
+}
+
+// --- sanitizeEmptyTextBlocks tests ---
+
+func TestSanitizeEmptyTextBlocks_RemovesEmptyTextBlock(t *testing.T) {
+	// A message with an empty text block alongside a valid tool_result.
+	// The empty text block should be removed; the tool_result kept.
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":""},{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}`)
+	result := sanitizeEmptyTextBlocks(payload)
+
+	blocks := gjson.GetBytes(result, "messages.0.content").Array()
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block after sanitize, got %d: %s", len(blocks), string(result))
+	}
+	if blocks[0].Get("type").String() != "tool_result" {
+		t.Errorf("expected tool_result block to remain, got %s", blocks[0].Get("type").String())
+	}
+}
+
+func TestSanitizeEmptyTextBlocks_RemovesWhitespaceOnlyTextBlock(t *testing.T) {
+	// Text block with only spaces/tabs/newlines should be treated as empty.
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"   \n\t  "},{"type":"text","text":"hello"}]}]}`)
+	result := sanitizeEmptyTextBlocks(payload)
+
+	blocks := gjson.GetBytes(result, "messages.0.content").Array()
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block after sanitize, got %d: %s", len(blocks), string(result))
+	}
+	if blocks[0].Get("text").String() != "hello" {
+		t.Errorf("expected 'hello' text block, got %q", blocks[0].Get("text").String())
+	}
+}
+
+func TestSanitizeEmptyTextBlocks_AllEmptyBecomesDot(t *testing.T) {
+	// If all content blocks are empty text, the message gets a "." placeholder.
+	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":"  "}]}]}`)
+	result := sanitizeEmptyTextBlocks(payload)
+
+	blocks := gjson.GetBytes(result, "messages.0.content").Array()
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 placeholder block, got %d: %s", len(blocks), string(result))
+	}
+	if blocks[0].Get("text").String() != "." {
+		t.Errorf("expected '.' placeholder, got %q", blocks[0].Get("text").String())
+	}
+}
+
+func TestSanitizeEmptyTextBlocks_StringContentWhitespace(t *testing.T) {
+	// String-form content (not array) that is whitespace-only should become ".".
+	payload := []byte(`{"messages":[{"role":"user","content":"   "}]}`)
+	result := sanitizeEmptyTextBlocks(payload)
+
+	content := gjson.GetBytes(result, "messages.0.content").String()
+	if content != "." {
+		t.Errorf("expected '.' for whitespace string content, got %q", content)
+	}
+}
+
+func TestSanitizeEmptyTextBlocks_PreservesValidContent(t *testing.T) {
+	// No empty blocks — payload should pass through unchanged.
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"assistant","content":[{"type":"text","text":"world"}]}]}`)
+	result := sanitizeEmptyTextBlocks(payload)
+
+	if !bytes.Equal(result, payload) {
+		t.Errorf("expected payload to be unchanged, got %s", string(result))
+	}
+}
+
+func TestSanitizeEmptyTextBlocks_MixedBlockTypes(t *testing.T) {
+	// Empty text block mixed with non-text blocks (tool_use, image, etc.)
+	// Only the empty text block should be removed.
+	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"text","text":""},{"type":"tool_use","id":"t1","name":"foo","input":{}}]}]}`)
+	result := sanitizeEmptyTextBlocks(payload)
+
+	blocks := gjson.GetBytes(result, "messages.0.content").Array()
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block, got %d: %s", len(blocks), string(result))
+	}
+	if blocks[0].Get("type").String() != "tool_use" {
+		t.Errorf("expected tool_use block to remain, got %s", blocks[0].Get("type").String())
+	}
+}
+
+func TestSanitizeEmptyTextBlocks_E2E_Execute(t *testing.T) {
+	// End-to-end: verify that a request with empty text blocks does NOT
+	// reach upstream with those blocks — they should be sanitized away.
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{}
+	executor := NewClaudeExecutor(cfg)
+
+	auth := &cliproxyauth.Auth{ID: "e2e-empty-text", Provider: "claude", Attributes: map[string]string{
+		"api_key":  "sk-ant-test",
+		"base_url": server.URL,
+	}}
+
+	// Payload with an empty text block in the user message.
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":""},{"type":"text","text":"hello"}]}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if receivedBody == nil {
+		t.Fatal("expected upstream to receive a request body")
+	}
+
+	// The empty text block should have been removed.
+	blocks := gjson.GetBytes(receivedBody, "messages.0.content").Array()
+	for _, b := range blocks {
+		if b.Get("type").String() == "text" && strings.TrimSpace(b.Get("text").String()) == "" {
+			t.Fatalf("empty text block should have been sanitized, but found in upstream body: %s", string(receivedBody))
+		}
+	}
+}

@@ -1498,6 +1498,19 @@ func sanitizeContextManagementEdits(payload []byte) []byte {
 	return result
 }
 
+// cloakingContextManagement is the standard context_management value that real
+// Claude Code CLI sends on every request. The clear_thinking edit does not
+// require a server-issued signature.
+var cloakingContextManagement = []byte(`{"edits":[{"keep":"all","type":"clear_thinking_20251015"}]}`)
+
+// replaceContextManagementForCloaking replaces context_management with the standard
+// CLI value. Server-signed edits from the original client are discarded because
+// their signatures are session-bound and invalid when forwarded through a proxy.
+func replaceContextManagementForCloaking(payload []byte) []byte {
+	result, _ := sjson.SetRawBytes(payload, "context_management", cloakingContextManagement)
+	return result
+}
+
 // repairToolUsePairing ensures every tool_use block in an assistant message has
 // a corresponding tool_result in the immediately following user message.
 // The Claude API requires strict pairing: each tool_use must be answered by a
@@ -1754,11 +1767,11 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// upstream proxies from injecting identifiable fields into the request body.
 	payload = stripNonStandardFields(payload)
 
-	// Remove context_management entirely during cloaking. This field contains
-	// server-signed edits (compact, clear_tool_uses) that are only valid for
-	// the original CLI session. Non-CLI clients cannot have valid signatures,
-	// and forwarded requests will be rejected with 400 "signature: Field required".
-	payload, _ = sjson.DeleteBytes(payload, "context_management")
+	// Replace context_management with the standard CLI value during cloaking.
+	// Real CLI always sends context_management with a clear_thinking edit (no signature required).
+	// Server-signed edits (compact, clear_tool_uses) are stripped because their signatures
+	// are session-bound and will cause 400 "signature: Field required" if forwarded.
+	payload = replaceContextManagementForCloaking(payload)
 
 	// Strip thinking blocks with invalid signatures from assistant messages.
 	// In multi-turn conversations, clients forward previous assistant thinking

@@ -302,7 +302,15 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return group[innerIndex%len(group)], nil
 	}
 
-	// Flat round-robin for non-grouped auths (original behavior).
+	// RPM-aware selection: pick the auth with the lowest current RPM to
+	// prevent any single account from accumulating dangerous request density
+	// that could trigger upstream bans.  Fall back to round-robin as tiebreaker.
+	if picked := pickLeastLoadedAuth(available); picked != nil {
+		s.mu.Unlock()
+		return picked, nil
+	}
+
+	// Flat round-robin fallback (e.g. all RPMs equal at 0).
 	s.ensureCursorKey(key, limit)
 	index := s.cursors[key]
 	if index >= 2_147_483_640 {
@@ -311,6 +319,53 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	s.cursors[key] = index + 1
 	s.mu.Unlock()
 	return available[index%len(available)], nil
+}
+
+// pickLeastLoadedAuth selects the auth with the lowest current RPM from the
+// candidates.  When multiple auths share the same lowest RPM a random one is
+// returned to avoid deterministic hot-spotting.  Returns nil only when all
+// auths have exactly the same RPM (callers fall back to round-robin).
+func pickLeastLoadedAuth(auths []*Auth) *Auth {
+	if len(auths) <= 1 {
+		return nil // nothing to optimize
+	}
+
+	type scored struct {
+		auth *Auth
+		rpm  int
+	}
+	scores := make([]scored, len(auths))
+	allSame := true
+	for i, a := range auths {
+		rpm := GlobalRPMTracker.CurrentRPM(a.EnsureIndex())
+		scores[i] = scored{auth: a, rpm: rpm}
+		if i > 0 && rpm != scores[0].rpm {
+			allSame = false
+		}
+	}
+	if allSame {
+		return nil // all equal, let round-robin handle it
+	}
+
+	// Find the minimum RPM.
+	minRPM := scores[0].rpm
+	for _, s := range scores[1:] {
+		if s.rpm < minRPM {
+			minRPM = s.rpm
+		}
+	}
+
+	// Collect all candidates at the minimum RPM and pick one randomly.
+	var candidates []*Auth
+	for _, s := range scores {
+		if s.rpm == minRPM {
+			candidates = append(candidates, s.auth)
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+	return candidates[rand.IntN(len(candidates))]
 }
 
 // ensureCursorKey ensures the cursor map has capacity for the given key.

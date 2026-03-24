@@ -1,33 +1,28 @@
 package executor
 
 import (
-	"fmt"
-	"net/http"
-	"sync"
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
-// claudeRateLimiter tracks request timestamps per auth for RPM limiting.
-var claudeRateLimiter = struct {
-	sync.Mutex
-	requests map[string][]time.Time // authID -> request timestamps
-}{
-	requests: make(map[string][]time.Time),
-}
+const (
+	// rpmWaitTimeout is the maximum time to block waiting for an RPM slot.
+	// Claude Code streaming requests can be long-lived, so 30s is reasonable
+	// for the client to wait before we give up.
+	rpmWaitTimeout = 30 * time.Second
+)
 
 // checkClaudeRateLimit enforces per-auth RPM (requests per minute) limit.
-// The RPM value is read from auth metadata ("rpm" or "rpm_limit").
-// Returns nil if allowed, or a statusErr with 429 and retryAfter if rate limited.
+// Instead of returning 429 (which triggers cooldown cascades in the conductor),
+// it blocks until a slot opens within the sliding window.
+// Returns nil when the request may proceed, or a context-style error on timeout.
+//
+// The request is recorded in the global RPM tracker so that the RPM-aware
+// selector can see real-time load when picking the next auth.
 func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 	if auth == nil {
-		return nil
-	}
-
-	rpm := auth.RPMLimit()
-	if rpm <= 0 {
 		return nil
 	}
 
@@ -36,44 +31,22 @@ func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 		return nil
 	}
 
-	now := time.Now()
-	windowStart := now.Add(-time.Minute)
-
-	claudeRateLimiter.Lock()
-	defer claudeRateLimiter.Unlock()
-
-	// Filter timestamps within the sliding window
-	timestamps := claudeRateLimiter.requests[authID]
-	var valid []time.Time
-	for _, ts := range timestamps {
-		if ts.After(windowStart) {
-			valid = append(valid, ts)
-		}
+	rpm := auth.RPMLimit()
+	if rpm <= 0 {
+		// No explicit RPM limit configured — still record for selector awareness.
+		cliproxyauth.GlobalRPMTracker.Record(authID)
+		return nil
 	}
 
-	// Prune empty entries
-	if len(valid) == 0 {
-		delete(claudeRateLimiter.requests, authID)
+	// Block until a slot opens (or timeout).
+	if !cliproxyauth.GlobalRPMTracker.WaitForSlot(authID, rpm, rpmWaitTimeout) {
+		log.Warnf("claude rate limit: auth %s still at %d rpm after %s wait, proceeding anyway", authID, rpm, rpmWaitTimeout)
+		// Proceed anyway instead of returning 429 — let upstream decide.
+		// This avoids triggering the conductor cooldown spiral that causes
+		// cascading account bans.
 	}
 
-	// Check if limit exceeded
-	if len(valid) >= rpm {
-		oldest := valid[0]
-		retryAfter := oldest.Add(time.Minute).Sub(now)
-		if retryAfter < time.Second {
-			retryAfter = time.Second
-		}
-		retryAfterSec := int(retryAfter.Seconds())
-		log.Debugf("claude rate limit: auth %s exceeded %d rpm, retry after %ds", authID, rpm, retryAfterSec)
-		return statusErr{
-			code:       http.StatusTooManyRequests,
-			msg:        fmt.Sprintf(`{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded: %d requests/minute, retry after %ds"}}`, rpm, retryAfterSec),
-			retryAfter: &retryAfter,
-		}
-	}
-
-	// Record this request
-	valid = append(valid, now)
-	claudeRateLimiter.requests[authID] = valid
+	// Record this request.
+	cliproxyauth.GlobalRPMTracker.Record(authID)
 	return nil
 }

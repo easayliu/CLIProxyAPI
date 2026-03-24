@@ -1439,11 +1439,10 @@ func TestCloaking_StripsThinkingSignatures(t *testing.T) {
 	}
 }
 
-// TestCloaking_StripsContextManagement verifies that when cloaking is active
-// (non-claude-cli client), context_management is completely removed from the
-// request body sent to upstream. This prevents 400 errors caused by missing
-// server-issued signatures.
-func TestCloaking_StripsContextManagement(t *testing.T) {
+// TestCloaking_ReplacesContextManagement verifies that when cloaking is active
+// (non-claude-cli client), context_management is replaced with the standard CLI
+// value (clear_thinking edit) and server-signed edits are stripped.
+func TestCloaking_ReplacesContextManagement(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1459,11 +1458,9 @@ func TestCloaking_StripsContextManagement(t *testing.T) {
 		"base_url": server.URL,
 	}}
 
-	// Payload with context_management containing edits (some with signature, some without)
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"server-sig"},{"type":"clear_thinking_20251015"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	// Payload with context_management containing server-signed edits
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"server-sig"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
-	// context.Background() has no gin context → getClientUserAgent returns ""
-	// → shouldCloak("auto", "") returns true → cloaking is active
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-4-6",
 		Payload: payload,
@@ -1478,13 +1475,24 @@ func TestCloaking_StripsContextManagement(t *testing.T) {
 		t.Fatal("expected upstream to receive a request body")
 	}
 
-	if gjson.GetBytes(receivedBody, "context_management").Exists() {
-		t.Fatalf("context_management should be stripped during cloaking, but found in upstream body: %s", string(receivedBody))
+	cm := gjson.GetBytes(receivedBody, "context_management")
+	if !cm.Exists() {
+		t.Fatal("context_management should be present after cloaking (replaced with standard CLI value)")
+	}
+	edits := cm.Get("edits").Array()
+	if len(edits) != 1 {
+		t.Fatalf("expected 1 edit in context_management, got %d", len(edits))
+	}
+	if edits[0].Get("type").String() != "clear_thinking_20251015" {
+		t.Errorf("expected clear_thinking_20251015 edit, got %s", edits[0].Get("type").String())
+	}
+	if edits[0].Get("signature").Exists() {
+		t.Error("standard CLI edit should not have a signature field")
 	}
 }
 
-// TestCloaking_StripsContextManagement_Stream verifies the same for streaming requests.
-func TestCloaking_StripsContextManagement_Stream(t *testing.T) {
+// TestCloaking_ReplacesContextManagement_Stream verifies the same for streaming requests.
+func TestCloaking_ReplacesContextManagement_Stream(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1521,7 +1529,8 @@ func TestCloaking_StripsContextManagement_Stream(t *testing.T) {
 		t.Fatal("expected upstream to receive a request body")
 	}
 
-	if gjson.GetBytes(receivedBody, "context_management").Exists() {
-		t.Fatalf("context_management should be stripped during cloaking in stream mode, but found: %s", string(receivedBody))
+	cm := gjson.GetBytes(receivedBody, "context_management")
+	if !cm.Exists() {
+		t.Fatal("context_management should be present after cloaking in stream mode")
 	}
 }

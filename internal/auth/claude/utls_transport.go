@@ -226,36 +226,14 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		addr = net.JoinHostPort(addr, port)
 	}
 
-	// Step 4-7: Send request and read response. If a pooled connection fails
-	// on write or read, retry once with a fresh connection (matching
-	// http.Transport's stale-connection retry behavior).
-	resp, err := t.roundTripAttempt(req, addr, reordered, true)
-	if err != nil {
-		// Retry with a fresh connection — the pooled one was likely stale.
-		resp, err = t.roundTripAttempt(req, addr, reordered, false)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// roundTripAttempt performs one send-receive cycle on a connection.
-// If allowPool is true, it tries the pool first; otherwise it always dials fresh.
-func (t *utlsRoundTripper) roundTripAttempt(req *http.Request, addr string, payload []byte, allowPool bool) (*http.Response, error) {
-	var conn net.Conn
-	var br *bufio.Reader
-	var err error
-	if allowPool {
-		conn, br, err = t.getOrDial(req, addr)
-	} else {
-		conn, br, err = t.dial(req, addr)
-	}
+	// Step 4: Try to get a pooled connection, otherwise dial a new one.
+	// If a pooled connection fails (stale/closed by server), retry with a fresh one.
+	conn, br, err := t.getOrDial(req, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Watch for context cancellation to abort in-flight I/O.
+	// Step 5: Watch for context cancellation to abort in-flight I/O.
 	cancelDone := make(chan struct{})
 	go func() {
 		select {
@@ -265,14 +243,33 @@ func (t *utlsRoundTripper) roundTripAttempt(req *http.Request, addr string, payl
 		}
 	}()
 
-	// Write request.
-	if _, err := conn.Write(payload); err != nil {
+	// Step 6: Write the request with reordered lowercase headers.
+	// If write fails on a pooled connection, retry once with a fresh one.
+	if _, writeErr := conn.Write(reordered); writeErr != nil {
 		close(cancelDone)
 		conn.Close()
-		return nil, err
+
+		// Retry with a fresh connection (the pooled one was likely stale).
+		conn, br, err = t.dial(req, addr)
+		if err != nil {
+			return nil, err
+		}
+		cancelDone = make(chan struct{})
+		go func() {
+			select {
+			case <-req.Context().Done():
+				conn.Close()
+			case <-cancelDone:
+			}
+		}()
+		if _, err := conn.Write(reordered); err != nil {
+			close(cancelDone)
+			conn.Close()
+			return nil, err
+		}
 	}
 
-	// Read response headers.
+	// Step 7: Read the response using the (possibly pre-existing) buffered reader.
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		close(cancelDone)
@@ -292,6 +289,7 @@ func (t *utlsRoundTripper) roundTripAttempt(req *http.Request, addr string, payl
 		cancel:     cancelDone,
 		noReuse:    resp.Close,
 	}
+
 	return resp, nil
 }
 

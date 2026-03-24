@@ -861,7 +861,7 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 // creating a fingerprint mismatch with the claimed claude-cli User-Agent.
 // Configurable via ClaudeHeaderDefaults.Os.
 func mapStainlessOS() string {
-	return "macOS" // Always report macOS to match typical Claude CLI user environment
+	return "MacOS" // Stainless SDK returns "MacOS" (capital M) for darwin
 }
 
 // mapStainlessArch returns a fixed arm64 value to match typical Claude CLI user environment.

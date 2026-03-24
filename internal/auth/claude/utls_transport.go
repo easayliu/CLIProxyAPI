@@ -178,6 +178,29 @@ func (t *utlsRoundTripper) dialTLS(ctx context.Context, network, addr string) (n
 	return tlsConn, nil
 }
 
+// dial creates a fresh connection (TLS for https, plain TCP for http).
+func (t *utlsRoundTripper) dial(req *http.Request, addr string) (net.Conn, *bufio.Reader, error) {
+	var conn net.Conn
+	var err error
+	if req.URL.Scheme == "http" {
+		conn, err = t.dialer.DialContext(req.Context(), "tcp", addr)
+	} else {
+		conn, err = t.dialTLS(req.Context(), "tcp", addr)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, bufio.NewReader(conn), nil
+}
+
+// getOrDial returns a pooled connection if available, otherwise dials a new one.
+func (t *utlsRoundTripper) getOrDial(req *http.Request, addr string) (net.Conn, *bufio.Reader, error) {
+	if pe := t.pool.get(addr); pe != nil {
+		return pe.conn, pe.br, nil
+	}
+	return t.dial(req, addr)
+}
+
 // RoundTrip implements http.RoundTripper. It serializes the request with Go's
 // standard req.Write, then reorders headers to match the real Bun/Stainless SDK
 // order and lowercases header names to match Node.js/Bun wire format.
@@ -204,22 +227,10 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	// Step 4: Try to get a pooled connection, otherwise dial a new one.
-	var conn net.Conn
-	var br *bufio.Reader
-	if pe := t.pool.get(addr); pe != nil {
-		conn = pe.conn
-		br = pe.br
-	} else {
-		var dialErr error
-		if req.URL.Scheme == "http" {
-			conn, dialErr = t.dialer.DialContext(req.Context(), "tcp", addr)
-		} else {
-			conn, dialErr = t.dialTLS(req.Context(), "tcp", addr)
-		}
-		if dialErr != nil {
-			return nil, dialErr
-		}
-		br = bufio.NewReader(conn)
+	// If a pooled connection fails (stale/closed by server), retry with a fresh one.
+	conn, br, err := t.getOrDial(req, addr)
+	if err != nil {
+		return nil, err
 	}
 
 	// Step 5: Watch for context cancellation to abort in-flight I/O.
@@ -233,10 +244,29 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}()
 
 	// Step 6: Write the request with reordered lowercase headers.
-	if _, err := conn.Write(reordered); err != nil {
+	// If write fails on a pooled connection, retry once with a fresh one.
+	if _, writeErr := conn.Write(reordered); writeErr != nil {
 		close(cancelDone)
 		conn.Close()
-		return nil, err
+
+		// Retry with a fresh connection (the pooled one was likely stale).
+		conn, br, err = t.dial(req, addr)
+		if err != nil {
+			return nil, err
+		}
+		cancelDone = make(chan struct{})
+		go func() {
+			select {
+			case <-req.Context().Done():
+				conn.Close()
+			case <-cancelDone:
+			}
+		}()
+		if _, err := conn.Write(reordered); err != nil {
+			close(cancelDone)
+			conn.Close()
+			return nil, err
+		}
 	}
 
 	// Step 7: Read the response using the (possibly pre-existing) buffered reader.
@@ -249,6 +279,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 
 	// Wrap the body so the connection is returned to the pool (or closed)
 	// when the caller finishes reading the response body.
+	// Do not reuse if the server sent "Connection: close".
 	resp.Body = &connPoolReader{
 		ReadCloser: resp.Body,
 		conn:       conn,
@@ -256,23 +287,25 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		addr:       addr,
 		pool:       &t.pool,
 		cancel:     cancelDone,
+		noReuse:    resp.Close,
 	}
 
 	return resp, nil
 }
 
-// connPoolReader wraps a response body. When the body is fully read (io.EOF),
-// the connection is returned to the pool for reuse. If Close is called before
-// EOF, the connection is closed (partial reads cannot be safely reused).
+// connPoolReader wraps a response body. When the body is fully read (io.EOF)
+// and the server did not send "Connection: close", the connection is returned
+// to the pool for reuse. Otherwise the connection is closed.
 type connPoolReader struct {
 	io.ReadCloser
-	conn   net.Conn
-	br     *bufio.Reader
-	addr   string
-	pool   *connPool
-	cancel chan struct{}
-	once   sync.Once
-	hitEOF bool // true when Read returned io.EOF
+	conn    net.Conn
+	br      *bufio.Reader
+	addr    string
+	pool    *connPool
+	cancel  chan struct{}
+	once    sync.Once
+	hitEOF  bool // true when Read returned io.EOF
+	noReuse bool // true when resp.Close is set (Connection: close)
 }
 
 func (r *connPoolReader) Read(p []byte) (int, error) {
@@ -287,14 +320,14 @@ func (r *connPoolReader) Close() error {
 	err := r.ReadCloser.Close()
 	r.once.Do(func() {
 		close(r.cancel)
-		if r.hitEOF {
-			// Body fully consumed — return connection to pool for reuse.
+		if r.hitEOF && !r.noReuse {
+			// Body fully consumed and server allows keep-alive — pool the connection.
 			r.pool.put(r.addr, &poolEntry{
 				conn: r.conn,
 				br:   r.br,
 			})
 		} else {
-			// Body not fully read — connection state is unknown, close it.
+			// Body not fully read or server sent Connection: close — discard.
 			r.conn.Close()
 		}
 	})

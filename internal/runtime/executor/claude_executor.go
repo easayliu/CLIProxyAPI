@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"net/textproto"
-	"runtime"
 	"strings"
 	"time"
 
@@ -857,34 +856,20 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
-// mapStainlessOS maps runtime.GOOS to Stainless SDK OS names.
+// mapStainlessOS returns a fixed macOS value to match typical Claude CLI user environment.
+// Using runtime.GOOS would leak the server OS (e.g. Linux on cloud servers),
+// creating a fingerprint mismatch with the claimed claude-cli User-Agent.
+// Configurable via ClaudeHeaderDefaults.Os.
 func mapStainlessOS() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "MacOS"
-	case "windows":
-		return "Windows"
-	case "linux":
-		return "Linux"
-	case "freebsd":
-		return "FreeBSD"
-	default:
-		return "Other::" + runtime.GOOS
-	}
+	return "macOS" // Always report macOS to match typical Claude CLI user environment
 }
 
-// mapStainlessArch maps runtime.GOARCH to Stainless SDK architecture names.
+// mapStainlessArch returns a fixed arm64 value to match typical Claude CLI user environment.
+// Using runtime.GOARCH would leak the server architecture (e.g. x64 on cloud servers),
+// creating a fingerprint mismatch with the claimed claude-cli User-Agent.
+// Configurable via ClaudeHeaderDefaults.Arch.
 func mapStainlessArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x64"
-	case "arm64":
-		return "arm64"
-	case "386":
-		return "x86"
-	default:
-		return "other::" + runtime.GOARCH
-	}
+	return "arm64" // Always report arm64 (Apple Silicon) to match typical CLI user
 }
 
 // modelSupports1MContext returns true if the model name explicitly requests 1M context.
@@ -980,8 +965,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	// line scanner reads it, so compressed responses are handled correctly.
 	r.Header.Set("Accept", "application/json")
 	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	// Keep OS/Arch mapping dynamic (not configurable).
-	// They intentionally continue to derive from runtime.GOOS/runtime.GOARCH.
+	// Report macOS/arm64 by default to match typical Claude CLI user environment.
+	// Server OS/arch would be a fingerprint (e.g. Linux on cloud servers).
+	// Configurable via ClaudeHeaderDefaults.Os and ClaudeHeaderDefaults.Arch.
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

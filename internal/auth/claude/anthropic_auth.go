@@ -187,8 +187,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	applyOAuthRequestHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -241,6 +240,19 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	return bundle, nil
 }
 
+// applyOAuthRequestHeaders sets standard headers on OAuth/token endpoint requests
+// to match the real Claude Code CLI's Bun/Stainless SDK fingerprint.
+func applyOAuthRequestHeaders(req *http.Request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("User-Agent", "claude-cli/2.1.81 (external, cli)")
+	req.Header.Set("X-Stainless-Runtime", "node")
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Stainless-Package-Version", "0.74.0")
+	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
+}
+
 // RefreshTokens refreshes the access token using the refresh token.
 // This method exchanges a valid refresh token for a new access token,
 // extending the user's authenticated session.
@@ -273,8 +285,7 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	applyOAuthRequestHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {

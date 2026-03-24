@@ -17,24 +17,129 @@ import (
 	tls "github.com/refraction-networking/utls"
 )
 
+// claudeHeaderOrder defines the canonical header order matching the real
+// Bun + @anthropic-ai/sdk (Stainless) wire format. Headers not in this
+// list are appended at the end in their original order.
+var claudeHeaderOrder = []string{
+	"host",
+	"authorization",
+	"x-api-key",
+	"content-type",
+	"content-length",
+	"transfer-encoding",
+	"anthropic-version",
+	"anthropic-beta",
+	"anthropic-dangerous-direct-browser-access",
+	"x-app",
+	"x-stainless-retry-count",
+	"x-stainless-runtime-version",
+	"x-stainless-package-version",
+	"x-stainless-runtime",
+	"x-stainless-lang",
+	"x-stainless-arch",
+	"x-stainless-os",
+	"x-stainless-timeout",
+	"user-agent",
+	"accept",
+	"accept-encoding",
+	"connection",
+}
+
+// claudeHeaderRank maps lowercase header name to its position in claudeHeaderOrder.
+// Built once at init time for O(1) lookups during reordering.
+var claudeHeaderRank map[string]int
+
+func init() {
+	claudeHeaderRank = make(map[string]int, len(claudeHeaderOrder))
+	for i, h := range claudeHeaderOrder {
+		claudeHeaderRank[h] = i
+	}
+}
+
+const (
+	// connIdleTimeout is how long an idle pooled connection is kept before eviction.
+	connIdleTimeout = 90 * time.Second
+	// maxIdlePerHost is the maximum number of idle connections kept per host:port.
+	maxIdlePerHost = 3
+)
+
+// poolEntry holds an idle connection along with its buffered reader and timestamp.
+type poolEntry struct {
+	conn      net.Conn
+	br        *bufio.Reader
+	idleSince time.Time
+}
+
+// connPool is a simple per-host idle connection pool for keep-alive reuse.
+type connPool struct {
+	mu   sync.Mutex
+	idle map[string][]*poolEntry // keyed by host:port
+}
+
+// get returns an idle connection for addr, or nil if none available.
+// Expired entries are closed and discarded.
+func (p *connPool) get(addr string) *poolEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entries := p.idle[addr]
+	now := time.Now()
+	for len(entries) > 0 {
+		// Pop from the end (LIFO — most recently used).
+		e := entries[len(entries)-1]
+		entries = entries[:len(entries)-1]
+		if now.Sub(e.idleSince) > connIdleTimeout {
+			e.conn.Close()
+			continue
+		}
+		p.idle[addr] = entries
+		return e
+	}
+	p.idle[addr] = entries
+	return nil
+}
+
+// put returns a connection to the pool. If the pool is full, the connection is closed.
+func (p *connPool) put(addr string, e *poolEntry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.idle == nil {
+		p.idle = make(map[string][]*poolEntry)
+	}
+	entries := p.idle[addr]
+	if len(entries) >= maxIdlePerHost {
+		e.conn.Close()
+		return
+	}
+	e.idleSince = time.Now()
+	p.idle[addr] = append(entries, e)
+}
+
 // utlsRoundTripper implements http.RoundTripper using utls with Bun BoringSSL
 // fingerprint to match the real Claude Code CLI's TLS characteristics.
 //
 // It uses HTTP/1.1 (Bun's ALPN only offers http/1.1) and writes raw HTTP
 // with lowercase header names to match Node.js/Bun wire format.
 //
+// Connections are pooled for keep-alive reuse, matching real CLI behavior.
+//
 // Proxy support is handled by ProxyDialer (see proxy_dial.go), which establishes
 // raw TCP connections through SOCKS5 or HTTP/HTTPS CONNECT proxies before this
 // layer applies the utls TLS handshake.
 type utlsRoundTripper struct {
 	dialer *ProxyDialer // handles proxy tunneling for raw TCP connections
+	pool   connPool     // idle connection pool for keep-alive reuse
 }
 
 // newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support.
 // The proxyURL parameter is the pre-resolved proxy URL string; an empty string means
 // inherit proxy from environment variables (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY).
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
-	return &utlsRoundTripper{dialer: NewProxyDialer(proxyURL)}
+	return &utlsRoundTripper{
+		dialer: NewProxyDialer(proxyURL),
+		pool:   connPool{idle: make(map[string][]*poolEntry)},
+	}
 }
 
 // dialTLS establishes a TLS connection using utls with the Bun BoringSSL spec.
@@ -74,13 +179,9 @@ func (t *utlsRoundTripper) dialTLS(ctx context.Context, network, addr string) (n
 }
 
 // RoundTrip implements http.RoundTripper. It serializes the request with Go's
-// standard req.Write, then converts all header names to lowercase in-place to
-// match the wire format of Node.js / Bun HTTP clients. The modified payload is
-// sent over a raw utls connection, and the response is read with http.ReadResponse.
-//
-// Each call dials a fresh TLS connection (no keep-alive pooling). This is
-// acceptable for Claude API traffic: streaming calls hold the connection for
-// the full response duration anyway, and non-streaming calls are infrequent.
+// standard req.Write, then reorders headers to match the real Bun/Stainless SDK
+// order and lowercases header names to match Node.js/Bun wire format.
+// The modified payload is sent over a utls connection (pooled when possible).
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Step 1: Serialize the full HTTP/1.1 request into a buffer.
 	// req.Write handles Content-Length, Transfer-Encoding, chunking, etc.
@@ -89,9 +190,8 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		return nil, fmt.Errorf("serialize request: %w", err)
 	}
 
-	// Step 2: Lowercase all header names in-place.
-	// ASCII case conversion preserves byte length — no reallocation needed.
-	lowercaseRequestHeaders(buf.Bytes())
+	// Step 2: Reorder headers to match real Bun/Stainless SDK order and lowercase names.
+	reordered := reorderAndLowercaseHeaders(buf.Bytes())
 
 	// Step 3: Resolve target address.
 	addr := req.URL.Host
@@ -103,16 +203,23 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		addr = net.JoinHostPort(addr, port)
 	}
 
-	// Step 4: Dial connection (TLS for https, plain TCP for http).
+	// Step 4: Try to get a pooled connection, otherwise dial a new one.
 	var conn net.Conn
-	var dialErr error
-	if req.URL.Scheme == "http" {
-		conn, dialErr = t.dialer.DialContext(req.Context(), "tcp", addr)
+	var br *bufio.Reader
+	if pe := t.pool.get(addr); pe != nil {
+		conn = pe.conn
+		br = pe.br
 	} else {
-		conn, dialErr = t.dialTLS(req.Context(), "tcp", addr)
-	}
-	if dialErr != nil {
-		return nil, dialErr
+		var dialErr error
+		if req.URL.Scheme == "http" {
+			conn, dialErr = t.dialer.DialContext(req.Context(), "tcp", addr)
+		} else {
+			conn, dialErr = t.dialTLS(req.Context(), "tcp", addr)
+		}
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		br = bufio.NewReader(conn)
 	}
 
 	// Step 5: Watch for context cancellation to abort in-flight I/O.
@@ -125,85 +232,160 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}()
 
-	// Step 6: Write the request with lowercase headers.
-	if _, err := conn.Write(buf.Bytes()); err != nil {
+	// Step 6: Write the request with reordered lowercase headers.
+	if _, err := conn.Write(reordered); err != nil {
 		close(cancelDone)
 		conn.Close()
 		return nil, err
 	}
 
-	// Step 7: Read the response.
-	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	// Step 7: Read the response using the (possibly pre-existing) buffered reader.
+	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		close(cancelDone)
 		conn.Close()
 		return nil, err
 	}
 
-	// Wrap the body so the connection and cancel goroutine are cleaned up
-	// when the caller finishes reading (or closes) the response body.
-	resp.Body = &connClosingReader{
+	// Wrap the body so the connection is returned to the pool (or closed)
+	// when the caller finishes reading the response body.
+	resp.Body = &connPoolReader{
 		ReadCloser: resp.Body,
 		conn:       conn,
+		br:         br,
+		addr:       addr,
+		pool:       &t.pool,
 		cancel:     cancelDone,
 	}
 
 	return resp, nil
 }
 
-// connClosingReader wraps a response body and closes the underlying connection
-// (and stops the context-cancellation goroutine) when Close is called.
-type connClosingReader struct {
+// connPoolReader wraps a response body. When the body is fully read (io.EOF),
+// the connection is returned to the pool for reuse. If Close is called before
+// EOF, the connection is closed (partial reads cannot be safely reused).
+type connPoolReader struct {
 	io.ReadCloser
 	conn   net.Conn
+	br     *bufio.Reader
+	addr   string
+	pool   *connPool
 	cancel chan struct{}
 	once   sync.Once
+	hitEOF bool // true when Read returned io.EOF
 }
 
-func (r *connClosingReader) Close() error {
+func (r *connPoolReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err == io.EOF {
+		r.hitEOF = true
+	}
+	return n, err
+}
+
+func (r *connPoolReader) Close() error {
 	err := r.ReadCloser.Close()
 	r.once.Do(func() {
 		close(r.cancel)
-		r.conn.Close()
+		if r.hitEOF {
+			// Body fully consumed — return connection to pool for reuse.
+			r.pool.put(r.addr, &poolEntry{
+				conn: r.conn,
+				br:   r.br,
+			})
+		} else {
+			// Body not fully read — connection state is unknown, close it.
+			r.conn.Close()
+		}
 	})
 	return err
 }
 
-// lowercaseRequestHeaders converts HTTP/1.1 header names from Go's Title-Case
-// to lowercase in-place within the raw request bytes. The request line (first
-// line) is left unchanged. Processing stops at the header/body boundary (\r\n\r\n).
+// headerLine holds a parsed header with its lowercase name and original full line bytes.
+type headerLine struct {
+	lowerName string // lowercase header name (for ordering lookup)
+	line      []byte // full original line bytes (e.g. "Content-Type: application/json")
+}
+
+// reorderAndLowercaseHeaders parses the raw HTTP/1.1 request bytes, reorders
+// headers to match the real Bun + Stainless SDK order (claudeHeaderOrder), and
+// lowercases all header names. The request line and body are preserved as-is.
 //
-// Since ASCII uppercase→lowercase is a single-byte operation (A-Z → a-z),
-// the conversion is size-preserving and does not affect Content-Length or framing.
-func lowercaseRequestHeaders(raw []byte) {
+// Returns a new byte slice with the rewritten request.
+func reorderAndLowercaseHeaders(raw []byte) []byte {
 	headerEnd := bytes.Index(raw, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
-		return
+		return raw
 	}
 
-	// Skip request line (e.g. "POST /v1/messages HTTP/1.1\r\n").
+	// Split request line.
 	lineEnd := bytes.Index(raw, []byte("\r\n"))
 	if lineEnd < 0 || lineEnd >= headerEnd {
-		return
+		return raw
 	}
-	pos := lineEnd + 2
+	requestLine := raw[:lineEnd] // e.g. "POST /v1/messages HTTP/1.1"
+	body := raw[headerEnd+2:]    // skip one \r\n; result.Write adds the other
 
-	// Process each header line: lowercase everything before the first ':'.
+	// Parse all header lines.
+	pos := lineEnd + 2
+	var headers []headerLine
 	for pos < headerEnd {
 		nextCRLF := bytes.Index(raw[pos:], []byte("\r\n"))
 		if nextCRLF < 0 {
 			break
 		}
 		line := raw[pos : pos+nextCRLF]
-		if colonIdx := bytes.IndexByte(line, ':'); colonIdx > 0 {
+		colonIdx := bytes.IndexByte(line, ':')
+		if colonIdx > 0 {
+			// Lowercase the header name portion.
+			nameBuf := make([]byte, colonIdx)
 			for i := 0; i < colonIdx; i++ {
-				if line[i] >= 'A' && line[i] <= 'Z' {
-					line[i] += 32
+				c := line[i]
+				if c >= 'A' && c <= 'Z' {
+					c += 32
 				}
+				nameBuf[i] = c
 			}
+			// Build the lowercased line: "name" + original ": value" part.
+			newLine := make([]byte, 0, len(line))
+			newLine = append(newLine, nameBuf...)
+			newLine = append(newLine, line[colonIdx:]...)
+			headers = append(headers, headerLine{
+				lowerName: string(nameBuf),
+				line:      newLine,
+			})
 		}
 		pos += nextCRLF + 2
 	}
+
+	// Reorder: first emit headers that appear in claudeHeaderOrder (in that order),
+	// then append any remaining headers in their original order.
+	used := make([]bool, len(headers))
+	var result bytes.Buffer
+	result.Grow(len(raw) + 64) // slightly over-allocate to avoid realloc
+	result.Write(requestLine)
+	result.WriteString("\r\n")
+
+	for _, orderedName := range claudeHeaderOrder {
+		for i, h := range headers {
+			if !used[i] && h.lowerName == orderedName {
+				result.Write(h.line)
+				result.WriteString("\r\n")
+				used[i] = true
+				break // only first match per ordered name
+			}
+		}
+	}
+	// Append any headers not in the canonical order.
+	for i, h := range headers {
+		if !used[i] {
+			result.Write(h.line)
+			result.WriteString("\r\n")
+		}
+	}
+
+	result.Write(body)
+	return result.Bytes()
 }
 
 // anthropicClients caches *http.Client instances keyed by proxyURL string.

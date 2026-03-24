@@ -245,7 +245,8 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 func applyOAuthRequestHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	// Do not set Accept-Encoding here — our custom utlsRoundTripper does not
+	// auto-decompress responses, and the token endpoint response is small JSON.
 	req.Header.Set("User-Agent", "claude-cli/2.1.81 (external, cli)")
 	req.Header.Set("X-Stainless-Runtime", "node")
 	req.Header.Set("X-Stainless-Lang", "js")

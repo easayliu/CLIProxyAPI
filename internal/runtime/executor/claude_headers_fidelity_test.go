@@ -66,6 +66,7 @@ var realCLIBetas = []string{
 	"interleaved-thinking-2025-05-14",
 	"context-management-2025-06-27",
 	"prompt-caching-scope-2026-01-05",
+	"advanced-tool-use-2025-11-20",
 	"effort-2025-11-24",
 }
 
@@ -77,6 +78,7 @@ var realCLIBetas1M = []string{
 	"interleaved-thinking-2025-05-14",
 	"context-management-2025-06-27",
 	"prompt-caching-scope-2026-01-05",
+	"advanced-tool-use-2025-11-20",
 	"effort-2025-11-24",
 }
 

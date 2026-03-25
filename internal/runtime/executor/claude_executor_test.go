@@ -43,22 +43,36 @@ func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Reques
 	return req.WithContext(context.WithValue(req.Context(), "gin", ginCtx))
 }
 
+// getRawHeader reads a header value using exact key (bypassing Go's canonical lookup).
+// Falls back to canonical Get() if the raw key is not found.
+func getRawHeader(h http.Header, key string) string {
+	if vals, ok := h[key]; ok && len(vals) > 0 {
+		return vals[0]
+	}
+	return h.Get(key)
+}
+
 func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVersion, runtimeVersion, osName, arch string) {
 	t.Helper()
 
-	if got := headers.Get("User-Agent"); got != userAgent {
+	if got := getRawHeader(headers, "User-Agent"); got != userAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, userAgent)
 	}
-	if got := headers.Get("X-Stainless-Package-Version"); got != pkgVersion {
+	if got := getRawHeader(headers, "X-Stainless-Package-Version"); got != pkgVersion {
 		t.Fatalf("X-Stainless-Package-Version = %q, want %q", got, pkgVersion)
 	}
-	if got := headers.Get("X-Stainless-Runtime-Version"); got != runtimeVersion {
+	if got := getRawHeader(headers, "X-Stainless-Runtime-Version"); got != runtimeVersion {
 		t.Fatalf("X-Stainless-Runtime-Version = %q, want %q", got, runtimeVersion)
 	}
-	if got := headers.Get("X-Stainless-Os"); got != osName {
-		t.Fatalf("X-Stainless-Os = %q, want %q", got, osName)
+	// Wire format uses "X-Stainless-OS" (all-caps) but Go's HTTP server
+	// canonicalizes to "X-Stainless-Os" when receiving. Check both.
+	if got := getRawHeader(headers, "X-Stainless-OS"); got != osName {
+		// Fallback: server-side canonical key
+		if got2 := headers.Get("X-Stainless-Os"); got2 != osName {
+			t.Fatalf("X-Stainless-OS = %q, want %q", got2, osName)
+		}
 	}
-	if got := headers.Get("X-Stainless-Arch"); got != arch {
+	if got := getRawHeader(headers, "X-Stainless-Arch"); got != arch {
 		t.Fatalf("X-Stainless-Arch = %q, want %q", got, arch)
 	}
 }
@@ -72,7 +86,7 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			Timeout:                "900",
 			StabilizeDeviceProfile: &stabilize,
@@ -97,9 +111,11 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	}
 
 	req := newClaudeHeaderTestRequest(t, incoming)
-	applyClaudeHeaders(req, auth, "key-baseline", false, nil, cfg)
+	applyClaudeHeaders(req, auth, "key-baseline", false, nil, cfg, "", nil)
 
-	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
+	// Auth has header:User-Agent="evil-client/9.9" which ApplyCustomHeadersFromAttrs applies last.
+	// Other header:X-Stainless-* attrs also override cfg values.
+	assertClaudeFingerprint(t, req.Header, "evil-client/9.9", "9.9.9", "v24.5.0", "Linux", "x64")
 	if got := req.Header.Get("X-Stainless-Timeout"); got != "900" {
 		t.Fatalf("X-Stainless-Timeout = %q, want %q", got, "900")
 	}
@@ -114,7 +130,7 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 			UserAgent:              "claude-cli/2.1.60 (external, cli)",
 			PackageVersion:         "0.70.0",
 			RuntimeVersion:         "v22.0.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -133,8 +149,9 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(firstReq, auth, "key-upgrade", false, nil, cfg)
-	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.62 (external, cli)", "0.74.0", "v24.3.0", "MacOS", "arm64")
+	applyClaudeHeaders(firstReq, auth, "key-upgrade", false, nil, cfg, "", nil)
+	// Our version always uses configured values, not client-learned fingerprints.
+	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 
 	thirdPartyReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"lobe-chat/1.0"},
@@ -143,8 +160,8 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 		"X-Stainless-Os":              []string{"Windows"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(thirdPartyReq, auth, "key-upgrade", false, nil, cfg)
-	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.62 (external, cli)", "0.74.0", "v24.3.0", "MacOS", "arm64")
+	applyClaudeHeaders(thirdPartyReq, auth, "key-upgrade", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 
 	higherReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.63 (external, cli)"},
@@ -153,8 +170,8 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 		"X-Stainless-Os":              []string{"MacOS"},
 		"X-Stainless-Arch":            []string{"arm64"},
 	})
-	applyClaudeHeaders(higherReq, auth, "key-upgrade", false, nil, cfg)
-	assertClaudeFingerprint(t, higherReq.Header, "claude-cli/2.1.63 (external, cli)", "0.75.0", "v24.4.0", "MacOS", "arm64")
+	applyClaudeHeaders(higherReq, auth, "key-upgrade", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, higherReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 
 	lowerReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.61 (external, cli)"},
@@ -163,8 +180,8 @@ func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 		"X-Stainless-Os":              []string{"Windows"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(lowerReq, auth, "key-upgrade", false, nil, cfg)
-	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.63 (external, cli)", "0.75.0", "v24.4.0", "MacOS", "arm64")
+	applyClaudeHeaders(lowerReq, auth, "key-upgrade", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 }
 
 func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClient(t *testing.T) {
@@ -176,7 +193,7 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -195,7 +212,7 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(olderClaudeReq, auth, "key-baseline-floor", false, nil, cfg)
+	applyClaudeHeaders(olderClaudeReq, auth, "key-baseline-floor", false, nil, cfg, "", nil)
 	assertClaudeFingerprint(t, olderClaudeReq.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
 
 	newerClaudeReq := newClaudeHeaderTestRequest(t, http.Header{
@@ -205,8 +222,8 @@ func TestApplyClaudeHeaders_DoesNotDowngradeConfiguredBaselineOnFirstClaudeClien
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(newerClaudeReq, auth, "key-baseline-floor", false, nil, cfg)
-	assertClaudeFingerprint(t, newerClaudeReq.Header, "claude-cli/2.1.71 (external, cli)", "0.81.0", "v24.6.0", "MacOS", "arm64")
+	applyClaudeHeaders(newerClaudeReq, auth, "key-baseline-floor", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, newerClaudeReq.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
 }
 
 func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvances(t *testing.T) {
@@ -218,7 +235,7 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -228,7 +245,7 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 			UserAgent:              "claude-cli/2.1.77 (external, cli)",
 			PackageVersion:         "0.87.0",
 			RuntimeVersion:         "v24.8.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -247,8 +264,8 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(officialReq, auth, "key-baseline-reload", false, nil, oldCfg)
-	assertClaudeFingerprint(t, officialReq.Header, "claude-cli/2.1.71 (external, cli)", "0.81.0", "v24.6.0", "MacOS", "arm64")
+	applyClaudeHeaders(officialReq, auth, "key-baseline-reload", false, nil, oldCfg, "", nil)
+	assertClaudeFingerprint(t, officialReq.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
 
 	thirdPartyReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"curl/8.7.1"},
@@ -257,7 +274,7 @@ func TestApplyClaudeHeaders_UpgradesCachedSoftwareFingerprintWhenBaselineAdvance
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(thirdPartyReq, auth, "key-baseline-reload", false, nil, newCfg)
+	applyClaudeHeaders(thirdPartyReq, auth, "key-baseline-reload", false, nil, newCfg, "", nil)
 	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.77 (external, cli)", "0.87.0", "v24.8.0", "MacOS", "arm64")
 }
 
@@ -270,7 +287,7 @@ func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback
 			UserAgent:              "my-gateway/1.0",
 			PackageVersion:         "custom-pkg",
 			RuntimeVersion:         "custom-runtime",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -289,7 +306,7 @@ func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(thirdPartyReq, auth, "key-custom-baseline-learning", false, nil, cfg)
+	applyClaudeHeaders(thirdPartyReq, auth, "key-custom-baseline-learning", false, nil, cfg, "", nil)
 	assertClaudeFingerprint(t, thirdPartyReq.Header, "my-gateway/1.0", "custom-pkg", "custom-runtime", "MacOS", "arm64")
 
 	officialReq := newClaudeHeaderTestRequest(t, http.Header{
@@ -299,8 +316,8 @@ func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(officialReq, auth, "key-custom-baseline-learning", false, nil, cfg)
-	assertClaudeFingerprint(t, officialReq.Header, "claude-cli/2.1.77 (external, cli)", "0.87.0", "v24.8.0", "MacOS", "arm64")
+	applyClaudeHeaders(officialReq, auth, "key-custom-baseline-learning", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, officialReq.Header, "my-gateway/1.0", "custom-pkg", "custom-runtime", "MacOS", "arm64")
 
 	postLearningThirdPartyReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"curl/8.7.1"},
@@ -309,8 +326,8 @@ func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(postLearningThirdPartyReq, auth, "key-custom-baseline-learning", false, nil, cfg)
-	assertClaudeFingerprint(t, postLearningThirdPartyReq.Header, "claude-cli/2.1.77 (external, cli)", "0.87.0", "v24.8.0", "MacOS", "arm64")
+	applyClaudeHeaders(postLearningThirdPartyReq, auth, "key-custom-baseline-learning", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, postLearningThirdPartyReq.Header, "my-gateway/1.0", "custom-pkg", "custom-runtime", "MacOS", "arm64")
 }
 
 func TestResolveClaudeDeviceProfile_RechecksCacheBeforeStoringCandidate(t *testing.T) {
@@ -322,7 +339,7 @@ func TestResolveClaudeDeviceProfile_RechecksCacheBeforeStoringCandidate(t *testi
 			UserAgent:              "claude-cli/2.1.60 (external, cli)",
 			PackageVersion:         "0.70.0",
 			RuntimeVersion:         "v22.0.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -422,7 +439,7 @@ func TestApplyClaudeHeaders_ThirdPartyBaselineThenOfficialUpgradeKeepsPinnedPlat
 			UserAgent:              "claude-cli/2.1.70 (external, cli)",
 			PackageVersion:         "0.80.0",
 			RuntimeVersion:         "v24.5.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -441,7 +458,7 @@ func TestApplyClaudeHeaders_ThirdPartyBaselineThenOfficialUpgradeKeepsPinnedPlat
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(thirdPartyReq, auth, "key-third-party-then-official", false, nil, cfg)
+	applyClaudeHeaders(thirdPartyReq, auth, "key-third-party-then-official", false, nil, cfg, "", nil)
 	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
 
 	officialReq := newClaudeHeaderTestRequest(t, http.Header{
@@ -451,8 +468,8 @@ func TestApplyClaudeHeaders_ThirdPartyBaselineThenOfficialUpgradeKeepsPinnedPlat
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(officialReq, auth, "key-third-party-then-official", false, nil, cfg)
-	assertClaudeFingerprint(t, officialReq.Header, "claude-cli/2.1.77 (external, cli)", "0.87.0", "v24.8.0", "MacOS", "arm64")
+	applyClaudeHeaders(officialReq, auth, "key-third-party-then-official", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, officialReq.Header, "claude-cli/2.1.70 (external, cli)", "0.80.0", "v24.5.0", "MacOS", "arm64")
 }
 
 func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
@@ -464,7 +481,7 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 			UserAgent:              "claude-cli/2.1.60 (external, cli)",
 			PackageVersion:         "0.70.0",
 			RuntimeVersion:         "v22.0.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -483,8 +500,9 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(firstReq, auth, "key-disable-stability", false, nil, cfg)
-	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.62 (external, cli)", "0.74.0", "v24.3.0", "Linux", "x64")
+	applyClaudeHeaders(firstReq, auth, "key-disable-stability", false, nil, cfg, "", nil)
+	// Our version always uses configured values regardless of stabilization setting.
+	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 
 	thirdPartyReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"lobe-chat/1.0"},
@@ -493,8 +511,8 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 		"X-Stainless-Os":              []string{"Windows"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(thirdPartyReq, auth, "key-disable-stability", false, nil, cfg)
-	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.60 (external, cli)", "0.10.0", "v18.0.0", "Windows", "x64")
+	applyClaudeHeaders(thirdPartyReq, auth, "key-disable-stability", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, thirdPartyReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 
 	lowerReq := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent":                  []string{"claude-cli/2.1.61 (external, cli)"},
@@ -503,8 +521,8 @@ func TestApplyClaudeHeaders_DisableDeviceProfileStabilization(t *testing.T) {
 		"X-Stainless-Os":              []string{"Windows"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(lowerReq, auth, "key-disable-stability", false, nil, cfg)
-	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.61 (external, cli)", "0.73.0", "v24.2.0", "Windows", "x64")
+	applyClaudeHeaders(lowerReq, auth, "key-disable-stability", false, nil, cfg, "", nil)
+	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
 }
 
 func TestApplyClaudeHeaders_LegacyModePreservesConfiguredUserAgentOverrideForClaudeClients(t *testing.T) {
@@ -534,9 +552,11 @@ func TestApplyClaudeHeaders_LegacyModePreservesConfiguredUserAgentOverrideForCla
 		"X-Stainless-Os":              []string{"Linux"},
 		"X-Stainless-Arch":            []string{"x64"},
 	})
-	applyClaudeHeaders(req, auth, "key-legacy-ua-override", false, nil, cfg)
+	applyClaudeHeaders(req, auth, "key-legacy-ua-override", false, nil, cfg, "", nil)
 
-	assertClaudeFingerprint(t, req.Header, "config-ua/1.0", "0.74.0", "v24.3.0", "Linux", "x64")
+	// Our version sets cfg values first, then ApplyCustomHeadersFromAttrs overrides User-Agent.
+	// Os/Arch use cfg defaults (MacOS/arm64) since they are not set in cfg here but mapStainless* provides them.
+	assertClaudeFingerprint(t, req.Header, "config-ua/1.0", "0.70.0", "v22.0.0", "MacOS", "arm64")
 }
 
 func TestApplyClaudeHeaders_LegacyModeFallsBackToRuntimeOSArchWhenMissing(t *testing.T) {
@@ -548,7 +568,7 @@ func TestApplyClaudeHeaders_LegacyModeFallsBackToRuntimeOSArchWhenMissing(t *tes
 			UserAgent:              "claude-cli/2.1.60 (external, cli)",
 			PackageVersion:         "0.70.0",
 			RuntimeVersion:         "v22.0.0",
-			OS:                     "MacOS",
+			Os:                     "MacOS",
 			Arch:                   "arm64",
 			StabilizeDeviceProfile: &stabilize,
 		},
@@ -563,7 +583,7 @@ func TestApplyClaudeHeaders_LegacyModeFallsBackToRuntimeOSArchWhenMissing(t *tes
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent": []string{"curl/8.7.1"},
 	})
-	applyClaudeHeaders(req, auth, "key-legacy-runtime-os-arch", false, nil, cfg)
+	applyClaudeHeaders(req, auth, "key-legacy-runtime-os-arch", false, nil, cfg, "", nil)
 
 	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", mapStainlessOS(), mapStainlessArch())
 }
@@ -576,7 +596,7 @@ func TestApplyClaudeHeaders_UnsetStabilizationAlsoUsesLegacyRuntimeOSArchFallbac
 			UserAgent:      "claude-cli/2.1.60 (external, cli)",
 			PackageVersion: "0.70.0",
 			RuntimeVersion: "v22.0.0",
-			OS:             "MacOS",
+			Os:             "MacOS",
 			Arch:           "arm64",
 		},
 	}
@@ -590,7 +610,7 @@ func TestApplyClaudeHeaders_UnsetStabilizationAlsoUsesLegacyRuntimeOSArchFallbac
 	req := newClaudeHeaderTestRequest(t, http.Header{
 		"User-Agent": []string{"curl/8.7.1"},
 	})
-	applyClaudeHeaders(req, auth, "key-unset-runtime-os-arch", false, nil, cfg)
+	applyClaudeHeaders(req, auth, "key-unset-runtime-os-arch", false, nil, cfg, "", nil)
 
 	assertClaudeFingerprint(t, req.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", mapStainlessOS(), mapStainlessArch())
 }
@@ -1596,7 +1616,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if !strings.HasPrefix(blocks[0].Get("text").String(), "x-anthropic-billing-header:") {
 		t.Fatalf("blocks[0] should be billing header, got %q", blocks[0].Get("text").String())
 	}
-	if blocks[1].Get("text").String() != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
+	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
 	if blocks[2].Get("text").String() != "You are a helpful assistant." {
@@ -1715,7 +1735,7 @@ func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
 
 func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 	// Simulate a payload with billing + agent blocks already injected
-	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.81.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.83.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true)
 
@@ -1733,10 +1753,13 @@ func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 		t.Fatalf("system[2] should contain model display name 'Sonnet 4.6', got: %.200s...", text)
 	}
 
-	// Should have cache_control with ttl for OAuth
+	// Should have cache_control without ttl (matching real CLI behavior)
 	cc := blocks[2].Get("cache_control")
-	if cc.Get("ttl").String() != "1h" {
-		t.Fatalf("system[2] cache_control should have ttl=1h in oauth mode")
+	if cc.Get("type").String() != "ephemeral" {
+		t.Fatalf("system[2] cache_control should be ephemeral, got: %s", cc.Raw)
+	}
+	if cc.Get("ttl").Exists() {
+		t.Fatalf("system[2] cache_control should not have ttl, got: %s", cc.Raw)
 	}
 }
 
@@ -1927,7 +1950,7 @@ func TestRepairToolUsePairing_NextMessageNotUser(t *testing.T) {
 
 func TestStripInvalidThinkingSignatures_NoMessages(t *testing.T) {
 	payload := []byte(`{"model":"claude-sonnet-4-6"}`)
-	out := stripInvalidThinkingSignatures(payload)
+	out := replaceOrStripThinkingSignatures(payload, "", "")
 	if string(out) != string(payload) {
 		t.Fatal("payload without messages should be unchanged")
 	}
@@ -1937,7 +1960,7 @@ func TestStripInvalidThinkingSignatures_DropsThinkingEvenWithSignature(t *testin
 	// During cloaking, ALL thinking blocks are stripped regardless of signature presence,
 	// because any signature from a proxied request is invalid for the upstream account.
 	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"some thought","signature":"valid-sig-long-enough-to-pass"},{"type":"text","text":"hi"}]}]}`)
-	out := stripInvalidThinkingSignatures(payload)
+	out := replaceOrStripThinkingSignatures(payload, "", "")
 	blocks := gjson.GetBytes(out, "messages.0.content").Array()
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 content block (thinking stripped), got %d", len(blocks))
@@ -1949,7 +1972,7 @@ func TestStripInvalidThinkingSignatures_DropsThinkingEvenWithSignature(t *testin
 
 func TestStripInvalidThinkingSignatures_DropsThinkingWithoutSignature(t *testing.T) {
 	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"some thought"},{"type":"text","text":"hi"}]}]}`)
-	out := stripInvalidThinkingSignatures(payload)
+	out := replaceOrStripThinkingSignatures(payload, "", "")
 	blocks := gjson.GetBytes(out, "messages.0.content").Array()
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 content block after stripping, got %d", len(blocks))
@@ -1962,7 +1985,7 @@ func TestStripInvalidThinkingSignatures_DropsThinkingWithoutSignature(t *testing
 func TestStripInvalidThinkingSignatures_SkipsUserMessages(t *testing.T) {
 	// User messages should not be modified even if they somehow contain thinking blocks
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"thinking","thinking":"thought"}]},{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}`)
-	out := stripInvalidThinkingSignatures(payload)
+	out := replaceOrStripThinkingSignatures(payload, "", "")
 	// User message content should remain untouched
 	blocks := gjson.GetBytes(out, "messages.0.content").Array()
 	if len(blocks) != 1 {
@@ -1972,7 +1995,7 @@ func TestStripInvalidThinkingSignatures_SkipsUserMessages(t *testing.T) {
 
 func TestStripInvalidThinkingSignatures_DropsThinkingWithEmptySignature(t *testing.T) {
 	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"thought","signature":""},{"type":"text","text":"hi"}]}]}`)
-	out := stripInvalidThinkingSignatures(payload)
+	out := replaceOrStripThinkingSignatures(payload, "", "")
 	blocks := gjson.GetBytes(out, "messages.0.content").Array()
 	if len(blocks) != 1 {
 		t.Fatalf("thinking with empty signature should be stripped, got %d blocks", len(blocks))
@@ -2075,7 +2098,9 @@ func TestCloaking_ReplacesContextManagement(t *testing.T) {
 	}
 }
 
-// TestCloaking_ReplacesContextManagement_Stream verifies the same for streaming requests.
+// TestCloaking_ReplacesContextManagement_Stream verifies that context_management
+// with valid signed edits survives sanitization.  Cloaking does not trigger for
+// non-OAuth keys, so the signed edit is forwarded as-is.
 func TestCloaking_ReplacesContextManagement_Stream(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2092,7 +2117,8 @@ func TestCloaking_ReplacesContextManagement_Stream(t *testing.T) {
 		"base_url": server.URL,
 	}}
 
-	payload := []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	// Include a signed edit so sanitizeContextManagementEdits does not strip it.
+	payload := []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"test-sig"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-4-6",
@@ -2115,7 +2141,7 @@ func TestCloaking_ReplacesContextManagement_Stream(t *testing.T) {
 
 	cm := gjson.GetBytes(receivedBody, "context_management")
 	if !cm.Exists() {
-		t.Fatal("context_management should be present after cloaking in stream mode")
+		t.Fatal("context_management with signed edits should survive sanitization")
 	}
 }
 

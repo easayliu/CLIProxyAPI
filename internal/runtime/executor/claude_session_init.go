@@ -38,7 +38,7 @@ type initSession struct {
 const (
 	initSessionBaseTTL = 1 * time.Hour
 	initSessionJitter  = 2 * time.Hour // total range: 1-3 hours
-	initCliVersion     = "2.1.81"
+	initCliVersion     = "2.1.83"
 )
 
 // NewSessionInitEmitter creates a new emitter using the Bun BoringSSL
@@ -77,14 +77,14 @@ func NewSessionInitEmitter() *SessionInitEmitter {
 // The sessionID (extracted from the client's metadata.user_id) is used as
 // the session key. Each unique sessionID triggers init exactly once.
 // The apiKey is the current OAuth access_token used for Authorization headers.
-func (si *SessionInitEmitter) EmitSessionInit(sessionID, apiKey string, isOAuth bool, deviceID, accountUUID, orgUUID, email string) {
+func (si *SessionInitEmitter) EmitSessionInit(sessionID, apiKey string, isOAuth bool, deviceID, accountUUID string) {
 	if sessionID == "" {
 		return
 	}
 	if !si.needsInit(sessionID) {
 		return
 	}
-	si.fireAll(sessionID, apiKey, isOAuth, deviceID, accountUUID, orgUUID, email)
+	si.fireAll(sessionID, apiKey, isOAuth, deviceID, accountUUID)
 }
 
 // needsInit checks whether a session init is needed for the given session ID.
@@ -107,7 +107,7 @@ func (si *SessionInitEmitter) needsInit(sessionID string) bool {
 }
 
 // fireAll sends all init requests in parallel.
-func (si *SessionInitEmitter) fireAll(sessionID, apiKey string, isOAuth bool, deviceID, accountUUID, orgUUID, email string) {
+func (si *SessionInitEmitter) fireAll(sessionID, apiKey string, isOAuth bool, deviceID, accountUUID string) {
 	var wg sync.WaitGroup
 
 	// Determine entrypoint style for User-Agent
@@ -117,11 +117,11 @@ func (si *SessionInitEmitter) fireAll(sessionID, apiKey string, isOAuth bool, de
 		func() { si.fireGrove(apiKey, isOAuth, entrypoint) },
 		func() { si.fireAccountSettings(apiKey, isOAuth) },
 		func() { si.firePenguinMode(apiKey, isOAuth) },
-		func() { si.fireClientData(apiKey, isOAuth) },
+		func() { si.fireBootstrap(apiKey, isOAuth) },
 		func() { si.fireMCPServers(apiKey, isOAuth) },
+		func() { si.fireMCPRegistry() },
 		func() { si.fireVersionCheck() },
 		func() { si.fireQuotaCheck(apiKey, isOAuth, sessionID, deviceID, accountUUID) },
-		func() { si.fireGrowthBookEval(apiKey, isOAuth, sessionID, deviceID, accountUUID, orgUUID, email) },
 		func() { si.fireTitleGeneration(apiKey, isOAuth, sessionID, deviceID, accountUUID) },
 	}
 
@@ -169,15 +169,15 @@ func (si *SessionInitEmitter) firePenguinMode(apiKey string, isOAuth bool) {
 	si.doRequest(req, "penguin_mode")
 }
 
-func (si *SessionInitEmitter) fireClientData(apiKey string, isOAuth bool) {
-	req, _ := http.NewRequest(http.MethodGet, si.upstream+"/api/oauth/claude_cli/client_data", nil)
+func (si *SessionInitEmitter) fireBootstrap(apiKey string, isOAuth bool) {
+	req, _ := http.NewRequest(http.MethodGet, si.upstream+"/api/claude_cli/bootstrap", nil)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Encoding", "gzip, compress, deflate, br")
 	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "claude-code/"+initCliVersion)
 	si.setAuth(req, apiKey, isOAuth)
-	si.doRequest(req, "client_data")
+	si.doRequest(req, "bootstrap")
 }
 
 func (si *SessionInitEmitter) fireMCPServers(apiKey string, isOAuth bool) {
@@ -190,6 +190,14 @@ func (si *SessionInitEmitter) fireMCPServers(apiKey string, isOAuth bool) {
 	req.Header.Set("User-Agent", "axios/1.13.6")
 	si.setAuth(req, apiKey, isOAuth)
 	si.doRequest(req, "mcp_servers")
+}
+
+func (si *SessionInitEmitter) fireMCPRegistry() {
+	req, _ := http.NewRequest(http.MethodGet, si.upstream+"/mcp-registry/v0/servers?version=latest&visibility=commercial", nil)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Encoding", "gzip, compress, deflate, br")
+	req.Header.Set("User-Agent", "axios/1.13.6")
+	si.doRequest(req, "mcp_registry")
 }
 
 func (si *SessionInitEmitter) fireVersionCheck() {
@@ -233,39 +241,6 @@ func (si *SessionInitEmitter) fireQuotaCheck(apiKey string, isOAuth bool, sessio
 	si.doRequest(req, "quota_check")
 }
 
-func (si *SessionInitEmitter) fireGrowthBookEval(apiKey string, isOAuth bool, sessionID, deviceID, accountUUID, orgUUID, email string) {
-	body := map[string]any{
-		"attributes": map[string]any{
-			"accountUUID":      accountUUID,
-			"appVersion":       initCliVersion,
-			"deviceID":         deviceID,
-			"email":            email,
-			"firstTokenTime":   time.Now().UnixMilli(),
-			"id":               deviceID,
-			"organizationUUID": orgUUID,
-			"platform":         "darwin",
-			"rateLimitTier":    "default_claude_max_20x",
-			"sessionId":        sessionID,
-			"subscriptionType": "max",
-			"userType":         "external",
-		},
-		"forcedFeatures":   []any{},
-		"forcedVariations": map[string]any{},
-		"url":              "",
-	}
-	data, _ := json.Marshal(body)
-
-	req, _ := http.NewRequest(http.MethodPost, si.upstream+"/api/eval/sdk-zAZezfDKGoZuXXKe", bytes.NewReader(data))
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("User-Agent", "Bun/1.3.11")
-	si.setAuth(req, apiKey, isOAuth)
-	si.doRequest(req, "growthbook_eval")
-}
-
 func (si *SessionInitEmitter) fireTitleGeneration(apiKey string, isOAuth bool, sessionID, deviceID, accountUUID string) {
 	userID := buildInitUserID(sessionID, deviceID, accountUUID)
 	body := map[string]any{
@@ -277,7 +252,7 @@ func (si *SessionInitEmitter) fireTitleGeneration(apiKey string, isOAuth bool, s
 		"messages":   []map[string]any{{"role": "user", "content": []map[string]string{{"type": "text", "text": "hello"}}}},
 		"metadata":   map[string]string{"user_id": userID},
 		"system": []map[string]string{
-			{"type": "text", "text": "x-anthropic-billing-header: cc_version=" + initCliVersion + ".c43; cc_entrypoint=cli; cch=d74fc;"},
+			{"type": "text", "text": "x-anthropic-billing-header: cc_version=" + initCliVersion + ".30b; cc_entrypoint=cli; cch=fc7bf;"},
 			{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
 			{"type": "text", "text": "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a list. Use sentence case: capitalize only the first word and proper nouns.\n\nReturn JSON with a single \"title\" field.\n\nGood examples:\n{\"title\": \"Fix login button on mobile\"}\n{\"title\": \"Add OAuth authentication\"}\n{\"title\": \"Debug failing CI tests\"}\n{\"title\": \"Refactor API client error handling\"}\n\nBad (too vague): {\"title\": \"Code changes\"}\nBad (too long): {\"title\": \"Investigate and fix the issue where the login button does not respond on mobile devices\"}\nBad (wrong case): {\"title\": \"Fix Login Button On Mobile\"}"},
 		},

@@ -37,7 +37,7 @@ claude-header-defaults:
 	if got := cfg.ClaudeHeaderDefaults.RuntimeVersion; got != "v24.5.0" {
 		t.Fatalf("RuntimeVersion = %q, want %q", got, "v24.5.0")
 	}
-	if got := cfg.ClaudeHeaderDefaults.OS; got != "MacOS" {
+	if got := cfg.ClaudeHeaderDefaults.Os; got != "MacOS" {
 		t.Fatalf("OS = %q, want %q", got, "MacOS")
 	}
 	if got := cfg.ClaudeHeaderDefaults.Arch; got != "arm64" {

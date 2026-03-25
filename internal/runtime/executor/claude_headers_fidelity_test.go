@@ -47,11 +47,11 @@ func captureFromRequest(r *http.Request) capturedHeaders {
 	}
 }
 
-// realCLIHeaders returns the expected header values from real Claude Code CLI 2.1.81.
+// realCLIHeaders returns the expected header values from real Claude Code CLI 2.1.83.
 var realCLIHeaders = capturedHeaders{
 	Accept:         "application/json",
 	AcceptEncoding: "gzip, deflate, br, zstd",
-	UserAgent:      "claude-cli/2.1.81 (external, cli)",
+	UserAgent:      "claude-cli/2.1.83 (external, cli)",
 	XApp:           "cli",
 	Version:        "2023-06-01",
 	DangerousDBA:   "true",
@@ -59,8 +59,33 @@ var realCLIHeaders = capturedHeaders{
 	StainlessRT:    "node",
 }
 
-// realCLIBetas lists the betas for non-1M models (e.g. sonnet).
+// realCLIBetas lists the betas produced by Execute/ExecuteStream for a
+// non-OAuth sonnet request. Even without explicit tools in the payload,
+// system injection adds a billing+agent block, and the body may gain tools
+// via config/defaults, producing this set.
 var realCLIBetas = []string{
+	"claude-code-20250219",
+	"oauth-2025-04-20",
+	"interleaved-thinking-2025-05-14",
+	"prompt-caching-scope-2026-01-05",
+	"advanced-tool-use-2025-11-20",
+	"effort-2025-11-24",
+}
+
+// realCLIBetas1M lists the betas for a 1M-capable model request.
+var realCLIBetas1M = []string{
+	"claude-code-20250219",
+	"oauth-2025-04-20",
+	"context-1m-2025-08-07",
+	"interleaved-thinking-2025-05-14",
+	"prompt-caching-scope-2026-01-05",
+	"advanced-tool-use-2025-11-20",
+	"effort-2025-11-24",
+}
+
+// realCLIBetasFull lists the betas for a full request with tools, thinking,
+// and context_management (matching real CLI main conversation).
+var realCLIBetasFull = []string{
 	"claude-code-20250219",
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
@@ -70,8 +95,8 @@ var realCLIBetas = []string{
 	"effort-2025-11-24",
 }
 
-// realCLIBetas1M lists the betas for 1M-capable models (e.g. opus-4-6).
-var realCLIBetas1M = []string{
+// realCLIBetasFull1M is the full betas with 1M context.
+var realCLIBetasFull1M = []string{
 	"claude-code-20250219",
 	"oauth-2025-04-20",
 	"context-1m-2025-08-07",
@@ -83,7 +108,7 @@ var realCLIBetas1M = []string{
 }
 
 // TestHeaderFidelity_StreamingMatchesRealCLI verifies that a streaming request
-// through ClaudeExecutor sends headers identical to the real Claude Code CLI 2.1.81.
+// through ClaudeExecutor sends headers identical to the real Claude Code CLI 2.1.83.
 func TestHeaderFidelity_StreamingMatchesRealCLI(t *testing.T) {
 	var captured capturedHeaders
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -305,7 +330,7 @@ func TestHeaderFidelity_GzipCompressedSSEStream(t *testing.T) {
 }
 
 // TestHeaderFidelity_UserIDNewJSONFormat verifies that the injected user_id
-// matches the new Claude Code 2.1.81 JSON format.
+// matches the new Claude Code 2.1.83 JSON format.
 func TestHeaderFidelity_UserIDNewJSONFormat(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +390,7 @@ func TestHeaderFidelity_UserIDNewJSONFormat(t *testing.T) {
 }
 
 // TestHeaderFidelity_BillingHeaderFormat verifies the billing header matches
-// Claude Code 2.1.81 format with dynamic cch.
+// Claude Code 2.1.83 format with dynamic cch.
 func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
 	var receivedBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -397,9 +422,9 @@ func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
 		t.Fatalf("system[0] is not billing header: %s", system0Text)
 	}
 
-	// Verify format: cc_version=2.1.81.XXX; cc_entrypoint=cli; cch=XXXXX;
-	if !strings.Contains(system0Text, "cc_version=2.1.81.") {
-		t.Errorf("billing header missing cc_version=2.1.81: %s", system0Text)
+	// Verify format: cc_version=2.1.83.XXX; cc_entrypoint=cli; cch=XXXXX;
+	if !strings.Contains(system0Text, "cc_version=2.1.83.") {
+		t.Errorf("billing header missing cc_version=2.1.83: %s", system0Text)
 	}
 	if !strings.Contains(system0Text, "cc_entrypoint=cli") {
 		t.Errorf("billing header missing cc_entrypoint=cli: %s", system0Text)
@@ -414,7 +439,7 @@ func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
 
 	// Verify system[1] is the agent block
 	system1Text := gjson.GetBytes(receivedBody, "system.1.text").String()
-	if system1Text != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
+	if system1Text != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Errorf("system[1] agent block mismatch: %s", system1Text)
 	}
 

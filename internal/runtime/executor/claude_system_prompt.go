@@ -64,13 +64,11 @@ func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte 
 
 	promptText := buildCLISystemPrompt(model)
 
-	// Build the CLI system prompt block with appropriate cache_control
-	cliBlock := `{"type":"text","cache_control":{"type":"ephemeral"}`
-	if oauthMode {
-		cliBlock = `{"type":"text","cache_control":{"type":"ephemeral","ttl":"1h"}`
-	}
-	// Use sjson to safely set the text field (handles JSON escaping)
-	cliBlockJSON, _ := sjson.Set(cliBlock+"}", "text", promptText)
+	// Build the CLI system prompt block with cache_control.
+	// Real CLI uses {"type":"ephemeral"} without ttl for system[2].
+	cliBlock := `{"type":"text","cache_control":{"type":"ephemeral"}}`
+	// Prefix with \n to match real CLI behavior observed in MITM capture.
+	cliBlockJSON, _ := sjson.Set(cliBlock, "text", "\n"+promptText)
 
 	// Collect extra system messages (beyond billing + agent) for migration
 	var extraTexts []string
@@ -148,5 +146,75 @@ func migrateSystemToUserMessage(payload []byte, texts []string) []byte {
 		break // only prepend to first user message
 	}
 
+	return payload
+}
+
+// Core CLI deferred tool names (without MCP tools which vary per user).
+const cliDeferredToolsContent = "<available-deferred-tools>\nAgent\nAskUserQuestion\nBash\nCronCreate\nCronDelete\nCronList\nEdit\nEnterPlanMode\nEnterWorktree\nExitPlanMode\nExitWorktree\nGlob\nGrep\nNotebookEdit\nRead\nSkill\nTaskCreate\nTaskGet\nTaskList\nTaskOutput\nTaskStop\nTaskUpdate\nWebFetch\nWebSearch\nWrite\n</available-deferred-tools>"
+
+// ToolSearch tool definition matching real Claude Code CLI v2.1.83.
+var toolSearchDefinition = json.RawMessage(`{"name":"ToolSearch","description":"Fetches full schema definitions for deferred tools so they can be called.\n\nDeferred tools appear by name in <available-deferred-tools> messages. Until fetched, only the name is known \u2014 there is no parameter schema, so the tool cannot be invoked. This tool takes a query, matches it against the deferred tool list, and returns the matched tools' complete JSONSchema definitions inside a <functions> block. Once a tool's schema appears in that result, it is callable exactly like any tool defined at the top of the prompt.\n\nResult format: each matched tool appears as one <function>{\"description\": \"...\", \"name\": \"...\", \"parameters\": {...}}</function> line inside the <functions> block \u2014 the same encoding as the tool list at the top of this prompt.\n\nQuery forms:\n- \"select:Read,Edit,Grep\" \u2014 fetch these exact tools by name\n- \"notebook jupyter\" \u2014 keyword search, up to max_results best matches\n- \"+slack send\" \u2014 require \"slack\" in the name, rank by remaining terms","input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["query","max_results"],"additionalProperties":false,"properties":{"query":{"type":"string","description":"Query to find deferred tools. Use \"select:<tool_name>\" for direct selection, or keywords to search."},"max_results":{"type":"number","default":5,"description":"Maximum number of results to return (default: 5)"}}}}`)
+
+// injectCLIDeferredTools prepends a deferred-tools user message and ensures
+// the ToolSearch tool is present in the tools array. This matches real
+// Claude Code CLI behavior where every request starts with the deferred
+// tools listing and includes ToolSearch as the only always-loaded tool.
+func injectCLIDeferredTools(payload []byte) []byte {
+	// Check if deferred-tools message already exists (real CLI client)
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() && len(messages.Array()) > 0 {
+		first := messages.Array()[0]
+		if first.Get("role").String() == "user" {
+			c := first.Get("content")
+			if c.Type == gjson.String && strings.Contains(c.String(), "<available-deferred-tools>") {
+				// Already has deferred tools — just ensure ToolSearch exists
+				payload = ensureToolSearchInTools(payload)
+				return payload
+			}
+		}
+	}
+
+	// Prepend deferred-tools user message
+	deferredMsg := map[string]string{
+		"role":    "user",
+		"content": cliDeferredToolsContent,
+	}
+	deferredJSON, _ := json.Marshal(deferredMsg)
+
+	if messages.IsArray() {
+		var newMsgs []interface{}
+		newMsgs = append(newMsgs, json.RawMessage(deferredJSON))
+		for _, msg := range messages.Array() {
+			newMsgs = append(newMsgs, json.RawMessage(msg.Raw))
+		}
+		payload, _ = sjson.SetBytes(payload, "messages", newMsgs)
+	}
+
+	payload = ensureToolSearchInTools(payload)
+	return payload
+}
+
+// ensureToolSearchInTools adds ToolSearch to the tools array if not already present.
+func ensureToolSearchInTools(payload []byte) []byte {
+	tools := gjson.GetBytes(payload, "tools")
+
+	// Check if ToolSearch already exists
+	if tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if tool.Get("name").String() == "ToolSearch" {
+				return payload
+			}
+		}
+		// Append to existing tools
+		var newTools []interface{}
+		for _, tool := range tools.Array() {
+			newTools = append(newTools, json.RawMessage(tool.Raw))
+		}
+		newTools = append(newTools, toolSearchDefinition)
+		payload, _ = sjson.SetBytes(payload, "tools", newTools)
+	} else {
+		// No tools array — create one with just ToolSearch
+		payload, _ = sjson.SetBytes(payload, "tools", []json.RawMessage{toolSearchDefinition})
+	}
 	return payload
 }

@@ -24,10 +24,11 @@ import (
 )
 
 const (
-	proxyAddr      = "127.0.0.1:19877"
-	proxyDumpDir   = "/tmp/proxy_captures"
-	upstreamProxy  = "http://127.0.0.1:6152"
+	proxyAddr     = "127.0.0.1:19877"
+	upstreamProxy = "http://127.0.0.1:6152"
 )
+
+var proxyDumpDir string
 
 // runHTTPProxy starts an HTTP/HTTPS forward proxy with MITM for TLS.
 // Usage:
@@ -35,6 +36,8 @@ const (
 //	HTTP_PROXY=http://127.0.0.1:19877 HTTPS_PROXY=http://127.0.0.1:19877 \
 //	NODE_TLS_REJECT_UNAUTHORIZED=0 claude -p "say hi"
 func runHTTPProxy() {
+	// Use timestamped subdirectory
+	proxyDumpDir = filepath.Join("/tmp/proxy_captures", time.Now().Format("20060102_150405"))
 	if err := os.MkdirAll(proxyDumpDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create dump dir: %v\n", err)
 		os.Exit(1)

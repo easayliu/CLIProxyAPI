@@ -202,7 +202,10 @@ waitForCallback:
 
 	fileName := fmt.Sprintf("claude-%s.json", tokenStorage.Email)
 	metadata := map[string]any{
-		"email": tokenStorage.Email,
+		"email":             tokenStorage.Email,
+		"device_id":         tokenStorage.DeviceID,
+		"account_uuid":      tokenStorage.AccountUUID,
+		"organization_uuid": tokenStorage.OrganizationUUID,
 	}
 
 	fmt.Println("Claude authentication successful")

@@ -243,15 +243,10 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 // applyOAuthRequestHeaders sets standard headers on OAuth/token endpoint requests
 // to match the real Claude Code CLI's Bun/Stainless SDK fingerprint.
 func applyOAuthRequestHeaders(req *http.Request) {
+	// Real Claude Code CLI token exchange uses axios defaults — only
+	// Content-Type and User-Agent, no Stainless or Accept headers.
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	// Do not set Accept-Encoding here — our custom utlsRoundTripper does not
-	// auto-decompress responses, and the token endpoint response is small JSON.
-	req.Header.Set("User-Agent", "claude-cli/2.1.81 (external, cli)")
-	req.Header.Set("X-Stainless-Runtime", "node")
-	req.Header.Set("X-Stainless-Lang", "js")
-	req.Header.Set("X-Stainless-Package-Version", "0.74.0")
-	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
+	req.Header.Set("User-Agent", "axios/1.13.4")
 }
 
 // RefreshTokens refreshes the access token using the refresh token.

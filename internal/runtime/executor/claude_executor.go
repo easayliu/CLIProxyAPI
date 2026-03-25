@@ -36,8 +36,9 @@ import (
 // ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
-	cfg              *config.Config
-	telemetryEmitter *TelemetryEmitter
+	cfg                *config.Config
+	sessionInitEmitter *SessionInitEmitter
+	// telemetryEmitter *TelemetryEmitter // disabled: not sending telemetry for now
 }
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
@@ -45,7 +46,10 @@ type ClaudeExecutor struct {
 const claudeToolPrefix = ""
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
-	return &ClaudeExecutor{cfg: cfg, telemetryEmitter: NewTelemetryEmitter()}
+	return &ClaudeExecutor{
+		cfg:                cfg,
+		sessionInitEmitter: NewSessionInitEmitter(),
+	}
 }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
@@ -109,6 +113,21 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		baseURL = "https://api.anthropic.com"
 	}
 
+	// Fire session init requests on first message per client session.
+	// Extract session_id from client's metadata.user_id to key sessions.
+	// This ensures session init is tied to the client session, not the
+	// volatile OAuth access_token which changes on refresh.
+	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
+		sessionID := extractClientSessionID(req.Payload)
+		if sessionID == "" {
+			// Client didn't provide session_id (e.g. OpenAI format).
+			// Use stable pool key — auth.ID survives token refresh.
+			sessionID = PickSessionID(stablePoolKey(auth, apiKey))
+		}
+		deviceID, accountUUID, orgUUID, email := extractAuthIdentity(auth, apiKey)
+		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, orgUUID, email)
+	}
+
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
 	from := opts.SourceFormat
@@ -135,7 +154,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// version connects through an upstream proxy like NewAPI.
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, apiKey)
+		body = checkSystemInstructionsWithMode(body, false, oauthMode, stablePoolKey(auth, apiKey))
 	}
 
 	// Sanitize context_management.edits: remove unsupported edit types before
@@ -285,29 +304,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 
-	// Emit telemetry events to match this v1/messages request
-	if e.telemetryEmitter != nil && auth != nil {
-		upstreamKey, _ := claudeCreds(auth)
-		isOAuth := isClaudeOAuthToken(upstreamKey)
-		var email string
-		var identity TelemetryIdentity
-		if auth.Metadata != nil {
-			if v, ok := auth.Metadata["email"].(string); ok {
-				email = v
-			}
-			if v, ok := auth.Metadata["device_id"].(string); ok {
-				identity.DeviceID = v
-			}
-			if v, ok := auth.Metadata["account_uuid"].(string); ok {
-				identity.AccountUUID = v
-			}
-			if v, ok := auth.Metadata["organization_uuid"].(string); ok {
-				identity.OrganizationUUID = v
-			}
-		}
-		model := gjson.GetBytes(req.Payload, "model").String()
-		e.telemetryEmitter.EmitForMessage(upstreamKey, upstreamKey, isOAuth, model, email, identity)
-	}
+	// Telemetry disabled: not sending CLI telemetry events for now.
+	// if e.telemetryEmitter != nil && auth != nil {
+	// 	...
+	// }
 
 	return resp, nil
 }
@@ -327,6 +327,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
+	}
+
+	// Fire session init requests on first message per client session.
+	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
+		sessionID := extractClientSessionID(req.Payload)
+		if sessionID == "" {
+			// Client didn't provide session_id (e.g. OpenAI format).
+			// Use stable pool key — auth.ID survives token refresh.
+			sessionID = PickSessionID(stablePoolKey(auth, apiKey))
+		}
+		deviceID, accountUUID, orgUUID, email := extractAuthIdentity(auth, apiKey)
+		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, orgUUID, email)
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -351,7 +363,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// to ensure version consistency with our template, regardless of cloaking.
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, apiKey)
+		body = checkSystemInstructionsWithMode(body, false, oauthMode, stablePoolKey(auth, apiKey))
 	}
 
 	// Sanitize context_management.edits: remove unsupported edit types before
@@ -991,6 +1003,51 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	return
 }
 
+// extractClientSessionID extracts the session_id from the client's
+// metadata.user_id JSON field. Returns empty string if not present.
+func extractClientSessionID(payload []byte) string {
+	userIDStr := gjson.GetBytes(payload, "metadata.user_id").String()
+	if userIDStr == "" {
+		return ""
+	}
+	// user_id is a JSON string: {"device_id":"...","account_uuid":"...","session_id":"..."}
+	sid := gjson.Get(userIDStr, "session_id").String()
+	return sid
+}
+
+// stablePoolKey returns a stable key for the session pool. For OAuth tokens,
+// auth.ID survives token refreshes. Falls back to apiKey for non-OAuth or
+// when auth is nil.
+func stablePoolKey(auth *cliproxyauth.Auth, apiKey string) string {
+	if auth != nil && auth.ID != "" {
+		return auth.ID
+	}
+	return apiKey
+}
+
+// extractAuthIdentity extracts identity fields from auth metadata,
+// falling back to hash-derived values from the API key.
+func extractAuthIdentity(auth *cliproxyauth.Auth, apiKey string) (deviceID, accountUUID, orgUUID, email string) {
+	deviceID = DeriveDeviceID(apiKey)
+	accountUUID = DeriveAccountUUID(apiKey)
+	orgUUID = DeriveOrganizationUUID(apiKey)
+	if auth != nil && auth.Metadata != nil {
+		if v, ok := auth.Metadata["device_id"].(string); ok && v != "" {
+			deviceID = v
+		}
+		if v, ok := auth.Metadata["account_uuid"].(string); ok && v != "" {
+			accountUUID = v
+		}
+		if v, ok := auth.Metadata["organization_uuid"].(string); ok && v != "" {
+			orgUUID = v
+		}
+		if v, ok := auth.Metadata["email"].(string); ok && v != "" {
+			email = v
+		}
+	}
+	return
+}
+
 func checkSystemInstructions(payload []byte) []byte {
 	return checkSystemInstructionsWithMode(payload, false, false, "")
 }
@@ -1255,10 +1312,13 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 //
 // Real Claude Code CLI sends ONLY metadata.user_id — no organization_uuid or other
 // fields in the metadata object. Verified via packet capture of real CLI traffic.
-func injectFakeUserID(payload []byte, apiKey string, useCache bool, realDeviceID string, realAccountUUID string) []byte {
+// injectFakeUserID replaces metadata.user_id with a generated identity.
+// poolKey is a stable identifier (e.g. auth.ID) used to key the session pool,
+// NOT the volatile OAuth access_token which changes on refresh.
+func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string) []byte {
 	generateID := func() string {
 		if useCache {
-			return cachedUserIDWithSession(apiKey, realDeviceID, realAccountUUID, "")
+			return cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, "")
 		}
 		return generateFakeUserID()
 	}
@@ -1277,7 +1337,7 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool, realDeviceID
 //  3. SHA-256(salt + chars + version), take first 3 hex chars
 //
 // cch is a 5-char hex hash derived from session-specific data (updated in v2.1.81).
-func generateBillingHeader(payload []byte, apiKey string) string {
+func generateBillingHeader(payload []byte, poolKey string) string {
 	const salt = "59cf53e54c78"
 	const version = "2.1.81"
 
@@ -1318,7 +1378,7 @@ func generateBillingHeader(payload []byte, apiKey string) string {
 	h := sha256.Sum256([]byte(salt + chars + version))
 	buildHash := hex.EncodeToString(h[:])[:3]
 
-	cch := getLastPickedCCH(apiKey)
+	cch := getLastPickedCCH(poolKey)
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
 }
 
@@ -1330,10 +1390,10 @@ func generateBillingHeader(payload []byte, apiKey string) string {
 //
 // When oauthMode is true, cache_control blocks include ttl:"1h" to match the
 // real Claude Code CLI behaviour under OAuth + active quota (fQ/aFK logic).
-func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, apiKey string) []byte {
+func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, poolKey string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(payload, apiKey)
+	billingText := generateBillingHeader(payload, poolKey)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
 	// Agent block matches real Claude Code v2.1.81 interactive mode system[1].
@@ -1855,7 +1915,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// before applyCloaking, so it applies to all requests regardless of cloaking.
 	// In strict mode, strip user system messages and keep only billing + agent blocks.
 	if strictMode && !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, true, true, apiKey)
+		payload = checkSystemInstructionsWithMode(payload, true, true, stablePoolKey(auth, apiKey))
 	}
 
 	// Inject the full Claude Code CLI system prompt as system[2] and migrate
@@ -1898,7 +1958,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 			realAccountUUID = v
 		}
 	}
-	payload = injectFakeUserID(payload, apiKey, cacheUserID, realDeviceID, realAccountUUID)
+	payload = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID)
 
 	// Inject standard CLI tools if client didn't send any.
 	payload = injectDefaultToolsIfMissing(payload)

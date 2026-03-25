@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -51,6 +52,121 @@ const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
 )
+
+// sessionAffinityMap maps client session_id → auth_id to ensure all requests
+// within the same Claude Code session are routed to the same upstream auth.
+// Without this, multi-auth rotation would scatter session init and conversation
+// requests across different accounts, creating detectable fingerprint mismatch.
+var (
+	sessionAffinityMap   = make(map[string]*sessionAffinityEntry)
+	sessionAffinityMapMu sync.RWMutex
+)
+
+type sessionAffinityEntry struct {
+	authID   string
+	expireAt time.Time
+}
+
+const sessionAffinityTTL = 3 * time.Hour
+
+func init() {
+	// Periodically purge expired session affinity entries to prevent memory leak.
+	go func() {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			sessionAffinityMapMu.Lock()
+			for k, v := range sessionAffinityMap {
+				if now.After(v.expireAt) {
+					delete(sessionAffinityMap, k)
+				}
+			}
+			sessionAffinityMapMu.Unlock()
+		}
+	}()
+}
+
+// lookupSessionAffinity returns the pinned auth ID for a session, or empty.
+func lookupSessionAffinity(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	sessionAffinityMapMu.RLock()
+	entry, ok := sessionAffinityMap[sessionID]
+	sessionAffinityMapMu.RUnlock()
+	if ok && time.Now().Before(entry.expireAt) {
+		return entry.authID
+	}
+	return ""
+}
+
+// recordSessionAffinity binds a session_id to an auth_id.
+func recordSessionAffinity(sessionID, authID string) {
+	if sessionID == "" || authID == "" {
+		return
+	}
+	sessionAffinityMapMu.Lock()
+	sessionAffinityMap[sessionID] = &sessionAffinityEntry{
+		authID:   authID,
+		expireAt: time.Now().Add(sessionAffinityTTL),
+	}
+	sessionAffinityMapMu.Unlock()
+}
+
+// extractSessionIDFromPayload extracts session_id from metadata.user_id JSON.
+func extractSessionIDFromPayload(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	// metadata.user_id is a JSON string containing {"session_id":"..."}
+	userIDRaw := gjson.GetBytes(payload, "metadata.user_id")
+	if !userIDRaw.Exists() {
+		return ""
+	}
+	return gjson.Get(userIDRaw.String(), "session_id").String()
+}
+
+// applySessionAffinity checks if the request payload contains a session_id
+// and, if so, pins the request to the previously used auth. For new sessions,
+// it registers a callback to record the mapping after auth selection.
+// Returns the session_id so callers can clear the mapping on failure.
+func applySessionAffinity(meta map[string]any, payload []byte) string {
+	sessionID := extractSessionIDFromPayload(payload)
+	if sessionID == "" {
+		return ""
+	}
+
+	// If this session is already bound to an auth, pin it.
+	if authID := lookupSessionAffinity(sessionID); authID != "" {
+		if _, alreadyPinned := meta[coreexecutor.PinnedAuthMetadataKey]; !alreadyPinned {
+			meta[coreexecutor.PinnedAuthMetadataKey] = authID
+		}
+		return sessionID
+	}
+
+	// New session: register a callback to record the mapping once auth is selected.
+	// Preserve any existing callback by chaining.
+	existingCallback, _ := meta[coreexecutor.SelectedAuthCallbackMetadataKey].(func(string))
+	meta[coreexecutor.SelectedAuthCallbackMetadataKey] = func(selectedAuthID string) {
+		recordSessionAffinity(sessionID, selectedAuthID)
+		if existingCallback != nil {
+			existingCallback(selectedAuthID)
+		}
+	}
+	return sessionID
+}
+
+// clearSessionAffinity removes the session → auth binding so the next
+// request can be routed to a different (healthy) auth.
+func clearSessionAffinity(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	sessionAffinityMapMu.Lock()
+	delete(sessionAffinityMap, sessionID)
+	sessionAffinityMapMu.Unlock()
+}
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
@@ -488,8 +604,16 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
+	sessionID := applySessionAffinity(reqMeta, rawJSON)
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
+	// If pinned auth is unavailable, clear affinity and retry without pin.
+	if err != nil && sessionID != "" && reqMeta[coreexecutor.PinnedAuthMetadataKey] != nil {
+		clearSessionAffinity(sessionID)
+		delete(reqMeta, coreexecutor.PinnedAuthMetadataKey)
+		applySessionAffinity(reqMeta, rawJSON) // re-register callback for new auth
+		resp, err = h.AuthManager.Execute(ctx, providers, req, opts)
+	}
 	if err != nil {
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -534,8 +658,15 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
+	sessionID := applySessionAffinity(reqMeta, rawJSON)
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
+	if err != nil && sessionID != "" && reqMeta[coreexecutor.PinnedAuthMetadataKey] != nil {
+		clearSessionAffinity(sessionID)
+		delete(reqMeta, coreexecutor.PinnedAuthMetadataKey)
+		applySessionAffinity(reqMeta, rawJSON)
+		resp, err = h.AuthManager.ExecuteCount(ctx, providers, req, opts)
+	}
 	if err != nil {
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -584,8 +715,15 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
+	sessionID := applySessionAffinity(reqMeta, rawJSON)
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	if err != nil && sessionID != "" && reqMeta[coreexecutor.PinnedAuthMetadataKey] != nil {
+		clearSessionAffinity(sessionID)
+		delete(reqMeta, coreexecutor.PinnedAuthMetadataKey)
+		applySessionAffinity(reqMeta, rawJSON)
+		streamResult, err = h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	}
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError

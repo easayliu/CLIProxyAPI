@@ -868,22 +868,6 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
-// mapStainlessOS returns a fixed macOS value to match typical Claude CLI user environment.
-// Using runtime.GOOS would leak the server OS (e.g. Linux on cloud servers),
-// creating a fingerprint mismatch with the claimed claude-cli User-Agent.
-// Configurable via ClaudeHeaderDefaults.Os.
-func mapStainlessOS() string {
-	return "MacOS" // Stainless SDK returns "MacOS" (capital M) for darwin
-}
-
-// mapStainlessArch returns a fixed arm64 value to match typical Claude CLI user environment.
-// Using runtime.GOARCH would leak the server architecture (e.g. x64 on cloud servers),
-// creating a fingerprint mismatch with the claimed claude-cli User-Agent.
-// Configurable via ClaudeHeaderDefaults.Arch.
-func mapStainlessArch() string {
-	return "arm64" // Always report arm64 (Apple Silicon) to match typical CLI user
-}
-
 // modelSupports1MContext returns true if the model name explicitly requests 1M context.
 // Real Claude CLI only adds context-1m-2025-08-07 beta when the model name contains "[1m]"
 // suffix (e.g. "claude-opus-4-6[1m]"). Without this suffix, even Opus 4.6 uses 200K context.
@@ -918,7 +902,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
-
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
 	if modelSupports1MContext(model) {
 		baseBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
@@ -977,9 +960,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	// line scanner reads it, so compressed responses are handled correctly.
 	r.Header.Set("Accept", "application/json")
 	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	// Report macOS/arm64 by default to match typical Claude CLI user environment.
-	// Server OS/arch would be a fingerprint (e.g. Linux on cloud servers).
-	// Configurable via ClaudeHeaderDefaults.Os and ClaudeHeaderDefaults.Arch.
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

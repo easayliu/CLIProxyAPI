@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -128,8 +129,11 @@ type Config struct {
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
-// ClaudeHeaderDefaults configures default header values injected into Claude API requests
-// when the client does not send them. Update these when Claude Code releases a new version.
+// ClaudeHeaderDefaults configures default header values injected into Claude API requests.
+// In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
+// the client omits them, while OS/Arch remain runtime-derived. When stabilized device
+// profiles are enabled, OS/Arch become the pinned platform baseline, while
+// UserAgent/PackageVersion/RuntimeVersion seed the upgradeable software fingerprint.
 type ClaudeHeaderDefaults struct {
 	UserAgent      string `yaml:"user-agent" json:"user-agent"`
 	PackageVersion string `yaml:"package-version" json:"package-version"`
@@ -141,7 +145,8 @@ type ClaudeHeaderDefaults struct {
 	Os string `yaml:"os" json:"os"`
 	// Arch overrides X-Stainless-Arch header (default: derived from runtime.GOARCH).
 	// Set to "arm64" or "x64" to match typical CLI user environments.
-	Arch string `yaml:"arch" json:"arch"`
+	Arch                   string `yaml:"arch" json:"arch"`
+	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
@@ -512,6 +517,10 @@ type OpenAICompatibilityModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// Thinking configures the thinking/reasoning capability for this model.
+	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
@@ -637,6 +646,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
+	// Sanitize Claude header defaults.
+	cfg.SanitizeClaudeHeaderDefaults()
+
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
@@ -734,6 +746,20 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+}
+
+// SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
+// configured Claude fingerprint baseline values.
+func (cfg *Config) SanitizeClaudeHeaderDefaults() {
+	if cfg == nil {
+		return
+	}
+	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
+	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
+	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
+	cfg.ClaudeHeaderDefaults.Os = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Os)
+	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
+	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.

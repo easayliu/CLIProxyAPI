@@ -45,7 +45,6 @@ var claudeHeaderOrder = []string{
 	"content-type",
 	"host",
 	"sec-fetch-mode",
-	"transfer-encoding",
 	"x-app",
 }
 

@@ -1,5 +1,9 @@
 package executor
 
+// Tests in this file are derived from real MITM captures of Claude Code CLI v2.1.83.
+// Capture: /private/tmp/proxy_captures/20260325_230810
+// Each test references the specific capture sequence number it validates against.
+
 import (
 	"bytes"
 	"compress/gzip"
@@ -11,251 +15,769 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/tidwall/gjson"
 )
 
-// capturedHeaders stores all headers received by a fake upstream server.
-type capturedHeaders struct {
-	Accept         string
-	AcceptEncoding string
-	AnthropicBeta  string
-	UserAgent      string
-	ContentType    string
-	XApp           string
-	Version        string
-	DangerousDBA   string
-	StainlessLang  string
-	StainlessRT    string
+// ---------------------------------------------------------------------------
+// Reference data: exact values from MITM capture 20260325_230810
+// ---------------------------------------------------------------------------
+
+// captureMainHeaders are the exact headers from capture #010 (opus-4-6 main
+// conversation, streaming, with tools + effort).
+var captureMainHeaders = map[string]string{
+	"Accept":                                   "application/json",
+	"User-Agent":                               "claude-cli/2.1.83 (external, cli)",
+	"X-Stainless-Arch":                         "arm64",
+	"X-Stainless-Lang":                         "js",
+	"X-Stainless-OS":                           "MacOS",
+	"X-Stainless-Package-Version":              "0.74.0",
+	"X-Stainless-Retry-Count":                  "0",
+	"X-Stainless-Runtime":                      "node",
+	"X-Stainless-Runtime-Version":              "v23.7.0",
+	"X-Stainless-Timeout":                      "600",
+	"accept-encoding":                          "br, gzip, deflate",
+	"accept-language":                           "*",
+	"anthropic-dangerous-direct-browser-access": "true",
+	"anthropic-version":                         "2023-06-01",
+	"connection":                                "keep-alive",
+	"content-type":                              "application/json",
+	"sec-fetch-mode":                            "cors",
+	"x-app":                                     "cli",
 }
 
-func captureFromRequest(r *http.Request) capturedHeaders {
-	return capturedHeaders{
-		Accept:         r.Header.Get("Accept"),
-		AcceptEncoding: r.Header.Get("Accept-Encoding"),
-		AnthropicBeta:  r.Header.Get("Anthropic-Beta"),
-		UserAgent:      r.Header.Get("User-Agent"),
-		ContentType:    r.Header.Get("Content-Type"),
-		XApp:           r.Header.Get("X-App"),
-		Version:        r.Header.Get("Anthropic-Version"),
-		DangerousDBA:   r.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"),
-		StainlessLang:  r.Header.Get("X-Stainless-Lang"),
-		StainlessRT:    r.Header.Get("X-Stainless-Runtime"),
-	}
+// captureMainBetas is the exact anthropic-beta value from capture #010.
+// opus-4-6 main conversation with tools + effort (no structured-outputs, no context-management).
+var captureMainBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
+
+// captureQuotaBetas is from capture #007 (haiku quota check, no tools).
+var captureQuotaBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
+
+// captureTitleBetas is from capture #009 (haiku title gen, with structured-outputs).
+var captureTitleBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
+
+// captureBillingHeader is from capture #010 system[0].
+const captureBillingHeader = "x-anthropic-billing-header: cc_version=2.1.83.c50; cc_entrypoint=cli; cch=00000;"
+
+// captureAgentBlock is from capture #010 system[1].
+const captureAgentBlock = "You are Claude Code, Anthropic's official CLI for Claude."
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// capturedRequest stores headers + body from a fake upstream server.
+type capturedRequest struct {
+	Headers http.Header
+	Body    []byte
 }
 
-// realCLIHeaders returns the expected header values from real Claude Code CLI 2.1.83.
-var realCLIHeaders = capturedHeaders{
-	Accept:         "application/json",
-	AcceptEncoding: "gzip, deflate, br, zstd",
-	UserAgent:      "claude-cli/2.1.83 (external, cli)",
-	XApp:           "cli",
-	Version:        "2023-06-01",
-	DangerousDBA:   "true",
-	StainlessLang:  "js",
-	StainlessRT:    "node",
-}
-
-// realCLIBetas lists the betas produced by Execute/ExecuteStream for a
-// non-OAuth sonnet request. Even without explicit tools in the payload,
-// system injection adds a billing+agent block, and the body may gain tools
-// via config/defaults, producing this set.
-var realCLIBetas = []string{
-	"claude-code-20250219",
-	"oauth-2025-04-20",
-	"interleaved-thinking-2025-05-14",
-	"prompt-caching-scope-2026-01-05",
-	"advanced-tool-use-2025-11-20",
-	"effort-2025-11-24",
-}
-
-// realCLIBetas1M lists the betas for a 1M-capable model request.
-var realCLIBetas1M = []string{
-	"claude-code-20250219",
-	"oauth-2025-04-20",
-	"context-1m-2025-08-07",
-	"interleaved-thinking-2025-05-14",
-	"prompt-caching-scope-2026-01-05",
-	"advanced-tool-use-2025-11-20",
-	"effort-2025-11-24",
-}
-
-// realCLIBetasFull lists the betas for a full request with tools, thinking,
-// and context_management (matching real CLI main conversation).
-var realCLIBetasFull = []string{
-	"claude-code-20250219",
-	"oauth-2025-04-20",
-	"interleaved-thinking-2025-05-14",
-	"context-management-2025-06-27",
-	"prompt-caching-scope-2026-01-05",
-	"advanced-tool-use-2025-11-20",
-	"effort-2025-11-24",
-}
-
-// realCLIBetasFull1M is the full betas with 1M context.
-var realCLIBetasFull1M = []string{
-	"claude-code-20250219",
-	"oauth-2025-04-20",
-	"context-1m-2025-08-07",
-	"interleaved-thinking-2025-05-14",
-	"context-management-2025-06-27",
-	"prompt-caching-scope-2026-01-05",
-	"advanced-tool-use-2025-11-20",
-	"effort-2025-11-24",
-}
-
-// TestHeaderFidelity_StreamingMatchesRealCLI verifies that a streaming request
-// through ClaudeExecutor sends headers identical to the real Claude Code CLI 2.1.83.
-func TestHeaderFidelity_StreamingMatchesRealCLI(t *testing.T) {
-	var captured capturedHeaders
+func newCaptureServer(t *testing.T, streaming bool) (*httptest.Server, *capturedRequest) {
+	t.Helper()
+	cap := &capturedRequest{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		captured = captureFromRequest(r)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"))
-		_, _ = w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
-		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
-		_, _ = w.Write([]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
-		_, _ = w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n"))
-		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-	payload := []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"say hi"}]}]}`)
-
-	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("ExecuteStream error: %v", err)
-	}
-	// Drain chunks
-	for chunk := range result.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("chunk error: %v", chunk.Err)
-		}
-	}
-
-	// Verify headers match real CLI
-	assertHeader(t, "Accept", captured.Accept, realCLIHeaders.Accept)
-	assertHeader(t, "Accept-Encoding", captured.AcceptEncoding, realCLIHeaders.AcceptEncoding)
-	assertHeader(t, "User-Agent", captured.UserAgent, realCLIHeaders.UserAgent)
-	assertHeader(t, "X-App", captured.XApp, realCLIHeaders.XApp)
-	assertHeader(t, "Anthropic-Version", captured.Version, realCLIHeaders.Version)
-	assertHeader(t, "Anthropic-Dangerous-Direct-Browser-Access", captured.DangerousDBA, realCLIHeaders.DangerousDBA)
-	assertHeader(t, "X-Stainless-Lang", captured.StainlessLang, realCLIHeaders.StainlessLang)
-	assertHeader(t, "X-Stainless-Runtime", captured.StainlessRT, realCLIHeaders.StainlessRT)
-
-	// Verify Anthropic-Beta contains all required betas in correct order
-	assertBetasInOrder(t, captured.AnthropicBeta, realCLIBetas)
-}
-
-// TestHeaderFidelity_NonStreamingMatchesRealCLI verifies non-streaming requests
-// also match the real CLI headers.
-func TestHeaderFidelity_NonStreamingMatchesRealCLI(t *testing.T) {
-	var captured capturedHeaders
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		captured = captureFromRequest(r)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"say hi"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	// Non-streaming should use the same Accept and Accept-Encoding
-	assertHeader(t, "Accept", captured.Accept, "application/json")
-	assertHeader(t, "Accept-Encoding", captured.AcceptEncoding, "gzip, deflate, br, zstd")
-	assertBetasInOrder(t, captured.AnthropicBeta, realCLIBetas)
-}
-
-// TestHeaderFidelity_StreamingAndNonStreamingHeadersIdentical verifies that
-// streaming and non-streaming requests send identical Accept/Accept-Encoding,
-// matching the real Claude Code CLI behaviour.
-func TestHeaderFidelity_StreamingAndNonStreamingHeadersIdentical(t *testing.T) {
-	var streamHeaders, nonStreamHeaders capturedHeaders
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		isStream := gjson.GetBytes(body, "stream").Bool()
-		if isStream {
-			streamHeaders = captureFromRequest(r)
+		cap.Headers = r.Header.Clone()
+		cap.Body, _ = io.ReadAll(r.Body)
+		if streaming {
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"))
+			w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+			w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
+			w.Write([]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+			w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n"))
+			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 		} else {
-			nonStreamHeaders = captureFromRequest(r)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+			w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
 		}
 	}))
-	defer server.Close()
+	return server, cap
+}
 
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+func newTestAuth(serverURL string) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
+		"base_url": serverURL,
 	}}
+}
 
-	// Non-streaming request
-	nonStreamPayload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model: "claude-sonnet-4-6", Payload: nonStreamPayload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	// Streaming request
-	streamPayload := []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model: "claude-sonnet-4-6", Payload: streamPayload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
-	if err != nil {
-		t.Fatalf("ExecuteStream error: %v", err)
-	}
+func drainStream(t *testing.T, result *cliproxyexecutor.StreamResult) {
+	t.Helper()
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("chunk error: %v", chunk.Err)
 		}
 	}
+}
 
-	if streamHeaders.Accept != nonStreamHeaders.Accept {
-		t.Errorf("Accept differs: stream=%q non-stream=%q", streamHeaders.Accept, nonStreamHeaders.Accept)
-	}
-	if streamHeaders.AcceptEncoding != nonStreamHeaders.AcceptEncoding {
-		t.Errorf("Accept-Encoding differs: stream=%q non-stream=%q", streamHeaders.AcceptEncoding, nonStreamHeaders.AcceptEncoding)
+func assertHeader(t *testing.T, name, got, want string) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s = %q, want %q", name, got, want)
 	}
 }
 
-// TestHeaderFidelity_GzipCompressedSSEStream verifies that the proxy correctly
-// handles a gzip-compressed SSE stream from upstream — the real scenario when
-// Accept-Encoding includes gzip.
-func TestHeaderFidelity_GzipCompressedSSEStream(t *testing.T) {
+func assertBetasExact(t *testing.T, got, want string) {
+	t.Helper()
+	gotParts := strings.Split(got, ",")
+	wantParts := strings.Split(want, ",")
+	for i, w := range wantParts {
+		if i >= len(gotParts) {
+			t.Errorf("anthropic-beta missing [%d]: want %q\n  full: %s", i, w, got)
+			continue
+		}
+		if strings.TrimSpace(gotParts[i]) != strings.TrimSpace(w) {
+			t.Errorf("anthropic-beta[%d] = %q, want %q\n  got:  %s\n  want: %s", i, gotParts[i], w, got, want)
+		}
+	}
+	if len(gotParts) > len(wantParts) {
+		t.Errorf("anthropic-beta has %d extra betas: %s", len(gotParts)-len(wantParts), got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Main conversation request headers (capture #010)
+// ---------------------------------------------------------------------------
+
+// TestCapture010_StreamingHeaders verifies that a streaming opus-4-6 request
+// produces headers matching capture #010 exactly.
+func TestCapture010_StreamingHeaders(t *testing.T) {
+	server, cap := newCaptureServer(t, true)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	// opus-4-6 with tools + effort, matching capture #010
+	payload := []byte(`{
+		"model":"claude-opus-4-6",
+		"stream":true,
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":[{"type":"text","text":"nihao"}]}],
+		"output_config":{"effort":"medium"},
+		"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}}]
+	}`)
+
+	result, err := executor.ExecuteStream(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	drainStream(t, result)
+
+	// Verify each header from capture #010
+	for name, want := range captureMainHeaders {
+		got := cap.Headers.Get(name)
+		if got == "" {
+			// Try lowercase lookup for raw headers set via r.Header["key"]
+			if vals, ok := cap.Headers[name]; ok && len(vals) > 0 {
+				got = vals[0]
+			}
+		}
+		assertHeader(t, name, got, want)
+	}
+
+	// Verify betas match capture #010 exactly
+	beta := cap.Headers.Get("Anthropic-Beta")
+	if beta == "" {
+		if vals, ok := cap.Headers["anthropic-beta"]; ok && len(vals) > 0 {
+			beta = vals[0]
+		}
+	}
+	assertBetasExact(t, beta, captureMainBetas)
+}
+
+// TestCapture010_NonStreamingHeaders verifies non-streaming produces identical
+// headers (Accept-Encoding, User-Agent etc. should not differ).
+func TestCapture010_NonStreamingHeaders(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{
+		"model":"claude-opus-4-6",
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":[{"type":"text","text":"nihao"}]}],
+		"output_config":{"effort":"medium"},
+		"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	assertHeader(t, "Accept", cap.Headers.Get("Accept"), "application/json")
+
+	enc := cap.Headers.Get("Accept-Encoding")
+	if enc == "" {
+		if vals, ok := cap.Headers["accept-encoding"]; ok && len(vals) > 0 {
+			enc = vals[0]
+		}
+	}
+	assertHeader(t, "accept-encoding", enc, "br, gzip, deflate")
+}
+
+// TestCapture010_StreamNonStreamIdentical verifies stream and non-stream
+// produce identical Accept/Accept-Encoding (real CLI does not vary these).
+func TestCapture010_StreamNonStreamIdentical(t *testing.T) {
+	var streamEnc, nonStreamEnc string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enc := r.Header.Get("Accept-Encoding")
+		if enc == "" {
+			if vals, ok := r.Header["accept-encoding"]; ok && len(vals) > 0 {
+				enc = vals[0]
+			}
+		}
+		body, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(body, "stream").Bool() {
+			streamEnc = enc
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+		} else {
+			nonStreamEnc = enc
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+		}
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := newTestAuth(server.URL)
+
+	// Non-streaming
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	// Streaming
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	drainStream(t, result)
+
+	if streamEnc != nonStreamEnc {
+		t.Errorf("Accept-Encoding differs: stream=%q non-stream=%q", streamEnc, nonStreamEnc)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Body structure (captures #010, #007)
+// ---------------------------------------------------------------------------
+
+// TestCapture010_SystemArray verifies system prompt structure matches capture #010:
+//   system[0]: billing header (no cache_control)
+//   system[1]: agent block (cache_control: ephemeral)
+//   system[2+]: user content (cache_control: ephemeral)
+func TestCapture010_SystemArray(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{
+		"model":"claude-opus-4-6",
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":[{"type":"text","text":"nihao"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	// system[0]: billing header
+	sys0 := gjson.GetBytes(cap.Body, "system.0.text").String()
+	if !strings.HasPrefix(sys0, "x-anthropic-billing-header:") {
+		t.Fatalf("system[0] not billing header: %s", sys0)
+	}
+	if !strings.Contains(sys0, "cc_version=2.1.83.") {
+		t.Errorf("billing header missing cc_version=2.1.83: %s", sys0)
+	}
+	if !strings.Contains(sys0, "cc_entrypoint=cli") {
+		t.Errorf("billing header missing cc_entrypoint=cli: %s", sys0)
+	}
+	if !strings.Contains(sys0, "cch=00000") {
+		t.Errorf("billing header should have cch=00000: %s", sys0)
+	}
+	// Capture #010: system[0] has NO cache_control
+	if gjson.GetBytes(cap.Body, "system.0.cache_control").Exists() {
+		t.Error("system[0] should not have cache_control (matches capture #010)")
+	}
+
+	// system[1]: agent block
+	sys1 := gjson.GetBytes(cap.Body, "system.1.text").String()
+	if sys1 != captureAgentBlock {
+		t.Errorf("system[1] = %q, want %q", sys1, captureAgentBlock)
+	}
+	// Capture #010: system[1] has cache_control: ephemeral
+	sys1CC := gjson.GetBytes(cap.Body, "system.1.cache_control.type").String()
+	if sys1CC != "ephemeral" {
+		t.Errorf("system[1].cache_control.type = %q, want \"ephemeral\"", sys1CC)
+	}
+}
+
+// TestCapture010_Temperature verifies temperature is always set to 1
+// (matching capture #010 body).
+func TestCapture010_Temperature(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	// Client sends temperature:0.5 — proxy should override to 1
+	payload := []byte(`{
+		"model":"claude-opus-4-6",
+		"max_tokens":1024,
+		"temperature":0.5,
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	temp := gjson.GetBytes(cap.Body, "temperature").Float()
+	if temp != 1.0 {
+		t.Errorf("temperature = %v, want 1 (capture #010)", temp)
+	}
+}
+
+// TestCapture010_UserIDFormat verifies metadata.user_id is JSON with
+// device_id, account_uuid, session_id (matching capture #010 body).
+func TestCapture010_UserIDFormat(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	userIDStr := gjson.GetBytes(cap.Body, "metadata.user_id").String()
+	if userIDStr == "" {
+		t.Fatal("metadata.user_id is empty")
+	}
+
+	var uid userIDPayload
+	if err := json.Unmarshal([]byte(userIDStr), &uid); err != nil {
+		t.Fatalf("user_id not valid JSON: %v\nraw: %s", err, userIDStr)
+	}
+	if len(uid.DeviceID) != 64 {
+		t.Errorf("device_id length = %d, want 64", len(uid.DeviceID))
+	}
+	if !strings.Contains(uid.AccountUUID, "-") || len(uid.AccountUUID) != 36 {
+		t.Errorf("account_uuid not UUID format: %s", uid.AccountUUID)
+	}
+	if !strings.Contains(uid.SessionID, "-") || len(uid.SessionID) != 36 {
+		t.Errorf("session_id not UUID format: %s", uid.SessionID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Beta variations per model (captures #007, #009, #010)
+// ---------------------------------------------------------------------------
+
+// TestCapture010_OpusBetas verifies opus-4-6 betas match capture #010 exactly.
+// Key: opus always includes context-1m-2025-08-07.
+func TestCapture010_OpusBetas(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{
+		"model":"claude-opus-4-6",
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+		"output_config":{"effort":"medium"},
+		"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	beta := cap.Headers.Get("Anthropic-Beta")
+	if beta == "" {
+		if vals, ok := cap.Headers["anthropic-beta"]; ok && len(vals) > 0 {
+			beta = vals[0]
+		}
+	}
+	assertBetasExact(t, beta, captureMainBetas)
+
+	if !strings.Contains(beta, "context-1m-2025-08-07") {
+		t.Errorf("opus-4-6 must include context-1m (capture #010), got: %s", beta)
+	}
+}
+
+// TestCapture_SonnetNoBetas verifies sonnet-4-6 does NOT include context-1m
+// (not an opus model).
+func TestCapture_SonnetNoBetas(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"max_tokens":1024,
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+		"output_config":{"effort":"medium"},
+		"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	beta := cap.Headers.Get("Anthropic-Beta")
+	if beta == "" {
+		if vals, ok := cap.Headers["anthropic-beta"]; ok && len(vals) > 0 {
+			beta = vals[0]
+		}
+	}
+	if strings.Contains(beta, "context-1m") {
+		t.Errorf("sonnet should not have context-1m, got: %s", beta)
+	}
+}
+
+// TestCapture_Opus1MSuffix verifies opus-4-6[1m] also includes context-1m.
+func TestCapture_Opus1MSuffix(t *testing.T) {
+	server, cap := newCaptureServer(t, false)
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{
+		"model":"claude-opus-4-6[1m]",
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+		"output_config":{"effort":"medium"},
+		"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6[1m]",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	beta := cap.Headers.Get("Anthropic-Beta")
+	if beta == "" {
+		if vals, ok := cap.Headers["anthropic-beta"]; ok && len(vals) > 0 {
+			beta = vals[0]
+		}
+	}
+	if !strings.Contains(beta, "context-1m-2025-08-07") {
+		t.Errorf("opus-4-6[1m] must include context-1m, got: %s", beta)
+	}
+}
+
+// TestCapture007_QuotaCheckBetas verifies that a minimal haiku request
+// (no tools, no effort, no structured-outputs) produces only the base betas,
+// matching capture #007.
+func TestCapture007_QuotaCheckBetas(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-haiku-4-5-20251001","role":"assistant","content":[{"type":"text","text":"#"}],"usage":{"input_tokens":8,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	// Test the session init quota check directly (not through executor pipeline).
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireQuotaCheck(client, "sk-ant-oat01-test", true, "session-123", "device-abc", "account-xyz")
+
+	beta := gotHeaders.Get("Anthropic-Beta")
+	assertBetasExact(t, beta, captureQuotaBetas)
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Session init request headers (captures #001-#006, #011)
+// ---------------------------------------------------------------------------
+
+// TestCapture001_AccountSettings verifies fireAccountSettings headers match capture #001.
+func TestCapture001_AccountSettings(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireAccountSettings(client, "sk-ant-oat01-test", true)
+
+	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json, text/plain, */*")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, compress, deflate, br")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-code/2.1.83")
+	// anthropic-beta set via raw header (lowercase key in Go map)
+	beta := gotHeaders.Get("Anthropic-Beta")
+	if beta == "" {
+		if vals, ok := gotHeaders["anthropic-beta"]; ok && len(vals) > 0 {
+			beta = vals[0]
+		}
+	}
+	assertHeader(t, "anthropic-beta", beta, "oauth-2025-04-20")
+	assertHeader(t, "Authorization", gotHeaders.Get("Authorization"), "Bearer sk-ant-oat01-test")
+}
+
+// TestCapture002_Grove verifies fireGrove headers match capture #002.
+func TestCapture002_Grove(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireGrove(client, "sk-ant-oat01-test", true, "cli")
+
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.83 (external, cli)")
+	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json, text/plain, */*")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, compress, deflate, br")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
+}
+
+// TestCapture003_Bootstrap verifies fireBootstrap headers match capture #003.
+func TestCapture003_Bootstrap(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireBootstrap(client, "sk-ant-oat01-test", true)
+
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-code/2.1.83")
+	assertHeader(t, "Content-Type", gotHeaders.Get("Content-Type"), "application/json")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
+}
+
+// TestCapture004_PenguinMode verifies firePenguinMode headers match capture #004.
+func TestCapture004_PenguinMode(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.firePenguinMode(client, "sk-ant-oat01-test", true)
+
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "axios/1.13.6")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, compress, deflate, br")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
+}
+
+// TestCapture005_MCPServers verifies fireMCPServers headers match capture #005.
+func TestCapture005_MCPServers(t *testing.T) {
+	var gotHeaders http.Header
+	var gotURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		gotURL = r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[],"next_page":null}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireMCPServers(client, "sk-ant-oat01-test", true)
+
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "axios/1.13.6")
+	assertHeader(t, "Content-Type", gotHeaders.Get("Content-Type"), "application/json")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
+	// anthropic-beta should be mcp-servers-2025-12-04 (not oauth)
+	beta := gotHeaders.Get("Anthropic-Beta")
+	if beta == "" {
+		if vals, ok := gotHeaders["anthropic-beta"]; ok && len(vals) > 0 {
+			beta = vals[0]
+		}
+	}
+	assertHeader(t, "anthropic-beta", beta, "mcp-servers-2025-12-04")
+	ver := gotHeaders.Get("Anthropic-Version")
+	if ver == "" {
+		if vals, ok := gotHeaders["anthropic-version"]; ok && len(vals) > 0 {
+			ver = vals[0]
+		}
+	}
+	assertHeader(t, "anthropic-version", ver, "2023-06-01")
+	if gotURL != "/v1/mcp_servers?limit=1000" {
+		t.Errorf("URL = %q, want /v1/mcp_servers?limit=1000", gotURL)
+	}
+}
+
+// TestCapture006_MCPRegistry verifies fireMCPRegistry headers match capture #006.
+func TestCapture006_MCPRegistry(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireMCPRegistry(client)
+
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "axios/1.13.6")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, compress, deflate, br")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
+	// No auth header for mcp-registry (capture #006 has no Authorization)
+	if gotHeaders.Get("Authorization") != "" {
+		t.Error("mcp-registry should not have Authorization header (capture #006)")
+	}
+}
+
+// TestCapture007_QuotaCheckHeaders verifies fireQuotaCheck headers match capture #007.
+func TestCapture007_QuotaCheckHeaders(t *testing.T) {
+	var gotHeaders http.Header
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-haiku-4-5-20251001","role":"assistant","content":[{"type":"text","text":"#"}],"usage":{"input_tokens":8,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireQuotaCheck(client, "sk-ant-oat01-test", true, "session-123", "device-abc", "account-xyz")
+
+	// Stainless SDK style headers (capture #007)
+	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "br, gzip, deflate")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.83 (external, cli)")
+	assertHeader(t, "X-Stainless-Lang", gotHeaders.Get("X-Stainless-Lang"), "js")
+	assertHeader(t, "X-Stainless-Runtime", gotHeaders.Get("X-Stainless-Runtime"), "node")
+	assertHeader(t, "X-Stainless-Runtime-Version", gotHeaders.Get("X-Stainless-Runtime-Version"), "v23.7.0")
+	assertHeader(t, "X-App", gotHeaders.Get("X-App"), "cli")
+	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "keep-alive")
+
+	// Body: model=haiku, max_tokens=1
+	model := gjson.GetBytes(gotBody, "model").String()
+	if model != "claude-haiku-4-5-20251001" {
+		t.Errorf("quota check model = %q, want claude-haiku-4-5-20251001", model)
+	}
+	maxTokens := gjson.GetBytes(gotBody, "max_tokens").Int()
+	if maxTokens != 1 {
+		t.Errorf("quota check max_tokens = %d, want 1", maxTokens)
+	}
+}
+
+// TestCapture009_TitleGenHeaders verifies fireTitleGeneration headers match capture #009.
+func TestCapture009_TitleGenHeaders(t *testing.T) {
+	var gotHeaders http.Header
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	si := &SessionInitEmitter{upstream: server.URL, sessions: make(map[string]*initSession)}
+	client := &http.Client{}
+	si.fireTitleGeneration(client, "sk-ant-oat01-test", true, "session-123", "device-abc", "account-xyz")
+
+	// Stainless SDK style headers (capture #009)
+	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "br, gzip, deflate")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.83 (external, cli)")
+	assertHeader(t, "X-Stainless-Runtime-Version", gotHeaders.Get("X-Stainless-Runtime-Version"), "v23.7.0")
+
+	// Beta must include structured-outputs (capture #009)
+	beta := gotHeaders.Get("Anthropic-Beta")
+	assertBetasExact(t, beta, captureTitleBetas)
+
+	// Body structure
+	model := gjson.GetBytes(gotBody, "model").String()
+	if model != "claude-haiku-4-5-20251001" {
+		t.Errorf("title gen model = %q, want claude-haiku-4-5-20251001", model)
+	}
+	if !gjson.GetBytes(gotBody, "stream").Bool() {
+		t.Error("title gen should be streaming")
+	}
+	if gjson.GetBytes(gotBody, "max_tokens").Int() != 32000 {
+		t.Errorf("title gen max_tokens = %d, want 32000", gjson.GetBytes(gotBody, "max_tokens").Int())
+	}
+	// system[0] billing header with .be2 build hash (capture #009)
+	sys0 := gjson.GetBytes(gotBody, "system.0.text").String()
+	if !strings.Contains(sys0, "cc_version=2.1.83.be2") {
+		t.Errorf("title gen billing header should use .be2 build hash: %s", sys0)
+	}
+	// output_config.format.type = json_schema
+	formatType := gjson.GetBytes(gotBody, "output_config.format.type").String()
+	if formatType != "json_schema" {
+		t.Errorf("title gen output_config.format.type = %q, want json_schema", formatType)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Gzip decompression (functional)
+// ---------------------------------------------------------------------------
+
+// TestCapture_GzipCompressedSSEStream verifies the proxy correctly handles
+// gzip-compressed SSE from upstream (real scenario with Accept-Encoding: br, gzip, deflate).
+func TestCapture_GzipCompressedSSEStream(t *testing.T) {
 	ssePayload := strings.Join([]string{
 		"event: message_start",
 		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}`,
@@ -277,33 +799,23 @@ func TestHeaderFidelity_GzipCompressedSSEStream(t *testing.T) {
 		"",
 	}, "\n")
 
-	// Gzip compress the SSE payload
 	var compressed bytes.Buffer
 	gzw := gzip.NewWriter(&compressed)
-	_, _ = gzw.Write([]byte(ssePayload))
-	_ = gzw.Close()
+	gzw.Write([]byte(ssePayload))
+	gzw.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Upstream responds with gzip-compressed SSE
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Content-Encoding", "gzip")
-		_, _ = w.Write(compressed.Bytes())
+		w.Write(compressed.Bytes())
 	}))
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-	payload := []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"say hi"}]}]}`)
-
-	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+	result, err := executor.ExecuteStream(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
+		Payload: []byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"say hi"}]}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
 	if err != nil {
 		t.Fatalf("ExecuteStream error: %v", err)
 	}
@@ -325,242 +837,5 @@ func TestHeaderFidelity_GzipCompressedSSEStream(t *testing.T) {
 	}
 	if !strings.Contains(combined, "message_stop") {
 		t.Error("missing message_stop in decompressed stream")
-	}
-	t.Logf("gzip SSE stream decompressed successfully, %d bytes received", len(allChunks))
-}
-
-// TestHeaderFidelity_UserIDNewJSONFormat verifies that the injected user_id
-// matches the new Claude Code 2.1.83 JSON format.
-func TestHeaderFidelity_UserIDNewJSONFormat(t *testing.T) {
-	var receivedBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedBody, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-	// No metadata.user_id in the payload — the proxy should inject one
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	userIDStr := gjson.GetBytes(receivedBody, "metadata.user_id").String()
-	if userIDStr == "" {
-		t.Fatal("metadata.user_id is empty")
-	}
-
-	// Verify it's valid JSON with the expected fields
-	var uid userIDPayload
-	if err := json.Unmarshal([]byte(userIDStr), &uid); err != nil {
-		t.Fatalf("user_id is not valid JSON: %v\nraw: %s", err, userIDStr)
-	}
-	if len(uid.DeviceID) != 64 {
-		t.Errorf("device_id length = %d, want 64", len(uid.DeviceID))
-	}
-	if uid.AccountUUID == "" {
-		t.Error("account_uuid is empty")
-	}
-	if uid.SessionID == "" {
-		t.Error("session_id is empty")
-	}
-	// Verify it looks like a valid UUID format
-	if !strings.Contains(uid.AccountUUID, "-") || len(uid.AccountUUID) != 36 {
-		t.Errorf("account_uuid doesn't look like a UUID: %s", uid.AccountUUID)
-	}
-	if !strings.Contains(uid.SessionID, "-") || len(uid.SessionID) != 36 {
-		t.Errorf("session_id doesn't look like a UUID: %s", uid.SessionID)
-	}
-
-	t.Logf("user_id format verified: device_id=%s... account=%s session=%s",
-		uid.DeviceID[:12], uid.AccountUUID, uid.SessionID)
-}
-
-// TestHeaderFidelity_BillingHeaderFormat verifies the billing header matches
-// Claude Code 2.1.83 format with dynamic cch.
-func TestHeaderFidelity_BillingHeaderFormat(t *testing.T) {
-	var receivedBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedBody, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"say hi"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	system0Text := gjson.GetBytes(receivedBody, "system.0.text").String()
-	if !strings.HasPrefix(system0Text, "x-anthropic-billing-header:") {
-		t.Fatalf("system[0] is not billing header: %s", system0Text)
-	}
-
-	// Verify format: cc_version=2.1.83.XXX; cc_entrypoint=cli; cch=XXXXX;
-	if !strings.Contains(system0Text, "cc_version=2.1.83.") {
-		t.Errorf("billing header missing cc_version=2.1.83: %s", system0Text)
-	}
-	if !strings.Contains(system0Text, "cc_entrypoint=cli") {
-		t.Errorf("billing header missing cc_entrypoint=cli: %s", system0Text)
-	}
-	if !strings.Contains(system0Text, "cch=") {
-		t.Errorf("billing header missing cch=: %s", system0Text)
-	}
-	// cch should NOT be 00000 (old hardcoded value)
-	if strings.Contains(system0Text, "cch=00000") {
-		t.Errorf("billing header still has hardcoded cch=00000: %s", system0Text)
-	}
-
-	// Verify system[1] is the agent block
-	system1Text := gjson.GetBytes(receivedBody, "system.1.text").String()
-	if system1Text != "You are Claude Code, Anthropic's official CLI for Claude." {
-		t.Errorf("system[1] agent block mismatch: %s", system1Text)
-	}
-
-	t.Logf("billing header: %s", system0Text)
-}
-
-// TestHeaderFidelity_OpusIncludes1MBeta verifies that only models with [1m] suffix
-// include the context-1m beta. Plain opus-4-6 and sonnet-4-6 do NOT include it.
-func TestHeaderFidelity_OpusIncludes1MBeta(t *testing.T) {
-	// Plain opus-4-6 should NOT include context-1m beta
-	var captured capturedHeaders
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		captured = captureFromRequest(r)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-	payload := []byte(`{"model":"claude-opus-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-opus-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	// Plain opus should NOT include context-1m beta (matches real CLI behavior)
-	assertBetasInOrder(t, captured.AnthropicBeta, realCLIBetas)
-	if strings.Contains(captured.AnthropicBeta, "context-1m") {
-		t.Errorf("plain opus-4-6 should not have context-1m beta, got: %s", captured.AnthropicBeta)
-	}
-
-	// opus-4-6[1m] SHOULD include context-1m beta
-	var captured1M capturedHeaders
-	server1M := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		captured1M = captureFromRequest(r)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
-	}))
-	defer server1M.Close()
-
-	auth1M := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server1M.URL,
-	}}
-	payload1M := []byte(`{"model":"claude-opus-4-6[1m]","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	_, err = executor.Execute(context.Background(), auth1M, cliproxyexecutor.Request{
-		Model:   "claude-opus-4-6[1m]",
-		Payload: payload1M,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	// [1m] model should include context-1m beta
-	assertBetasInOrder(t, captured1M.AnthropicBeta, realCLIBetas1M)
-
-	// Verify sonnet does NOT include context-1m
-	var capturedSonnet capturedHeaders
-	serverSonnet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedSonnet = captureFromRequest(r)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
-	}))
-	defer serverSonnet.Close()
-
-	authSonnet := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": serverSonnet.URL,
-	}}
-	payloadSonnet := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	_, err = executor.Execute(context.Background(), authSonnet, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payloadSonnet,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	// Sonnet should NOT include context-1m beta
-	assertBetasInOrder(t, capturedSonnet.AnthropicBeta, realCLIBetas)
-	if strings.Contains(capturedSonnet.AnthropicBeta, "context-1m") {
-		t.Errorf("sonnet should not have context-1m beta, got: %s", capturedSonnet.AnthropicBeta)
-	}
-}
-
-// --- Helpers ---
-
-func assertHeader(t *testing.T, name, got, want string) {
-	t.Helper()
-	if got != want {
-		t.Errorf("%s = %q, want %q", name, got, want)
-	}
-}
-
-func assertBetasInOrder(t *testing.T, betaHeader string, expected []string) {
-	t.Helper()
-	parts := strings.Split(betaHeader, ",")
-	for i, want := range expected {
-		if i >= len(parts) {
-			t.Errorf("Anthropic-Beta missing beta at position %d: want %q", i, want)
-			continue
-		}
-		got := strings.TrimSpace(parts[i])
-		if got != want {
-			t.Errorf("Anthropic-Beta[%d] = %q, want %q\n  full: %s", i, got, want, betaHeader)
-		}
 	}
 }

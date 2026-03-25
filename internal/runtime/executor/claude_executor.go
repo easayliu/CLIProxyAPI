@@ -47,7 +47,8 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
 	return &ClaudeExecutor{
 		cfg:                cfg,
 		sessionInitEmitter: NewSessionInitEmitter(),
-		telemetryEmitter:   NewTelemetryEmitter(),
+		// telemetryEmitter disabled: synthetic telemetry may be a detection signal.
+		// telemetryEmitter:   NewTelemetryEmitter(),
 	}
 }
 
@@ -121,7 +122,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Fire session init requests on first message per client session.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
 		deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
-		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID)
+		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth))
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -138,6 +139,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+
+	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
+	// Override to match CLI fingerprint regardless of what the client sent.
+	body, _ = sjson.SetBytes(body, "temperature", 1)
 
 	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	// if err != nil {
@@ -339,7 +344,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Fire session init requests on first message per client session.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
 		deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
-		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID)
+		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth))
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -354,6 +359,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+
+	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
+	body, _ = sjson.SetBytes(body, "temperature", 1)
 
 	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	// if err != nil {
@@ -949,7 +957,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if gjson.GetBytes(body, "context_management").Exists() {
 		addBeta("context-management-2025-06-27")
 	}
-	if modelSupports1MContext(model) {
+	// Real CLI 2.1.83 always includes context-1m beta for Opus 4.6 (MITM capture confirmed).
+	// Also add it when model explicitly requests 1M via [1m] suffix or X-CPA-CLAUDE-1M header.
+	if modelSupports1MContext(model) || strings.Contains(model, "opus-4-6") {
 		addBeta("context-1m-2025-08-07")
 	}
 
@@ -1011,7 +1021,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Stainless SDK headers: Title-Case, except OS which is all-caps
 	setRaw("X-Stainless-Retry-Count", "0")
-	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
+	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v23.7.0"))
 	setRaw("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
 	setRaw("X-Stainless-Runtime", "node")
 	setRaw("X-Stainless-Lang", "js")
@@ -1019,11 +1029,14 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	setRaw("X-Stainless-OS", hdrDefault(hd.Os, mapStainlessOS()))
 	setRaw("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 
-	// Standard HTTP headers: Title-Case (matches Node.js HTTP/1.1)
+	// Standard HTTP headers matching real CLI 2.1.83 MITM capture.
+	// Accept is Title-Case; the rest are lowercase in real Bun wire format.
 	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.83 (external, cli)"))
-	r.Header.Set("Connection", "keep-alive")
 	r.Header.Set("Accept", "application/json")
-	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	setRaw("accept-encoding", "br, gzip, deflate")
+	setRaw("accept-language", "*")
+	setRaw("sec-fetch-mode", "cors")
+	setRaw("connection", "keep-alive")
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -1381,8 +1394,8 @@ func generateBillingHeader(poolKey string) string {
 	const version = "2.1.83"
 	const buildHash = "c50"
 
-	cch := getLastPickedCCH(poolKey)
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
+	// Real Claude Code CLI hardcodes cch=00000 (confirmed in cli.js 2.1.83).
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", version, buildHash)
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:
@@ -1399,18 +1412,21 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 	billingText := generateBillingHeader(poolKey)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
+	agentBlock := `{"type":"text","cache_control":{"type":"ephemeral"},"text":"You are Claude Code, Anthropic's official CLI for Claude."}`
 	if strictMode {
-		// Strict mode: billing header only
-		result := "[" + billingBlock + "]"
+		// Strict mode: billing header + agent block only
+		result := "[" + billingBlock + "," + agentBlock + "]"
 		payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 		return payload
 	}
 
-	// Non-strict mode: billing header + user system messages
-	// Always regenerate to ensure version consistency with our template (2.1.83).
-	// If the client already injected a billing header (e.g. real Claude Code CLI
-	// with a different version), strip it to prevent version mismatch fingerprints.
-	result := "[" + billingBlock
+	// Non-strict mode: billing header + agent block + user system messages.
+	// Always regenerate billing + agent to ensure version consistency (2.1.83).
+	// Matches MITM capture 20260325_230810 #010 structure:
+	//   system[0]: billing header (no cache_control)
+	//   system[1]: agent identifier (cache_control: ephemeral)
+	//   system[2..]: user system messages (cache_control: ephemeral)
+	result := "[" + billingBlock + "," + agentBlock
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {

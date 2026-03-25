@@ -20,29 +20,33 @@ import (
 // claudeHeaderOrder defines the canonical header order matching the real
 // Bun + @anthropic-ai/sdk (Stainless) wire format. Headers not in this
 // list are appended at the end in their original order.
+// claudeHeaderOrder matches the real Claude Code CLI 2.1.83 wire order
+// captured via MITM httpproxy (Bun + @anthropic-ai/sdk).
 var claudeHeaderOrder = []string{
-	"host",
-	"authorization",
-	"x-api-key",
-	"content-type",
-	"content-length",
-	"transfer-encoding",
-	"anthropic-version",
+	"accept",
+	"user-agent",
+	"x-stainless-arch",
+	"x-stainless-lang",
+	"x-stainless-os",
+	"x-stainless-package-version",
+	"x-stainless-retry-count",
+	"x-stainless-runtime",
+	"x-stainless-runtime-version",
+	"x-stainless-timeout",
+	"accept-encoding",
+	"accept-language",
 	"anthropic-beta",
 	"anthropic-dangerous-direct-browser-access",
-	"x-app",
-	"x-stainless-retry-count",
-	"x-stainless-runtime-version",
-	"x-stainless-package-version",
-	"x-stainless-runtime",
-	"x-stainless-lang",
-	"x-stainless-arch",
-	"x-stainless-os",
-	"x-stainless-timeout",
-	"user-agent",
-	"accept",
-	"accept-encoding",
+	"anthropic-version",
+	"authorization",
+	"x-api-key",
 	"connection",
+	"content-length",
+	"content-type",
+	"host",
+	"sec-fetch-mode",
+	"transfer-encoding",
+	"x-app",
 }
 
 // claudeHeaderRank maps lowercase header name to its position in claudeHeaderOrder.

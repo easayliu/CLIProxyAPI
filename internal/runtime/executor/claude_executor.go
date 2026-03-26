@@ -6,6 +6,8 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1415,18 +1417,73 @@ func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceI
 	return payload, pickedSessionID, nil
 }
 
+// billingBuildHashSalt is the fixed salt used by real Claude Code CLI 2.1.84
+// to compute the per-request build hash in the billing header.
+// Extracted from cli.js: KM7 = "59cf53e54c78".
+const billingBuildHashSalt = "59cf53e54c78"
+
+// billingCLIVersion is the CLI version embedded in the billing header.
+const billingCLIVersion = "2.1.84"
+
+// computeBuildHash computes the 3-char build hash for the billing header.
+// Algorithm (from cli.js _0T): extract chars at positions [4,7,20] from the
+// first user message text, concatenate salt + chars + version, SHA-256 hash,
+// take first 3 hex chars.
+func computeBuildHash(payload []byte) string {
+	text := firstUserMessageText(payload)
+	chars := make([]byte, 3)
+	indices := [3]int{4, 7, 20}
+	for i, idx := range indices {
+		if idx < len(text) {
+			chars[i] = text[idx]
+		} else {
+			chars[i] = '0'
+		}
+	}
+	input := billingBuildHashSalt + string(chars) + billingCLIVersion
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:])[:3]
+}
+
+// firstUserMessageText extracts the text content of the first user message
+// from a Claude API request payload. Matches cli.js OM7 function behavior.
+func firstUserMessageText(payload []byte) string {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return ""
+	}
+	for _, msg := range messages.Array() {
+		if msg.Get("role").String() != "user" {
+			continue
+		}
+		content := msg.Get("content")
+		// String content
+		if content.Type == gjson.String {
+			return content.String()
+		}
+		// Array content: find first text block
+		if content.IsArray() {
+			for _, block := range content.Array() {
+				if block.Get("type").String() == "text" {
+					return block.Get("text").String()
+				}
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
 //
-// The build hash is a fixed value per CLI version (c50 for 2.1.84).
-// cch is a 5-char hex hash derived from session-specific data.
-func generateBillingHeader(poolKey string) string {
-	const version = "2.1.84"
-	const buildHash = "c50"
-
-	// Real Claude Code CLI hardcodes cch=00000 (confirmed in cli.js 2.1.84).
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", version, buildHash)
+// The build hash is dynamically computed per-request from the first user message
+// content using SHA-256, matching real CLI 2.1.84 behavior (cli.js _0T/qmq).
+// cch is hardcoded to 00000 (confirmed in cli.js 2.1.84 fW_ function).
+func generateBillingHeader(payload []byte) string {
+	buildHash := computeBuildHash(payload)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", billingCLIVersion, buildHash)
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:
@@ -1440,7 +1497,7 @@ func generateBillingHeader(poolKey string) string {
 func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, poolKey string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(poolKey)
+	billingText := generateBillingHeader(payload)
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
 	agentBlock := `{"type":"text","cache_control":{"type":"ephemeral"},"text":"You are Claude Code, Anthropic's official CLI for Claude."}`

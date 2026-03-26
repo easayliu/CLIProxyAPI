@@ -59,8 +59,8 @@ var captureQuotaBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,contex
 // captureTitleBetas is from capture (haiku title gen, with structured-outputs + context-management).
 var captureTitleBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
 
-// captureBillingHeader is from system[0].
-const captureBillingHeader = "x-anthropic-billing-header: cc_version=2.1.84.c50; cc_entrypoint=cli; cch=00000;"
+// captureBillingHeader prefix; build hash is now dynamic per-request.
+const captureBillingHeaderPrefix = "x-anthropic-billing-header: cc_version=2.1.84."
 
 // captureAgentBlock is from capture #010 system[1].
 const captureAgentBlock = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -769,10 +769,10 @@ func TestCapture009_TitleGenHeaders(t *testing.T) {
 	if gjson.GetBytes(gotBody, "max_tokens").Int() != 32000 {
 		t.Errorf("title gen max_tokens = %d, want 32000", gjson.GetBytes(gotBody, "max_tokens").Int())
 	}
-	// system[0] billing header with .be2 build hash (capture #009)
+	// system[0] billing header with dynamic build hash (computed from "hello" user text)
 	sys0 := gjson.GetBytes(gotBody, "system.0.text").String()
-	if !strings.Contains(sys0, "cc_version=2.1.84.be2") {
-		t.Errorf("title gen billing header should use .be2 build hash: %s", sys0)
+	if !strings.Contains(sys0, "cc_version=2.1.84.736") {
+		t.Errorf("title gen billing header should use .736 build hash (from 'hello'): %s", sys0)
 	}
 	// output_config.format.type = json_schema
 	formatType := gjson.GetBytes(gotBody, "output_config.format.type").String()

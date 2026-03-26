@@ -2,6 +2,8 @@ package executor
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -291,7 +293,7 @@ func (si *SessionInitEmitter) fireTitleGeneration(client *http.Client, apiKey st
 		"messages":    []map[string]any{{"role": "user", "content": []map[string]string{{"type": "text", "text": "hello"}}}},
 		"metadata":    map[string]string{"user_id": userID},
 		"system": []map[string]string{
-			{"type": "text", "text": "x-anthropic-billing-header: cc_version=" + initCliVersion + ".be2; cc_entrypoint=cli; cch=00000;"},
+			{"type": "text", "text": "x-anthropic-billing-header: cc_version=" + initCliVersion + "." + initBuildHash("hello") + "; cc_entrypoint=cli; cch=00000;"},
 			{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
 			{"type": "text", "text": "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a list. Use sentence case: capitalize only the first word and proper nouns.\n\nReturn JSON with a single \"title\" field.\n\nGood examples:\n{\"title\": \"Fix login button on mobile\"}\n{\"title\": \"Add OAuth authentication\"}\n{\"title\": \"Debug failing CI tests\"}\n{\"title\": \"Refactor API client error handling\"}\n\nBad (too vague): {\"title\": \"Code changes\"}\nBad (too long): {\"title\": \"Investigate and fix the issue where the login button does not respond on mobile devices\"}\nBad (wrong case): {\"title\": \"Fix Login Button On Mobile\"}"},
 		},
@@ -357,6 +359,24 @@ func (si *SessionInitEmitter) doRequest(client *http.Client, req *http.Request, 
 	if resp.StatusCode >= 400 {
 		log.Debugf("[session-init] %s returned status %d", label, resp.StatusCode)
 	}
+}
+
+// initBuildHash computes the 3-char build hash for session init billing headers.
+// Uses the same algorithm as the main executor (cli.js _0T):
+// SHA256(salt + chars_at_4_7_20 + version).slice(0,3).
+func initBuildHash(userText string) string {
+	chars := make([]byte, 3)
+	indices := [3]int{4, 7, 20}
+	for i, idx := range indices {
+		if idx < len(userText) {
+			chars[i] = userText[idx]
+		} else {
+			chars[i] = '0'
+		}
+	}
+	input := billingBuildHashSalt + string(chars) + billingCLIVersion
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:])[:3]
 }
 
 // buildInitUserID builds the JSON user_id for init requests (quota check,

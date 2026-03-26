@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	log "github.com/sirupsen/logrus"
 )
@@ -37,7 +38,7 @@ type initSession struct {
 const (
 	initSessionBaseTTL = 1 * time.Hour
 	initSessionJitter  = 2 * time.Hour // total range: 1-3 hours
-	initCliVersion     = "2.1.83"
+	initCliVersion     = "2.1.84"
 )
 
 // NewSessionInitEmitter creates a new emitter using the Bun BoringSSL
@@ -113,10 +114,10 @@ func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey str
 	// Determine entrypoint style for User-Agent
 	entrypoint := "cli" // interactive mode
 
-	// Matches real CLI 2.1.83 startup requests (MITM capture 20260325_230810).
+	// Matches real CLI 2.1.84 startup requests (MITM capture 20260326_091714).
 	// Sequence: grove, account_settings, bootstrap, penguin_mode, mcp_servers,
-	// mcp_registry, quota_check all fire in parallel. Then after quota_check
-	// completes: mcp_servers (2nd), title_generation, plugin_version_check.
+	// mcp_registry, quota_check, cli_version_check all fire in parallel.
+	// Then after quota_check completes: mcp_servers (2nd), title_generation.
 	reqs := []func(){
 		func() { si.fireGrove(client, apiKey, isOAuth, entrypoint) },
 		func() { si.fireAccountSettings(client, apiKey, isOAuth) },
@@ -125,6 +126,7 @@ func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey str
 		func() { si.fireMCPServers(client, apiKey, isOAuth) },
 		func() { si.fireMCPRegistry(client) },
 		func() { si.fireQuotaCheck(client, apiKey, isOAuth, sessionID, deviceID, accountUUID) },
+		func() { si.fireCLIVersionCheck(client) },
 	}
 
 	for _, fn := range reqs {
@@ -143,7 +145,6 @@ func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey str
 	reqs2 := []func(){
 		func() { si.fireMCPServers(client, apiKey, isOAuth) },
 		func() { si.fireTitleGeneration(client, apiKey, isOAuth, sessionID, deviceID, accountUUID) },
-		func() { si.firePluginVersionCheck(client) },
 	}
 	for _, fn := range reqs2 {
 		wg2.Add(1)
@@ -159,7 +160,7 @@ func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey str
 // --- Individual request senders ---
 
 // All init requests use Connection: close and axios-style headers
-// matching real CLI 2.1.83 MITM capture (DISABLE_TELEMETRY=1).
+// matching real CLI 2.1.84 MITM capture (DISABLE_TELEMETRY=1).
 
 func (si *SessionInitEmitter) fireGrove(client *http.Client, apiKey string, isOAuth bool, entrypoint string) {
 	req, _ := http.NewRequest(http.MethodGet, si.upstream+"/api/claude_code_grove", nil)
@@ -228,16 +229,16 @@ func (si *SessionInitEmitter) fireMCPRegistry(client *http.Client) {
 	si.doRequest(client, req, "mcp_registry")
 }
 
-// firePluginVersionCheck matches MITM capture 20260325_230810 #011.
-// Real CLI checks plugin version from downloads.claude.ai (not GCS).
-func (si *SessionInitEmitter) firePluginVersionCheck(client *http.Client) {
+// fireCLIVersionCheck matches MITM capture 20260326_091714 #008.
+// Real CLI checks latest version from GCS bucket in first wave.
+func (si *SessionInitEmitter) fireCLIVersionCheck(client *http.Client) {
 	req, _ := http.NewRequest(http.MethodGet,
-		"https://downloads.claude.ai/claude-code-releases/plugins/claude-plugins-official/latest", nil)
+		"https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/latest", nil)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Encoding", "gzip, compress, deflate, br")
 	req.Header.Set("Connection", "close")
 	req.Header.Set("User-Agent", "axios/1.13.6")
-	si.doRequest(client, req, "plugin_version_check")
+	si.doRequest(client, req, "cli_version_check")
 }
 
 func (si *SessionInitEmitter) fireQuotaCheck(client *http.Client, apiKey string, isOAuth bool, sessionID, deviceID, accountUUID string) {
@@ -250,11 +251,11 @@ func (si *SessionInitEmitter) fireQuotaCheck(client *http.Client, apiKey string,
 	}
 	data, _ := json.Marshal(body)
 
-	// Headers match MITM capture 20260325_230810 #007 (Stainless SDK style).
+	// Headers match MITM capture 20260326_091714 #007 (Stainless SDK style).
 	req, _ := http.NewRequest(http.MethodPost, si.upstream+"/v1/messages?beta=true", bytes.NewReader(data))
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "br, gzip, deflate")
-	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05")
 	req.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
@@ -267,8 +268,9 @@ func (si *SessionInitEmitter) fireQuotaCheck(client *http.Client, apiKey string,
 	req.Header.Set("X-Stainless-Package-Version", "0.74.0")
 	req.Header.Set("X-Stainless-Retry-Count", "0")
 	req.Header.Set("X-Stainless-Runtime", "node")
-	req.Header.Set("X-Stainless-Runtime-Version", "v23.7.0")
+	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
 	req.Header.Set("X-Stainless-Timeout", "600")
+	req.Header["x-client-request-id"] = []string{uuid.New().String()}
 	si.setAuth(req, apiKey, isOAuth)
 	si.doRequest(client, req, "quota_check")
 }
@@ -305,11 +307,11 @@ func (si *SessionInitEmitter) fireTitleGeneration(client *http.Client, apiKey st
 	}
 	data, _ := json.Marshal(body)
 
-	// Headers match MITM capture 20260325_230810 #009 (Stainless SDK style).
+	// Headers match MITM capture 20260326_091714 (Stainless SDK style).
 	req, _ := http.NewRequest(http.MethodPost, si.upstream+"/v1/messages?beta=true", bytes.NewReader(data))
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "br, gzip, deflate")
-	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15")
 	req.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
@@ -322,8 +324,9 @@ func (si *SessionInitEmitter) fireTitleGeneration(client *http.Client, apiKey st
 	req.Header.Set("X-Stainless-Package-Version", "0.74.0")
 	req.Header.Set("X-Stainless-Retry-Count", "0")
 	req.Header.Set("X-Stainless-Runtime", "node")
-	req.Header.Set("X-Stainless-Runtime-Version", "v23.7.0")
+	req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
 	req.Header.Set("X-Stainless-Timeout", "600")
+	req.Header["x-client-request-id"] = []string{uuid.New().String()}
 	si.setAuth(req, apiKey, isOAuth)
 	si.doRequest(client, req, "title_generation")
 }

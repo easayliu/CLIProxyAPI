@@ -17,7 +17,7 @@ import (
 
 // TelemetryEmitter generates and sends CLI telemetry events to Anthropic
 // alongside v1/messages requests, using the same upstream auth identity.
-// Event structure and timing are derived from real Claude Code CLI 2.1.83
+// Event structure and timing are derived from real Claude Code CLI 2.1.84
 // MITM captures (see /tmp/proxy_captures/).
 type TelemetryEmitter struct {
 	client   *http.Client
@@ -51,10 +51,10 @@ const (
 	telemetrySessionBaseTTL = 1 * time.Hour
 	telemetrySessionJitter  = 2 * time.Hour // total range: 1-3 hours
 
-	// Header constants from real CLI 2.1.83 MITM capture.
+	// Header constants from real CLI 2.1.84 MITM capture.
 	telemetryServiceName = "claude-code"
 	telemetryBetaHeader  = "oauth-2025-04-20"
-	telemetryCliVersion  = "2.1.83"
+	telemetryCliVersion  = "2.1.84"
 
 	// Event body betas from real CLI capture — includes redact-thinking.
 	telemetryEventBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
@@ -166,7 +166,7 @@ func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string, iden
 }
 
 // --- Session Init Batch ---
-// Matches real CLI 2.1.83 first telemetry batch pattern.
+// Matches real CLI 2.1.84 first telemetry batch pattern.
 
 func (s *telemetrySession) emitSessionInit() []map[string]any {
 	events := make([]map[string]any, 0, 24)
@@ -315,7 +315,7 @@ func (s *telemetrySession) emitSessionInit() []map[string]any {
 }
 
 // --- Per-Message Batch ---
-// Matches real CLI 2.1.83 second telemetry batch pattern.
+// Matches real CLI 2.1.84 second telemetry batch pattern.
 
 func (s *telemetrySession) emitMessageEvents() []map[string]any {
 	events := make([]map[string]any, 0, 10)
@@ -406,7 +406,7 @@ func (s *telemetrySession) emitMessageEvents() []map[string]any {
 
 // --- Event Builders ---
 
-// buildEvent constructs a ClaudeCodeInternalEvent matching real CLI 2.1.83 format.
+// buildEvent constructs a ClaudeCodeInternalEvent matching real CLI 2.1.84 format.
 func (s *telemetrySession) buildEvent(eventName, timestamp string, extraMetadata map[string]any) map[string]any {
 	metaMap := make(map[string]any)
 	for k, v := range extraMetadata {
@@ -577,7 +577,7 @@ func (s *telemetrySession) fakeExitMetadata() map[string]any {
 // --- HTTP Sender ---
 
 // sendEventBatch sends a batch of telemetry events to the Anthropic event logging endpoint.
-// Headers match real CLI 2.1.83 MITM capture exactly.
+// Headers match real CLI 2.1.84 MITM capture exactly.
 func (te *TelemetryEmitter) sendEventBatch(authToken string, isOAuth bool, events []map[string]any) {
 	if len(events) == 0 {
 		return
@@ -600,11 +600,11 @@ func (te *TelemetryEmitter) sendEventBatch(authToken string, isOAuth bool, event
 		return
 	}
 
-	// Headers match real CLI 2.1.83 capture exactly:
+	// Headers match real CLI 2.1.84 capture exactly:
 	//   Accept: application/json, text/plain, */*
 	//   Accept-Encoding: gzip, compress, deflate, br
 	//   Content-Type: application/json
-	//   User-Agent: claude-code/2.1.83
+	//   User-Agent: claude-code/2.1.84
 	//   anthropic-beta: oauth-2025-04-20
 	//   x-service-name: claude-code
 	req.Header.Set("Accept", "application/json, text/plain, */*")

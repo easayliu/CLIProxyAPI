@@ -20,7 +20,7 @@ import (
 // claudeHeaderOrder defines the canonical header order matching the real
 // Bun + @anthropic-ai/sdk (Stainless) wire format. Headers not in this
 // list are appended at the end in their original order.
-// claudeHeaderOrder matches the real Claude Code CLI 2.1.83 wire order
+// claudeHeaderOrder matches the real Claude Code CLI 2.1.84 wire order
 // captured via MITM httpproxy (Bun + @anthropic-ai/sdk).
 var claudeHeaderOrder = []string{
 	"accept",
@@ -46,6 +46,7 @@ var claudeHeaderOrder = []string{
 	"host",
 	"sec-fetch-mode",
 	"x-app",
+	"x-client-request-id",
 }
 
 // claudeHeaderRank maps lowercase header name to its position in claudeHeaderOrder.

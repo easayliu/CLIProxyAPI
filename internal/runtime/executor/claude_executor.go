@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -932,7 +933,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	// Build Anthropic-Beta dynamically based on request body content,
-	// matching real Claude CLI 2.1.83 behavior observed via MITM capture.
+	// matching real Claude CLI 2.1.84 behavior observed via MITM capture.
 	betaSet := make(map[string]bool)
 	addBeta := func(b string) { betaSet[b] = true }
 
@@ -956,7 +957,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if gjson.GetBytes(body, "context_management").Exists() {
 		addBeta("context-management-2025-06-27")
 	}
-	// Real CLI 2.1.83 always includes context-1m beta for Opus 4.6 (MITM capture confirmed).
+	// Real CLI 2.1.84 always includes context-1m beta for Opus 4.6 (MITM capture confirmed).
 	// Also add it when model explicitly requests 1M via [1m] suffix or X-CPA-CLAUDE-1M header.
 	if modelSupports1MContext(model) || strings.Contains(model, "opus-4-6") {
 		addBeta("context-1m-2025-08-07")
@@ -1003,7 +1004,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	for b := range betaSet {
 		betas = append(betas, b)
 	}
-	// Use exact header casing from real CLI MITM capture (2.1.83).
+	// Use exact header casing from real CLI MITM capture (2.1.84).
 	// Go's r.Header.Set() canonicalizes keys (e.g. "anthropic-beta" → "Anthropic-Beta"),
 	// so we bypass it with direct map assignment r.Header["key"] = []string{val}.
 	// For HTTP/2 this doesn't matter (all keys lowercased on wire), but for HTTP/1.1
@@ -1020,7 +1021,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Stainless SDK headers: Title-Case, except OS which is all-caps
 	setRaw("X-Stainless-Retry-Count", "0")
-	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v23.7.0"))
+	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	setRaw("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
 	setRaw("X-Stainless-Runtime", "node")
 	setRaw("X-Stainless-Lang", "js")
@@ -1028,14 +1029,16 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	setRaw("X-Stainless-OS", hdrDefault(hd.Os, mapStainlessOS()))
 	setRaw("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 
-	// Standard HTTP headers matching real CLI 2.1.83 MITM capture.
+	// Standard HTTP headers matching real CLI 2.1.84 MITM capture.
 	// Accept is Title-Case; the rest are lowercase in real Bun wire format.
-	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.83 (external, cli)"))
+	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.84 (external, cli)"))
 	r.Header.Set("Accept", "application/json")
-	setRaw("accept-encoding", "br, gzip, deflate")
+	setRaw("accept-encoding", "gzip, deflate, br, zstd")
 	setRaw("accept-language", "*")
 	setRaw("sec-fetch-mode", "cors")
 	setRaw("connection", "keep-alive")
+	// Real CLI 2.1.84 sends x-client-request-id (UUID v4) with every /v1/messages request.
+	setRaw("x-client-request-id", uuid.New().String())
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -1387,13 +1390,13 @@ func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceI
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
 //
-// The build hash is a fixed value per CLI version (c50 for 2.1.83).
+// The build hash is a fixed value per CLI version (c50 for 2.1.84).
 // cch is a 5-char hex hash derived from session-specific data.
 func generateBillingHeader(poolKey string) string {
-	const version = "2.1.83"
+	const version = "2.1.84"
 	const buildHash = "c50"
 
-	// Real Claude Code CLI hardcodes cch=00000 (confirmed in cli.js 2.1.83).
+	// Real Claude Code CLI hardcodes cch=00000 (confirmed in cli.js 2.1.84).
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", version, buildHash)
 }
 
@@ -1403,7 +1406,7 @@ func generateBillingHeader(poolKey string) string {
 //	system[1]: agent identifier (cache_control: ephemeral)
 //	system[2..]: user system messages (cache_control added when missing)
 //
-// MITM capture (2.1.83) shows cache_control is {"type":"ephemeral"} without
+// MITM capture (2.1.84) shows cache_control is {"type":"ephemeral"} without
 // ttl for main conversation. The oauthMode param is kept for future use.
 func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, poolKey string) []byte {
 	system := gjson.GetBytes(payload, "system")
@@ -1420,7 +1423,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 	}
 
 	// Non-strict mode: billing header + agent block + user system messages.
-	// Always regenerate billing + agent to ensure version consistency (2.1.83).
+	// Always regenerate billing + agent to ensure version consistency (2.1.84).
 	// Matches MITM capture 20260325_230810 #010 structure:
 	//   system[0]: billing header (no cache_control)
 	//   system[1]: agent identifier (cache_control: ephemeral)
@@ -1573,7 +1576,7 @@ var cloakingContextManagementNoThinking = []byte(`{"edits":[]}`)
 // The clear_thinking edit is only included when the request has thinking enabled,
 // as Anthropic rejects it otherwise with "clear_thinking_20251015 strategy requires
 // thinking to be enabled or adaptive".
-// Real CLI 2.1.83 does NOT send context_management in early/short conversations;
+// Real CLI 2.1.84 does NOT send context_management in early/short conversations;
 // injecting it unconditionally would be a fingerprint difference.
 func replaceContextManagementForCloaking(payload []byte) []byte {
 	if !gjson.GetBytes(payload, "context_management").Exists() {

@@ -1253,8 +1253,8 @@ func TestClaudeExecutor_ExecuteStream_MatchesRealCLIHeaders(t *testing.T) {
 		}
 	}
 
-	if gotEncoding != "br, gzip, deflate" {
-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "br, gzip, deflate")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
 	}
 	if gotAccept != "application/json" {
 		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
@@ -1291,8 +1291,8 @@ func TestClaudeExecutor_Execute_SetsCompressedAcceptEncoding(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if gotEncoding != "br, gzip, deflate" {
-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "br, gzip, deflate")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
 	}
 	if gotAccept != "application/json" {
 		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
@@ -1480,8 +1480,8 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingMatchesRealCLI(t *testing.T)
 		}
 	}
 
-	if gotEncoding != "br, gzip, deflate" {
-		t.Errorf("Accept-Encoding = %q, want %q (matching real Claude Code CLI)", gotEncoding, "br, gzip, deflate")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q (matching real Claude Code CLI)", gotEncoding, "gzip, deflate, br, zstd")
 	}
 }
 
@@ -1736,7 +1736,7 @@ func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
 
 func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 	// Simulate a payload with billing + agent blocks already injected
-	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.83.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.84.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true)
 

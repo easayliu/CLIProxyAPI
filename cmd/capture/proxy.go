@@ -24,8 +24,7 @@ import (
 )
 
 const (
-	proxyAddr     = "127.0.0.1:19877"
-	upstreamProxy = "http://127.0.0.1:6152"
+	proxyAddr = "127.0.0.1:19877"
 )
 
 var proxyDumpDir string
@@ -53,11 +52,18 @@ func runHTTPProxy() {
 	var counter atomic.Int64
 	var mu sync.Mutex
 
-	// Build HTTP client with upstream proxy
-	proxyURL, _ := url.Parse(upstreamProxy)
+	// Build HTTP client, optionally with upstream proxy
 	upstreamTransport := &http.Transport{
-		Proxy:           http.ProxyURL(proxyURL),
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	if envProxy := os.Getenv("CAPTURE_UPSTREAM_PROXY"); envProxy != "" {
+		proxyURL, err := url.Parse(envProxy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid CAPTURE_UPSTREAM_PROXY %q: %v\n", envProxy, err)
+			os.Exit(1)
+		}
+		upstreamTransport.Proxy = http.ProxyURL(proxyURL)
+		fmt.Printf("Upstream proxy: %s\n", envProxy)
 	}
 	upstreamClient := &http.Client{Transport: upstreamTransport}
 
@@ -75,6 +81,9 @@ func runHTTPProxy() {
 	fmt.Printf("  HTTP_PROXY=http://%s HTTPS_PROXY=http://%s \\\n", proxyAddr, proxyAddr)
 	fmt.Println("  NODE_TLS_REJECT_UNAUTHORIZED=0 \\")
 	fmt.Println("  claude -p \"say hi\"")
+	fmt.Println()
+	fmt.Println("Optional: set CAPTURE_UPSTREAM_PROXY to chain through another proxy, e.g.:")
+	fmt.Println("  CAPTURE_UPSTREAM_PROXY=http://127.0.0.1:6152 go run ./cmd/capture httpproxy")
 	fmt.Println()
 	fmt.Printf("Dumps: %s/\n", proxyDumpDir)
 	fmt.Println("Press Ctrl+C to stop")

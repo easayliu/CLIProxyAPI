@@ -1,7 +1,7 @@
 package executor
 
-// Tests in this file are derived from real MITM captures of Claude Code CLI v2.1.83.
-// Capture: /private/tmp/proxy_captures/20260325_230810
+// Tests in this file are derived from real MITM captures of Claude Code CLI v2.1.84.
+// Capture: /private/tmp/proxy_captures/20260326_091714
 // Each test references the specific capture sequence number it validates against.
 
 import (
@@ -23,23 +23,23 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Reference data: exact values from MITM capture 20260325_230810
+// Reference data: exact values from MITM capture 20260326_091714
 // ---------------------------------------------------------------------------
 
-// captureMainHeaders are the exact headers from capture #010 (opus-4-6 main
+// captureMainHeaders are the exact headers from capture #007 (v1/messages main
 // conversation, streaming, with tools + effort).
 var captureMainHeaders = map[string]string{
 	"Accept":                                   "application/json",
-	"User-Agent":                               "claude-cli/2.1.83 (external, cli)",
+	"User-Agent":                               "claude-cli/2.1.84 (external, cli)",
 	"X-Stainless-Arch":                         "arm64",
 	"X-Stainless-Lang":                         "js",
 	"X-Stainless-OS":                           "MacOS",
 	"X-Stainless-Package-Version":              "0.74.0",
 	"X-Stainless-Retry-Count":                  "0",
 	"X-Stainless-Runtime":                      "node",
-	"X-Stainless-Runtime-Version":              "v23.7.0",
+	"X-Stainless-Runtime-Version":              "v24.3.0",
 	"X-Stainless-Timeout":                      "600",
-	"accept-encoding":                          "br, gzip, deflate",
+	"accept-encoding":                          "gzip, deflate, br, zstd",
 	"accept-language":                           "*",
 	"anthropic-dangerous-direct-browser-access": "true",
 	"anthropic-version":                         "2023-06-01",
@@ -49,18 +49,18 @@ var captureMainHeaders = map[string]string{
 	"x-app":                                     "cli",
 }
 
-// captureMainBetas is the exact anthropic-beta value from capture #010.
+// captureMainBetas is the exact anthropic-beta value from capture #007.
 // opus-4-6 main conversation with tools + effort (no structured-outputs, no context-management).
 var captureMainBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
 
-// captureQuotaBetas is from capture #007 (haiku quota check, no tools).
-var captureQuotaBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
+// captureQuotaBetas is from capture #007 (haiku quota check, with context-management).
+var captureQuotaBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
 
-// captureTitleBetas is from capture #009 (haiku title gen, with structured-outputs).
-var captureTitleBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
+// captureTitleBetas is from capture (haiku title gen, with structured-outputs + context-management).
+var captureTitleBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
 
-// captureBillingHeader is from capture #010 system[0].
-const captureBillingHeader = "x-anthropic-billing-header: cc_version=2.1.83.c50; cc_entrypoint=cli; cch=00000;"
+// captureBillingHeader is from system[0].
+const captureBillingHeader = "x-anthropic-billing-header: cc_version=2.1.84.c50; cc_entrypoint=cli; cch=00000;"
 
 // captureAgentBlock is from capture #010 system[1].
 const captureAgentBlock = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -225,7 +225,7 @@ func TestCapture010_NonStreamingHeaders(t *testing.T) {
 			enc = vals[0]
 		}
 	}
-	assertHeader(t, "accept-encoding", enc, "br, gzip, deflate")
+	assertHeader(t, "accept-encoding", enc, "gzip, deflate, br, zstd")
 }
 
 // TestCapture010_StreamNonStreamIdentical verifies stream and non-stream
@@ -312,8 +312,8 @@ func TestCapture010_SystemArray(t *testing.T) {
 	if !strings.HasPrefix(sys0, "x-anthropic-billing-header:") {
 		t.Fatalf("system[0] not billing header: %s", sys0)
 	}
-	if !strings.Contains(sys0, "cc_version=2.1.83.") {
-		t.Errorf("billing header missing cc_version=2.1.83: %s", sys0)
+	if !strings.Contains(sys0, "cc_version=2.1.84.") {
+		t.Errorf("billing header missing cc_version=2.1.84: %s", sys0)
 	}
 	if !strings.Contains(sys0, "cc_entrypoint=cli") {
 		t.Errorf("billing header missing cc_entrypoint=cli: %s", sys0)
@@ -553,7 +553,7 @@ func TestCapture001_AccountSettings(t *testing.T) {
 	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json, text/plain, */*")
 	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, compress, deflate, br")
 	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
-	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-code/2.1.83")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-code/2.1.84")
 	// anthropic-beta set via raw header (lowercase key in Go map)
 	beta := gotHeaders.Get("Anthropic-Beta")
 	if beta == "" {
@@ -579,7 +579,7 @@ func TestCapture002_Grove(t *testing.T) {
 	client := &http.Client{}
 	si.fireGrove(client, "sk-ant-oat01-test", true, "cli")
 
-	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.83 (external, cli)")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.84 (external, cli)")
 	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json, text/plain, */*")
 	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, compress, deflate, br")
 	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
@@ -599,7 +599,7 @@ func TestCapture003_Bootstrap(t *testing.T) {
 	client := &http.Client{}
 	si.fireBootstrap(client, "sk-ant-oat01-test", true)
 
-	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-code/2.1.83")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-code/2.1.84")
 	assertHeader(t, "Content-Type", gotHeaders.Get("Content-Type"), "application/json")
 	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "close")
 }
@@ -703,13 +703,23 @@ func TestCapture007_QuotaCheckHeaders(t *testing.T) {
 
 	// Stainless SDK style headers (capture #007)
 	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json")
-	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "br, gzip, deflate")
-	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.83 (external, cli)")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, deflate, br, zstd")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.84 (external, cli)")
 	assertHeader(t, "X-Stainless-Lang", gotHeaders.Get("X-Stainless-Lang"), "js")
 	assertHeader(t, "X-Stainless-Runtime", gotHeaders.Get("X-Stainless-Runtime"), "node")
-	assertHeader(t, "X-Stainless-Runtime-Version", gotHeaders.Get("X-Stainless-Runtime-Version"), "v23.7.0")
+	assertHeader(t, "X-Stainless-Runtime-Version", gotHeaders.Get("X-Stainless-Runtime-Version"), "v24.3.0")
 	assertHeader(t, "X-App", gotHeaders.Get("X-App"), "cli")
 	assertHeader(t, "Connection", gotHeaders.Get("Connection"), "keep-alive")
+	// x-client-request-id must be present (UUID v4 format)
+	clientReqID := gotHeaders.Get("X-Client-Request-Id")
+	if clientReqID == "" {
+		if vals, ok := gotHeaders["x-client-request-id"]; ok && len(vals) > 0 {
+			clientReqID = vals[0]
+		}
+	}
+	if clientReqID == "" {
+		t.Error("missing x-client-request-id header")
+	}
 
 	// Body: model=haiku, max_tokens=1
 	model := gjson.GetBytes(gotBody, "model").String()
@@ -738,11 +748,11 @@ func TestCapture009_TitleGenHeaders(t *testing.T) {
 	client := &http.Client{}
 	si.fireTitleGeneration(client, "sk-ant-oat01-test", true, "session-123", "device-abc", "account-xyz")
 
-	// Stainless SDK style headers (capture #009)
+	// Stainless SDK style headers
 	assertHeader(t, "Accept", gotHeaders.Get("Accept"), "application/json")
-	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "br, gzip, deflate")
-	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.83 (external, cli)")
-	assertHeader(t, "X-Stainless-Runtime-Version", gotHeaders.Get("X-Stainless-Runtime-Version"), "v23.7.0")
+	assertHeader(t, "Accept-Encoding", gotHeaders.Get("Accept-Encoding"), "gzip, deflate, br, zstd")
+	assertHeader(t, "User-Agent", gotHeaders.Get("User-Agent"), "claude-cli/2.1.84 (external, cli)")
+	assertHeader(t, "X-Stainless-Runtime-Version", gotHeaders.Get("X-Stainless-Runtime-Version"), "v24.3.0")
 
 	// Beta must include structured-outputs (capture #009)
 	beta := gotHeaders.Get("Anthropic-Beta")
@@ -761,7 +771,7 @@ func TestCapture009_TitleGenHeaders(t *testing.T) {
 	}
 	// system[0] billing header with .be2 build hash (capture #009)
 	sys0 := gjson.GetBytes(gotBody, "system.0.text").String()
-	if !strings.Contains(sys0, "cc_version=2.1.83.be2") {
+	if !strings.Contains(sys0, "cc_version=2.1.84.be2") {
 		t.Errorf("title gen billing header should use .be2 build hash: %s", sys0)
 	}
 	// output_config.format.type = json_schema

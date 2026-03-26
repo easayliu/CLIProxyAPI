@@ -83,8 +83,12 @@ func (si *SessionInitEmitter) EmitSessionInit(sessionID, apiKey string, isOAuth 
 	}
 	// Create a per-account HTTP client so session init requests use the same
 	// outbound proxy (and therefore the same exit IP) as the main API requests.
-	client := claudeauth.NewAnthropicHttpClient(proxyURL)
-	client.Timeout = 10 * time.Second
+	// Use a separate client to avoid mutating the cached shared client's Timeout.
+	shared := claudeauth.NewAnthropicHttpClient(proxyURL)
+	client := &http.Client{
+		Transport: shared.Transport,
+		Timeout:   10 * time.Second,
+	}
 	si.fireAll(client, sessionID, apiKey, isOAuth, deviceID, accountUUID)
 }
 

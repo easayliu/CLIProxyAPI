@@ -87,13 +87,13 @@ func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte 
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 
 	// Migrate extra system messages into the first user message content.
-	// If no extra system blocks exist (simple API client), inject default
-	// system-reminder blocks to match real CLI behavior. The real CLI always
-	// has skills and date context reminders prepended to the first user message.
-	if len(extraTexts) == 0 {
-		extraTexts = defaultSystemReminders()
-	}
-	payload = migrateSystemToUserMessage(payload, extraTexts)
+	// Always prepend default system-reminder blocks first, then append any
+	// client extra system blocks. This ensures the first text block is always
+	// the fixed defaultSkillsReminder, producing a consistent billing header
+	// build hash (c8e) regardless of what the client sends.
+	defaults := defaultSystemReminders()
+	allTexts := append(defaults, extraTexts...)
+	payload = migrateSystemToUserMessage(payload, allTexts)
 
 	return payload
 }

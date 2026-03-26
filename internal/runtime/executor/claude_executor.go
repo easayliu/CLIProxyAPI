@@ -1467,7 +1467,10 @@ func computeBuildHash(payload []byte) string {
 	}
 	input := billingBuildHashSalt + string(chars) + billingCLIVersion
 	h := sha256.Sum256([]byte(input))
-	return hex.EncodeToString(h[:])[:3]
+	hash := hex.EncodeToString(h[:])[:3]
+	log.Infof("[billing-debug] firstUserText(len=%d): %.80s", len(text), text)
+	log.Infof("[billing-debug] chars=[%c,%c,%c] hash=%s", chars[0], chars[1], chars[2], hash)
+	return hash
 }
 
 // firstUserMessageText extracts the text content of the first non-deferred-tools

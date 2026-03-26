@@ -1485,18 +1485,33 @@ func generateCCH(payload []byte) string {
 	return hex.EncodeToString(h[:])[:5]
 }
 
-// generateBillingHeader creates the x-anthropic-billing-header text block that
-// real Claude Code prepends to every system prompt array.
-// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
-//
-// The build hash is dynamically computed per-request from the first user message
-// content using SHA-256, matching real CLI 2.1.84 behavior (cli.js _0T/qmq).
-// cch is a 5-char hex hash derived from the request payload; the JS source shows
-// cch=00000 but Bun's native layer replaces it on the wire (verified via fake server).
-func generateBillingHeader(payload []byte) string {
+// Billing header placeholder tokens, replaced by finalizeBillingHeader after
+// all message injections (system-reminder, deferred-tools) are complete.
+const (
+	billingBuildHashPlaceholder = "__BH__"
+	billingCCHPlaceholder      = "__CCH__"
+)
+
+// generateBillingHeader creates an x-anthropic-billing-header with placeholder
+// tokens for the build hash and cch. These placeholders are replaced by
+// finalizeBillingHeader once the full payload (including injected system-reminder
+// and deferred-tools) is available.
+func generateBillingHeader() string {
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;",
+		billingCLIVersion, billingBuildHashPlaceholder, billingCCHPlaceholder)
+}
+
+// finalizeBillingHeader replaces the placeholder tokens in system[0] with the
+// real build hash and cch computed from the final payload. Must be called AFTER
+// all message injections (injectCLISystemPrompt, injectCLIDeferredTools, etc.)
+// so that the first user message text matches what the real CLI computes from.
+func finalizeBillingHeader(payload []byte) []byte {
 	buildHash := computeBuildHash(payload)
 	cch := generateCCH(payload)
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", billingCLIVersion, buildHash, cch)
+	// Replace placeholders in the raw JSON bytes.
+	result := bytes.ReplaceAll(payload, []byte(billingBuildHashPlaceholder), []byte(buildHash))
+	result = bytes.ReplaceAll(result, []byte(billingCCHPlaceholder), []byte(cch))
+	return result
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:

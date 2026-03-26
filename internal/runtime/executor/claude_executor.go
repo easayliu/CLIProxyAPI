@@ -161,14 +161,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// 	return resp, err
 	// }
 
-	// Always regenerate system[0] (billing header)
+	// Always regenerate system[0] (billing header) and system[1] (agent block)
 	// to ensure version consistency with our template, regardless of cloaking.
 	// This prevents version mismatch when a real Claude Code CLI with a different
 	// version connects through an upstream proxy like NewAPI.
-	if !isHaikuModel(baseModel) {
-		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
-	}
+	// MITM captures confirm real CLI sends full system blocks for all models including Haiku.
+	oauthMode := isClaudeOAuthToken(apiKey)
+	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
@@ -394,11 +393,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// 	return nil, err
 	// }
 
-	// Always regenerate system[0] (billing header)
-	if !isHaikuModel(baseModel) {
-		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
-	}
+	// Always regenerate system[0]/[1] for all models including Haiku.
+	oauthMode := isClaudeOAuthToken(apiKey)
+	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
@@ -611,10 +608,8 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	if !isHaikuModel(baseModel) {
-		body = checkSystemInstructions(body)
-		body = finalizeBillingHeader(body)
-	}
+	body = checkSystemInstructions(body)
+	body = finalizeBillingHeader(body)
 
 	// // Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	// body = enforceCacheControlLimit(body, 4)
@@ -921,7 +916,8 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 }
 
 // isHaikuModel returns true for all Haiku model variants (3.5 and 4.5).
-// Real CLI skips system prompt injection and adaptive thinking for Haiku.
+// Real CLI sends full system prompt for Haiku but skips deferred-tools,
+// adaptive thinking, and effort injection.
 func isHaikuModel(model string) bool {
 	return strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-haiku-4-5")
 }
@@ -2046,22 +2042,24 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Note: system[0]/[1] injection is now handled in Execute/ExecuteStream
 	// before applyCloaking, so it applies to all requests regardless of cloaking.
 	// In strict mode, strip user system messages and keep only billing + agent blocks.
-	if strictMode && !isHaikuModel(model) {
+	if strictMode {
 		payload = checkSystemInstructionsWithMode(payload, true, true, stablePoolKey(auth, apiKey))
 	}
 
 	// Inject the full Claude Code CLI system prompt as system[2] and migrate
 	// any extra system messages into the first user message as <system-reminder>.
-	// Real CLI always sends exactly 3 system blocks; extra blocks are a fingerprint.
+	// Real CLI always sends exactly 3 system blocks for all models including Haiku.
 	oauthMode := isClaudeOAuthToken(apiKey)
+	payload = injectCLISystemPrompt(payload, model, oauthMode)
+
+	// Inject deferred-tools user message and ToolSearch tool to match real CLI.
+	// MITM captures confirm Haiku requests do NOT have deferred-tools message,
+	// while opus/sonnet requests always start with <available-deferred-tools>.
 	if !isHaikuModel(model) {
-		payload = injectCLISystemPrompt(payload, model, oauthMode)
-		// Inject deferred-tools user message and ToolSearch tool to match real
-		// CLI behavior. Every request from Claude Code CLI starts with a
-		// <available-deferred-tools> user message and includes ToolSearch.
 		payload = injectCLIDeferredTools(payload)
-		log.Infof("[cloaking] injected: system-prompt=%t deferred-tools=%t system-reminders=%t", true, true, true)
 	}
+	log.Infof("[cloaking] injected: system-prompt=%t deferred-tools=%t system-reminders=%t model=%s",
+		true, !isHaikuModel(model), true, model)
 
 	// Match real CLI 2.1.84 behavior: only output_config.effort, no thinking field.
 	// MITM captures confirm real CLI never sends thinking for opus-4-6 or sonnet-4-6.

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
 )
 
 // userIDPayload is the JSON structure for Claude Code 2.1.79+ metadata.user_id.
@@ -69,6 +70,42 @@ func isClaudeCodeClient(userAgent string) bool {
 // Older models like sonnet-4, claude-3-5-sonnet, haiku etc. do not.
 func supportsAdaptiveThinking(model string) bool {
 	return strings.Contains(model, "opus-4-6") || strings.Contains(model, "sonnet-4-6")
+}
+
+// thinkingToEffort converts a client's thinking configuration to the equivalent
+// output_config.effort level. Real CLI 2.1.84 never sends thinking; it only uses
+// effort. This mapping preserves the client's intent when cloaking removes thinking.
+//
+// Mapping:
+//
+//	thinking.type = "disabled"  → "low"   (minimal thinking)
+//	thinking.type = "adaptive"  → "medium" (default CLI behavior)
+//	thinking.type = "enabled" with budget_tokens:
+//	  budget <= 4096   → "low"
+//	  budget <= 16384  → "medium"
+//	  budget <= 32768  → "high"
+//	  budget > 32768   → "high"
+//	no thinking / unknown → "medium" (default)
+func thinkingToEffort(payload []byte) string {
+	t := gjson.GetBytes(payload, "thinking.type").String()
+	switch t {
+	case "disabled":
+		return "low"
+	case "adaptive":
+		return "medium"
+	case "enabled":
+		budget := gjson.GetBytes(payload, "thinking.budget_tokens").Int()
+		switch {
+		case budget <= 4096:
+			return "low"
+		case budget <= 16384:
+			return "medium"
+		default:
+			return "high"
+		}
+	default:
+		return "medium"
+	}
 }
 
 // extractFieldFromUserID extracts a named field from a JSON-format user_id string.

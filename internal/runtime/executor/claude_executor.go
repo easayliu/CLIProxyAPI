@@ -984,7 +984,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if gjson.GetBytes(body, "output_config.format.type").String() == "json_schema" {
 		addBeta("structured-outputs-2025-12-15")
 	}
-	if gjson.GetBytes(body, "context_management").Exists() {
+	// Real CLI 2.1.84 always includes context-management beta for non-haiku models,
+	// even when the body has no context_management field (MITM capture confirmed).
+	if gjson.GetBytes(body, "context_management").Exists() || !isHaikuModel(model) {
 		addBeta("context-management-2025-06-27")
 	}
 	// Real CLI 2.1.84 always includes context-1m beta for Opus 4.6 (MITM capture confirmed).
@@ -1061,19 +1063,26 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Standard HTTP headers matching real CLI 2.1.84 MITM capture.
 	// Accept is Title-Case; the rest are lowercase in real Bun wire format.
-	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.84 (external, cli)"))
+	userAgent := hdrDefault(hd.UserAgent, "claude-cli/2.1.84 (external, cli)")
+	clientReqID := uuid.New().String()
+	r.Header.Set("User-Agent", userAgent)
 	r.Header.Set("Accept", "application/json")
 	setRaw("accept-encoding", "gzip, deflate, br, zstd")
 	setRaw("accept-language", "*")
 	setRaw("sec-fetch-mode", "cors")
 	setRaw("connection", "keep-alive")
 	// Real CLI 2.1.84 sends x-client-request-id (UUID v4) with every /v1/messages request.
-	setRaw("x-client-request-id", uuid.New().String())
+	setRaw("x-client-request-id", clientReqID)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+
+	log.Infof("[cloaking] headers: User-Agent=%s anthropic-beta=%s x-client-request-id=%s X-Stainless-Package-Version=%s X-Stainless-Runtime-Version=%s X-Stainless-OS=%s X-Stainless-Arch=%s",
+		userAgent, strings.Join(betas, ","), clientReqID,
+		r.Header["X-Stainless-Package-Version"], r.Header["X-Stainless-Runtime-Version"],
+		r.Header["X-Stainless-OS"], r.Header["X-Stainless-Arch"])
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1929,21 +1938,35 @@ func repairToolUsePairing(payload []byte) []byte {
 	return result
 }
 
-// normalizeMaxTokensForCloaking ensures max_tokens matches the model's default value
-// when cloaking is active. Real Claude Code CLI always sends model-appropriate max_tokens
-// (e.g. 128000 for Opus 4.6, 64000 for Sonnet 4.6). A fixed value like 8192 across all
-// models is a detectable fingerprint. This function replaces missing or non-matching
-// max_tokens with the model's max_completion_tokens from the registry.
+// cliMaxTokens maps model IDs to the max_tokens values that real Claude Code CLI
+// sends. These are hardcoded to match observed MITM captures and must be updated
+// when real CLI behavior changes. Using the registry is unreliable because models
+// may have multiple entries with different providers/values.
+var cliMaxTokens = map[string]int{
+	"claude-opus-4-6":           64000,
+	"claude-sonnet-4-6":         32000,
+	"claude-sonnet-4-20250514":  16000,
+	"claude-haiku-4-5-20251001": 32000,
+}
+
+// normalizeMaxTokensForCloaking ensures max_tokens matches the value that real
+// Claude Code CLI sends for each model. A mismatched value (e.g. 8192 for all
+// models) is a detectable fingerprint.
 func normalizeMaxTokensForCloaking(payload []byte, model string) []byte {
-	modelInfo := registry.LookupModelInfo(model, "claude")
-	if modelInfo == nil || modelInfo.MaxCompletionTokens <= 0 {
-		return payload
+	expected, ok := cliMaxTokens[model]
+	if !ok {
+		// Unknown model: fall back to registry
+		modelInfo := registry.LookupModelInfo(model, "claude")
+		if modelInfo == nil || modelInfo.MaxCompletionTokens <= 0 {
+			return payload
+		}
+		expected = modelInfo.MaxCompletionTokens
 	}
-	expected := modelInfo.MaxCompletionTokens
 	current := gjson.GetBytes(payload, "max_tokens")
 	if current.Exists() && int(current.Int()) == expected {
 		return payload
 	}
+	log.Infof("[cloaking] max_tokens: %v -> %d", current.Value(), expected)
 	result, err := sjson.SetBytes(payload, "max_tokens", expected)
 	if err != nil {
 		return payload
@@ -2034,20 +2057,30 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		// CLI behavior. Every request from Claude Code CLI starts with a
 		// <available-deferred-tools> user message and includes ToolSearch.
 		payload = injectCLIDeferredTools(payload)
+		log.Infof("[cloaking] injected: system-prompt=%t deferred-tools=%t system-reminders=%t", true, true, true)
 	}
 
-	// Inject thinking and output_config to match real CLI defaults.
-	// Real Claude Code CLI always sends thinking:{type:"adaptive"} and
-	// output_config:{effort:"medium"}. Adaptive thinking is only supported
-	// on Claude 4.6 models (opus-4-6, sonnet-4-6). Older models (sonnet-4,
-	// claude-3-5-*) will reject adaptive thinking with 400 errors.
+	// Match real CLI 2.1.84 behavior: only output_config.effort, no thinking field.
+	// MITM captures confirm real CLI never sends thinking for opus-4-6 or sonnet-4-6.
+	// If client sends thinking, convert it to an appropriate effort level and remove it.
 	if supportsAdaptiveThinking(model) {
-		if !gjson.GetBytes(payload, "thinking").Exists() {
-			payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
-		}
-		if !gjson.GetBytes(payload, "output_config").Exists() {
+		thinkingRemoved := false
+		effortInjected := false
+		if gjson.GetBytes(payload, "thinking").Exists() {
+			// Map client's thinking to effort if client didn't set output_config
+			if !gjson.GetBytes(payload, "output_config").Exists() {
+				effort := thinkingToEffort(payload)
+				payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"`+effort+`"}`))
+				effortInjected = true
+			}
+			payload, _ = sjson.DeleteBytes(payload, "thinking")
+			thinkingRemoved = true
+		} else if !gjson.GetBytes(payload, "output_config").Exists() {
 			payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
+			effortInjected = true
 		}
+		log.Infof("[cloaking] output_config: effort=%s (injected=%t) thinking: removed=%t",
+			gjson.GetBytes(payload, "output_config.effort").String(), effortInjected, thinkingRemoved)
 	}
 
 	// Replace context_management with the standard CLI value during cloaking.

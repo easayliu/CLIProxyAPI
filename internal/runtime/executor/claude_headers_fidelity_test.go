@@ -318,8 +318,11 @@ func TestCapture010_SystemArray(t *testing.T) {
 	if !strings.Contains(sys0, "cc_entrypoint=cli") {
 		t.Errorf("billing header missing cc_entrypoint=cli: %s", sys0)
 	}
-	if !strings.Contains(sys0, "cch=00000") {
-		t.Errorf("billing header should have cch=00000: %s", sys0)
+	if !strings.Contains(sys0, "cch=") {
+		t.Errorf("billing header missing cch= field: %s", sys0)
+	}
+	if strings.Contains(sys0, "cch=00000") {
+		t.Errorf("billing header should NOT have cch=00000 (must be dynamic): %s", sys0)
 	}
 	// Capture #010: system[0] has NO cache_control
 	if gjson.GetBytes(cap.Body, "system.0.cache_control").Exists() {

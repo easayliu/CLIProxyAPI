@@ -1474,16 +1474,29 @@ func firstUserMessageText(payload []byte) string {
 	return ""
 }
 
+// generateCCH generates a 5-char hex string for the cch field in the billing header.
+// The real CLI 2.1.84 JS source sets cch=00000, but MITM + fake server captures confirm
+// the actual wire value is a non-zero 5-char hex that changes per request.
+// The replacement happens in Bun's native layer (not visible in JS source).
+// We generate a deterministic hash from the request payload to produce realistic,
+// per-request varying values without true randomness.
+func generateCCH(payload []byte) string {
+	h := sha256.Sum256(payload)
+	return hex.EncodeToString(h[:])[:5]
+}
+
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
 //
 // The build hash is dynamically computed per-request from the first user message
 // content using SHA-256, matching real CLI 2.1.84 behavior (cli.js _0T/qmq).
-// cch is hardcoded to 00000 (confirmed in cli.js 2.1.84 fW_ function).
+// cch is a 5-char hex hash derived from the request payload; the JS source shows
+// cch=00000 but Bun's native layer replaces it on the wire (verified via fake server).
 func generateBillingHeader(payload []byte) string {
 	buildHash := computeBuildHash(payload)
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", billingCLIVersion, buildHash)
+	cch := generateCCH(payload)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", billingCLIVersion, buildHash, cch)
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:

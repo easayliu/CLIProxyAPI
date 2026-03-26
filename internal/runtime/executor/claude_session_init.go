@@ -293,7 +293,7 @@ func (si *SessionInitEmitter) fireTitleGeneration(client *http.Client, apiKey st
 		"messages":    []map[string]any{{"role": "user", "content": []map[string]string{{"type": "text", "text": "hello"}}}},
 		"metadata":    map[string]string{"user_id": userID},
 		"system": []map[string]string{
-			{"type": "text", "text": "x-anthropic-billing-header: cc_version=" + initCliVersion + "." + initBuildHash("hello") + "; cc_entrypoint=cli; cch=00000;"},
+			{"type": "text", "text": "x-anthropic-billing-header: cc_version=" + initCliVersion + "." + initBuildHash("hello") + "; cc_entrypoint=cli; cch=" + randomCCH() + ";"},
 			{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
 			{"type": "text", "text": "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a list. Use sentence case: capitalize only the first word and proper nouns.\n\nReturn JSON with a single \"title\" field.\n\nGood examples:\n{\"title\": \"Fix login button on mobile\"}\n{\"title\": \"Add OAuth authentication\"}\n{\"title\": \"Debug failing CI tests\"}\n{\"title\": \"Refactor API client error handling\"}\n\nBad (too vague): {\"title\": \"Code changes\"}\nBad (too long): {\"title\": \"Investigate and fix the issue where the login button does not respond on mobile devices\"}\nBad (wrong case): {\"title\": \"Fix Login Button On Mobile\"}"},
 		},

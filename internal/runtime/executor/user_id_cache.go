@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 )
 
 // sessionSlot represents one "terminal window" — a single CLI session with its own
@@ -22,17 +24,12 @@ type sessionSlot struct {
 	expire    time.Time
 	requests  int // requests served so far
 	maxReqs   int // per-slot cap (randomized)
+	busy      bool // true while a request is in-flight
 }
 
 // sessionPool holds concurrent session slots for one API key.
-// The number of active slots adapts to request frequency: low RPM uses 1 slot
-// (like a single terminal), high RPM grows up to maxSlots (multiple terminals).
 type sessionPool struct {
 	slots []sessionSlot
-
-	// Adaptive sizing: track request rate over a sliding window.
-	windowStart time.Time // start of the current measurement window
-	windowReqs  int       // requests in the current window
 }
 
 var (
@@ -58,15 +55,8 @@ const (
 	sessionSlotBaseReqs  = 80
 	sessionSlotReqJitter = 120 // total range: 80–199
 
-	// Adaptive pool sizing thresholds.
-	// Below rpmThreshold1, use 1 slot (single terminal).
-	// Between rpmThreshold1 and rpmThreshold2, use 2 slots.
-	// Above rpmThreshold2, use 3 slots.
-	rpmThreshold1 = 10 // RPM > 10 → 2 slots
-	rpmThreshold2 = 25 // RPM > 25 → 3 slots
-
-	// RPM measurement window.
-	rpmWindowDuration = 5 * time.Minute
+	// Default number of concurrent session slots when RPM is not configured.
+	defaultSlotCount = 10
 
 	// Cleanup interval for expired pools.
 	sessionPoolCleanupInterval = 15 * time.Minute
@@ -131,41 +121,13 @@ func purgeExpiredPools() {
 	}
 }
 
-// desiredSlots returns how many concurrent slots this pool should have
-// based on recent request frequency.
-func (p *sessionPool) desiredSlots(now time.Time) int {
-	// Estimate RPM from the measurement window.
-	elapsed := now.Sub(p.windowStart)
-	if elapsed < 30*time.Second {
-		// Not enough data yet — keep current size.
-		return len(p.slots)
-	}
-	rpm := float64(p.windowReqs) / elapsed.Minutes()
-
-	if rpm > float64(rpmThreshold2) {
-		return 3
-	}
-	if rpm > float64(rpmThreshold1) {
-		return 2
-	}
-	return 1
-}
-
-// recordRequest updates the RPM measurement window.
-func (p *sessionPool) recordRequest(now time.Time) {
-	// Reset window if it has expired.
-	if now.Sub(p.windowStart) > rpmWindowDuration {
-		p.windowStart = now
-		p.windowReqs = 0
-	}
-	p.windowReqs++
-}
 
 // pickSessionID selects a session_id from the pool for this API key.
-// At low RPM (<= 10), it behaves like a single terminal: one session_id that
-// lives for 1-3 hours. At higher RPM, additional "terminals" are opened to
-// spread the load, like a developer working in multiple terminal windows.
-func pickSessionID(apiKey string) string {
+// slotCount determines the number of concurrent slots; 0 uses defaultSlotCount.
+func pickSessionID(apiKey string, slotCount int) string {
+	if slotCount <= 0 {
+		slotCount = defaultSlotCount
+	}
 	h := sha256.Sum256([]byte("session-pool:" + apiKey))
 	cacheKey := hex.EncodeToString(h[:])
 	now := time.Now()
@@ -173,19 +135,18 @@ func pickSessionID(apiKey string) string {
 	sessionPoolCleanOnce.Do(startSessionPoolCleanup)
 
 	sessionPoolsMu.Lock()
-	defer sessionPoolsMu.Unlock()
 
 	pool, ok := sessionPools[cacheKey]
 	if !ok {
+		slots := make([]sessionSlot, slotCount)
+		for i := range slots {
+			slots[i] = newSessionSlot()
+		}
 		pool = &sessionPool{
-			slots:       []sessionSlot{newSessionSlot()},
-			windowStart: now,
+			slots: slots,
 		}
 		sessionPools[cacheKey] = pool
 	}
-
-	// Record this request for RPM tracking.
-	pool.recordRequest(now)
 
 	// Refresh any dead slots.
 	for i := range pool.slots {
@@ -194,36 +155,110 @@ func pickSessionID(apiKey string) string {
 		}
 	}
 
-	// Adapt pool size based on request frequency.
-	desired := pool.desiredSlots(now)
+	// Adapt pool size.
+	desired := slotCount
 	for len(pool.slots) < desired {
 		pool.slots = append(pool.slots, newSessionSlot())
 	}
-	// Shrink: only remove excess slots that are dead (don't kill active sessions).
+	// Shrink: only remove excess slots that are not busy.
 	if len(pool.slots) > desired {
 		live := pool.slots[:0]
 		for i := range pool.slots {
-			if len(live) < desired || pool.slots[i].requests > 0 {
+			if len(live) < desired || pool.slots[i].busy {
 				live = append(live, pool.slots[i])
 			}
 		}
-		// Keep at least desired slots.
 		for len(live) < desired {
 			live = append(live, newSessionSlot())
 		}
 		pool.slots = live
 	}
 
-	// Pick a random live slot.
-	idx := rand.IntN(len(pool.slots))
+	// Pick an idle slot. Collect all idle indices and pick randomly.
+	var idle []int
+	for i := range pool.slots {
+		if !pool.slots[i].busy {
+			idle = append(idle, i)
+		}
+	}
+	if len(idle) == 0 {
+		// All slots busy — wait for one to become available (timeout 10s).
+		slotCount := len(pool.slots)
+		sessionPoolsMu.Unlock()
+		log.Warnf("[session-pool] key=%.16s all %d slots busy, waiting...", cacheKey, slotCount)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			time.Sleep(100 * time.Millisecond)
+			sessionPoolsMu.Lock()
+			idle = nil
+			for i := range pool.slots {
+				if !pool.slots[i].busy {
+					idle = append(idle, i)
+				}
+			}
+			if len(idle) > 0 {
+				break // lock held
+			}
+			if time.Now().After(deadline) {
+				log.Errorf("[session-pool] key=%.16s timeout after 10s, all %d slots busy", cacheKey, slotCount)
+				sessionPoolsMu.Unlock()
+				return ""
+			}
+			sessionPoolsMu.Unlock()
+		}
+	}
+	// Lock is held here.
+	idx := idle[rand.IntN(len(idle))]
+	pool.slots[idx].busy = true
 	pool.slots[idx].requests++
+
+	// Log all session IDs in this pool for auditing.
+	var sids []string
+	for i, s := range pool.slots {
+		marker := " "
+		if i == idx {
+			marker = "*"
+		}
+		status := "idle"
+		if s.busy {
+			status = "busy"
+		}
+		sids = append(sids, fmt.Sprintf("[%s%s %s reqs=%d]", marker, s.sessionID, status, s.requests))
+	}
+	log.Infof("[session-pool] key=%.16s slots=%d picked=%d sessions=%s", cacheKey, len(pool.slots), idx, strings.Join(sids, ", "))
 
 	// Cache the selected slot's cch for generateCCH() to pick up.
 	lastPickedCCHMu.Lock()
 	lastPickedCCH[cacheKey] = pool.slots[idx].cch
 	lastPickedCCHMu.Unlock()
 
-	return pool.slots[idx].sessionID
+	sid := pool.slots[idx].sessionID
+	sessionPoolsMu.Unlock()
+	return sid
+}
+
+// ReleaseSessionSlot marks the slot that owns sessionID as idle so it can
+// accept new requests. Call this when the upstream response finishes.
+func ReleaseSessionSlot(apiKey string, sessionID string) {
+	if apiKey == "" || sessionID == "" {
+		return
+	}
+	h := sha256.Sum256([]byte("session-pool:" + apiKey))
+	cacheKey := hex.EncodeToString(h[:])
+
+	sessionPoolsMu.Lock()
+	defer sessionPoolsMu.Unlock()
+
+	pool, ok := sessionPools[cacheKey]
+	if !ok {
+		return
+	}
+	for i := range pool.slots {
+		if pool.slots[i].sessionID == sessionID {
+			pool.slots[i].busy = false
+			return
+		}
+	}
 }
 
 // getLastPickedCCH returns the cch associated with the most recently picked
@@ -284,26 +319,48 @@ func DeriveRH(apiKey string) string {
 	return hex.EncodeToString(h[:8])
 }
 
-// PickSessionID is the exported version of pickSessionID.
-// It selects a session_id from the adaptive pool for the given API key.
+// PickSessionID returns a session_id from the pool without marking the slot as busy.
+// Used for session init and telemetry where no slot reservation is needed.
 func PickSessionID(apiKey string) string {
-	return pickSessionID(apiKey)
+	if apiKey == "" {
+		return uuid.New().String()
+	}
+	h := sha256.Sum256([]byte("session-pool:" + apiKey))
+	cacheKey := hex.EncodeToString(h[:])
+
+	sessionPoolsMu.Lock()
+	defer sessionPoolsMu.Unlock()
+
+	pool, ok := sessionPools[cacheKey]
+	if !ok {
+		return uuid.New().String()
+	}
+	// Return the first alive slot's sessionID without marking busy.
+	now := time.Now()
+	for _, s := range pool.slots {
+		if s.alive(now) {
+			return s.sessionID
+		}
+	}
+	return uuid.New().String()
 }
 
 // cachedUserID builds a complete user_id with stable device_id/account_uuid
 // and a session_id picked from an adaptive pool of concurrent sessions.
 // If realDeviceID or realAccountUUID is provided (from persisted OAuth auth file),
 // it is used instead of the derived value for maximum authenticity.
-func cachedUserID(apiKey string, realDeviceID string, realAccountUUID string) string {
-	return cachedUserIDWithSession(apiKey, realDeviceID, realAccountUUID, "")
+func cachedUserID(apiKey string, realDeviceID string, realAccountUUID string, slotCount int) (string, string) {
+	return cachedUserIDWithSession(apiKey, realDeviceID, realAccountUUID, "", slotCount)
 }
 
 // cachedUserIDWithSession is like cachedUserID but allows preserving a client-provided
 // session_id. When clientSessionID is non-empty, it is used directly instead of the
 // pool-selected value.
-func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID string, clientSessionID string) string {
+// cachedUserIDWithSession returns the JSON user_id string and the pool-picked sessionID
+// so callers can release the slot after the request completes.
+func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID string, clientSessionID string, slotCount int) (string, string) {
 	if apiKey == "" {
-		return generateFakeUserID()
+		return generateFakeUserID(), ""
 	}
 
 	deviceID := DeriveDeviceID(apiKey)
@@ -316,7 +373,11 @@ func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID
 		accountUUID = realAccountUUID
 	}
 
-	sessionID := pickSessionID(apiKey)
+	sessionID := pickSessionID(apiKey, slotCount)
+	if sessionID == "" && clientSessionID == "" {
+		// Pool timeout — no slot available.
+		return "", ""
+	}
 	if clientSessionID != "" {
 		sessionID = clientSessionID
 	}
@@ -327,5 +388,5 @@ func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID
 		SessionID:   sessionID,
 	}
 	data, _ := json.Marshal(payload)
-	return string(data)
+	return string(data), sessionID
 }

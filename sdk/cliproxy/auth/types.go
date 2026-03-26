@@ -344,6 +344,23 @@ func (a *Auth) RPMLimit() int {
 	return 0
 }
 
+// MaxConcurrent returns the maximum number of concurrent session slots for this auth.
+// The value is read from metadata key "max_concurrent" (or "max-concurrent").
+// Returns 0 if not set, meaning use the default slot count.
+func (a *Auth) MaxConcurrent() int {
+	if a == nil || a.Metadata == nil {
+		return 0
+	}
+	for _, key := range []string{"max_concurrent", "max-concurrent"} {
+		if val, ok := a.Metadata[key]; ok {
+			if parsed, okParse := parseIntAny(val); okParse && parsed > 0 {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:

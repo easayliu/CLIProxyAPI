@@ -112,6 +112,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		baseURL = "https://api.anthropic.com"
 	}
 
+	// Log identity on every request for auditing.
+	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
+
 	// Extract session ID for signature caching and session init.
 	sessionID := extractClientSessionID(req.Payload)
 	if sessionID == "" {
@@ -120,7 +123,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Fire session init requests on first message per client session.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
-		deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
 		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth))
 	}
 
@@ -171,7 +173,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	var poolSessionID string
+	body, poolSessionID, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	if err != nil {
+		return
+	}
+	poolKey := stablePoolKey(auth, apiKey)
+	if poolSessionID != "" {
+		defer ReleaseSessionSlot(poolKey, poolSessionID)
+	}
 
 	// requestedModel := payloadRequestedModel(opts, req.Model)
 	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -285,9 +295,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.publish(ctx, parseClaudeUsage(data))
 	}
-	// Cache thinking signatures from response for session reuse.
-	extractSessionSignature(sessionID, stablePoolKey(auth, apiKey), data)
-
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
 	}
@@ -306,7 +313,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Send CLI telemetry events to match real Claude Code behavior.
 	if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) {
-		deviceID, accountUUID, orgUUID, email := extractAuthIdentity(auth, apiKey)
+		_, _, orgUUID, email := extractAuthIdentity(auth, apiKey)
 		e.telemetryEmitter.EmitForMessage(apiKey, apiKey, true, baseModel, email, TelemetryIdentity{
 			DeviceID:         deviceID,
 			AccountUUID:      accountUUID,
@@ -334,6 +341,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		baseURL = "https://api.anthropic.com"
 	}
 
+	// Log identity on every request for auditing.
+	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
+
 	// Extract session ID for signature caching and session init.
 	sessionID := extractClientSessionID(req.Payload)
 	if sessionID == "" {
@@ -342,7 +352,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Fire session init requests on first message per client session.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
-		deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
 		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth))
 	}
 
@@ -387,7 +396,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	var poolSessionID string
+	body, poolSessionID, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	if err != nil {
+		return
+	}
+	poolKey := stablePoolKey(auth, apiKey)
+	if poolSessionID != "" {
+		defer ReleaseSessionSlot(poolKey, poolSessionID)
+	}
 
 	// requestedModel := payloadRequestedModel(opts, req.Model)
 	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -482,7 +499,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	// Send CLI telemetry events on successful stream start.
 	if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) {
-		deviceID, accountUUID, orgUUID, email := extractAuthIdentity(auth, apiKey)
+		_, _, orgUUID, email := extractAuthIdentity(auth, apiKey)
 		e.telemetryEmitter.EmitForMessage(apiKey, apiKey, true, baseModel, email, TelemetryIdentity{
 			DeviceID:         deviceID,
 			AccountUUID:      accountUUID,
@@ -499,17 +516,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}()
 
-		// Observer caches thinking signatures from the response stream.
-		sigObserver := newStreamSignatureObserver(sessionID, stablePoolKey(auth, apiKey))
-
 		// If from == to (Claude → Claude), directly forward the SSE stream without translation
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
 				line := scanner.Bytes()
-				sigObserver.ObserveLine(line)
-				appendAPIResponseChunk(ctx, e.cfg, line)
+		appendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := parseClaudeStreamUsage(line); ok {
 					reporter.publish(ctx, detail)
 				}
@@ -536,8 +549,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			sigObserver.ObserveLine(line)
-			appendAPIResponseChunk(ctx, e.cfg, line)
+appendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := parseClaudeStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
 			}
@@ -1090,9 +1102,11 @@ func extractAuthIdentity(auth *cliproxyauth.Auth, apiKey string) (deviceID, acco
 	deviceID = DeriveDeviceID(apiKey)
 	accountUUID = DeriveAccountUUID(apiKey)
 	orgUUID = DeriveOrganizationUUID(apiKey)
+	fromMeta := false
 	if auth != nil && auth.Metadata != nil {
 		if v, ok := auth.Metadata["device_id"].(string); ok && v != "" {
 			deviceID = v
+			fromMeta = true
 		}
 		if v, ok := auth.Metadata["account_uuid"].(string); ok && v != "" {
 			accountUUID = v
@@ -1103,6 +1117,15 @@ func extractAuthIdentity(auth *cliproxyauth.Auth, apiKey string) (deviceID, acco
 		if v, ok := auth.Metadata["email"].(string); ok && v != "" {
 			email = v
 		}
+	}
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	if fromMeta {
+		log.Infof("[claude-identity] auth=%s device_id=%s account_uuid=%s org_uuid=%s (from auth metadata)", authID, deviceID, accountUUID, orgUUID)
+	} else {
+		log.Warnf("[claude-identity] auth=%s device_id=%s account_uuid=%s org_uuid=%s (derived from key — consider setting device_id/account_uuid in auth config)", authID, deviceID, accountUUID, orgUUID)
 	}
 	return
 }
@@ -1374,16 +1397,22 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 // injectFakeUserID replaces metadata.user_id with a generated identity.
 // poolKey is a stable identifier (e.g. auth.ID) used to key the session pool,
 // NOT the volatile OAuth access_token which changes on refresh.
-func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string) []byte {
-	generateID := func() string {
-		if useCache {
-			return cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, "")
+// injectFakeUserID returns the modified payload and the pool sessionID for release.
+func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string, slotCount int) ([]byte, string, error) {
+	var uid string
+	var pickedSessionID string
+	if useCache {
+		uid, pickedSessionID = cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, "", slotCount)
+		if uid == "" {
+			return payload, "", fmt.Errorf("session pool timeout: all slots busy")
 		}
-		return generateFakeUserID()
+	} else {
+		uid = generateFakeUserID()
 	}
 
-	payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-	return payload
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", uid)
+	log.Infof("[claude-identity] metadata.user_id=%s", uid)
+	return payload, pickedSessionID, nil
 }
 
 // generateBillingHeader creates the x-anthropic-billing-header text block that
@@ -1786,64 +1815,6 @@ func repairToolUsePairing(payload []byte) []byte {
 	return result
 }
 
-// replaceOrStripThinkingSignatures handles thinking blocks in assistant messages.
-// If a cached signature exists for the same session (keyed by thinking text hash),
-// the signature is replaced so the thinking block is preserved — matching real
-// Claude Code CLI behavior. If no cached signature is available, the thinking
-// block is stripped to avoid 400 "Invalid signature in thinking block" errors.
-func replaceOrStripThinkingSignatures(payload []byte, sessionID, poolKey string) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return payload
-	}
-
-	modified := false
-	result := payload
-
-	for i, msg := range messages.Array() {
-		if msg.Get("role").String() != "assistant" {
-			continue
-		}
-		content := msg.Get("content")
-		if !content.Exists() || !content.IsArray() {
-			continue
-		}
-
-		var kept []interface{}
-		changed := false
-		for _, block := range content.Array() {
-			if block.Get("type").String() != "thinking" {
-				kept = append(kept, json.RawMessage(block.Raw))
-				continue
-			}
-
-			thinkingText := block.Get("thinking").String()
-			cachedSig := getSessionSignature(sessionID, poolKey, thinkingText)
-
-			if cachedSig != "" {
-				// Replace signature with cached version from same session
-				updated, _ := sjson.SetBytes([]byte(block.Raw), "signature", cachedSig)
-				kept = append(kept, json.RawMessage(updated))
-				changed = true
-			} else {
-				// No cached signature — strip thinking block
-				changed = true
-			}
-		}
-
-		if changed {
-			modified = true
-			path := fmt.Sprintf("messages.%d.content", i)
-			result, _ = sjson.SetBytes(result, path, kept)
-		}
-	}
-
-	if !modified {
-		return payload
-	}
-	return result
-}
-
 // normalizeMaxTokensForCloaking ensures max_tokens matches the model's default value
 // when cloaking is active. Real Claude Code CLI always sends model-appropriate max_tokens
 // (e.g. 128000 for Opus 4.6, 64000 for Sonnet 4.6). A fixed value like 8192 across all
@@ -1868,7 +1839,8 @@ func normalizeMaxTokensForCloaking(payload []byte, model string) []byte {
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
-func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string, sessionID string) []byte {
+// applyCloaking returns the cloaked payload, the pool sessionID to release, and an error on timeout.
+func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string, sessionID string) ([]byte, string, error) {
 	clientUserAgent := getClientUserAgent(ctx)
 
 	// Get cloak config from ClaudeKey configuration
@@ -1910,21 +1882,17 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// OAuth tokens default to no cloaking. Set cloak_mode to "always" or
 	// "auto" in auth attributes or config to re-enable cloaking for OAuth.
 	if cloakMode == "auto" && isClaudeOAuthToken(apiKey) {
-		cloakMode = "never"
+		cloakMode = "always"
 	}
 
 	// Determine if cloaking should be applied
 	if !shouldCloak(cloakMode, clientUserAgent) {
-		return payload
+		return payload, "", nil
 	}
 
 	// Strip non-standard top-level fields and sanitize metadata to prevent
 	// upstream proxies from injecting identifiable fields into the request body.
 	payload = stripNonStandardFields(payload)
-
-	// Replace thinking block signatures with cached versions from the same session,
-	// or strip thinking blocks if no cached signature is available.
-	payload = replaceOrStripThinkingSignatures(payload, sessionID, stablePoolKey(auth, apiKey))
 
 	// Normalize max_tokens to match the model's default when cloaking is active.
 	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default
@@ -1983,7 +1951,16 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 			realAccountUUID = v
 		}
 	}
-	payload = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID)
+	var poolSessionID string
+	var injectErr error
+	slotCount := 0
+	if auth != nil {
+		slotCount = auth.MaxConcurrent()
+	}
+	payload, poolSessionID, injectErr = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID, slotCount)
+	if injectErr != nil {
+		return payload, "", injectErr
+	}
 
 	// Inject standard CLI tools if client didn't send any.
 	payload = injectDefaultToolsIfMissing(payload)
@@ -1994,7 +1971,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = obfuscateSensitiveWords(payload, matcher)
 	}
 
-	return payload
+	return payload, poolSessionID, nil
 }
 
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.

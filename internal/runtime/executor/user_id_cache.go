@@ -237,6 +237,36 @@ func pickSessionID(apiKey string, slotCount int) string {
 	return sid
 }
 
+// EnsureSessionPool creates the session pool for the given key if it doesn't
+// exist yet, so that subsequent PickSessionID calls return a pool-backed
+// sessionID instead of a random UUID. Must be called before PickSessionID
+// on the first request for a given key.
+func EnsureSessionPool(apiKey string, slotCount int) {
+	if apiKey == "" {
+		return
+	}
+	if slotCount <= 0 {
+		slotCount = defaultSlotCount
+	}
+	h := sha256.Sum256([]byte("session-pool:" + apiKey))
+	cacheKey := hex.EncodeToString(h[:])
+
+	sessionPoolCleanOnce.Do(startSessionPoolCleanup)
+
+	sessionPoolsMu.Lock()
+	defer sessionPoolsMu.Unlock()
+
+	if _, ok := sessionPools[cacheKey]; ok {
+		return // already exists
+	}
+	slots := make([]sessionSlot, slotCount)
+	for i := range slots {
+		slots[i] = newSessionSlot()
+	}
+	sessionPools[cacheKey] = &sessionPool{slots: slots}
+	log.Infof("[session-pool] key=%.16s pre-initialized %d slots", cacheKey, slotCount)
+}
+
 // ReleaseSessionSlot marks the slot that owns sessionID as idle so it can
 // accept new requests. Call this when the upstream response finishes.
 func ReleaseSessionSlot(apiKey string, sessionID string) {

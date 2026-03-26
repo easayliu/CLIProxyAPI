@@ -117,10 +117,19 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Log identity on every request for auditing.
 	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
 
+	// Ensure session pool exists before picking a session ID, so that
+	// PickSessionID returns a pool-backed ID consistent with later cloaking.
+	poolKey := stablePoolKey(auth, apiKey)
+	slotCount := 0
+	if auth != nil {
+		slotCount = auth.MaxConcurrent()
+	}
+	EnsureSessionPool(poolKey, slotCount)
+
 	// Extract session ID for signature caching and session init.
 	sessionID := extractClientSessionID(req.Payload)
 	if sessionID == "" {
-		sessionID = PickSessionID(stablePoolKey(auth, apiKey))
+		sessionID = PickSessionID(poolKey)
 	}
 
 	// Fire session init requests on first message per client session.
@@ -158,7 +167,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// version connects through an upstream proxy like NewAPI.
 	if !isHaikuModel(baseModel) {
 		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, stablePoolKey(auth, apiKey))
+		body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 	}
 
 	// Sanitize context_management.edits: remove unsupported edit types before
@@ -180,7 +189,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return
 	}
-	poolKey := stablePoolKey(auth, apiKey)
 	if poolSessionID != "" {
 		defer ReleaseSessionSlot(poolKey, poolSessionID)
 	}
@@ -346,10 +354,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Log identity on every request for auditing.
 	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
 
+	// Ensure session pool exists before picking a session ID.
+	poolKey := stablePoolKey(auth, apiKey)
+	slotCount := 0
+	if auth != nil {
+		slotCount = auth.MaxConcurrent()
+	}
+	EnsureSessionPool(poolKey, slotCount)
+
 	// Extract session ID for signature caching and session init.
 	sessionID := extractClientSessionID(req.Payload)
 	if sessionID == "" {
-		sessionID = PickSessionID(stablePoolKey(auth, apiKey))
+		sessionID = PickSessionID(poolKey)
 	}
 
 	// Fire session init requests on first message per client session.
@@ -381,7 +397,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Always regenerate system[0] (billing header)
 	if !isHaikuModel(baseModel) {
 		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, stablePoolKey(auth, apiKey))
+		body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 	}
 
 	// Sanitize context_management.edits: remove unsupported edit types before
@@ -403,7 +419,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return
 	}
-	poolKey := stablePoolKey(auth, apiKey)
 	if poolSessionID != "" {
 		defer ReleaseSessionSlot(poolKey, poolSessionID)
 	}
@@ -598,6 +613,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 
 	if !isHaikuModel(baseModel) {
 		body = checkSystemInstructions(body)
+		body = finalizeBillingHeader(body)
 	}
 
 	// // Keep count_tokens requests compatible with Anthropic cache-control constraints too.
@@ -1445,8 +1461,10 @@ func computeBuildHash(payload []byte) string {
 	return hex.EncodeToString(h[:])[:3]
 }
 
-// firstUserMessageText extracts the text content of the first user message
-// from a Claude API request payload. Matches cli.js OM7 function behavior.
+// firstUserMessageText extracts the text content of the first non-deferred-tools
+// user message from a Claude API request payload. Matches cli.js OM7 function
+// behavior: the deferred-tools message (messages[0] with <available-deferred-tools>)
+// is skipped; the build hash is computed from the next user message's first text block.
 func firstUserMessageText(payload []byte) string {
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.IsArray() {
@@ -1459,15 +1477,25 @@ func firstUserMessageText(payload []byte) string {
 		content := msg.Get("content")
 		// String content
 		if content.Type == gjson.String {
-			return content.String()
+			text := content.String()
+			if strings.Contains(text, "<available-deferred-tools>") {
+				continue // skip deferred-tools message
+			}
+			return text
 		}
 		// Array content: find first text block
 		if content.IsArray() {
+			first := ""
 			for _, block := range content.Array() {
 				if block.Get("type").String() == "text" {
-					return block.Get("text").String()
+					first = block.Get("text").String()
+					break
 				}
 			}
+			if strings.Contains(first, "<available-deferred-tools>") {
+				continue // skip deferred-tools message
+			}
+			return first
 		}
 		return ""
 	}
@@ -1511,6 +1539,7 @@ func finalizeBillingHeader(payload []byte) []byte {
 	// Replace placeholders in the raw JSON bytes.
 	result := bytes.ReplaceAll(payload, []byte(billingBuildHashPlaceholder), []byte(buildHash))
 	result = bytes.ReplaceAll(result, []byte(billingCCHPlaceholder), []byte(cch))
+	log.Infof("[billing-header] cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", billingCLIVersion, buildHash, cch)
 	return result
 }
 
@@ -1525,7 +1554,7 @@ func finalizeBillingHeader(payload []byte) []byte {
 func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, poolKey string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(payload)
+	billingText := generateBillingHeader()
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
 	agentBlock := `{"type":"text","cache_control":{"type":"ephemeral"},"text":"You are Claude Code, Anthropic's official CLI for Claude."}`
@@ -1972,6 +2001,9 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Determine if cloaking should be applied
 	if !shouldCloak(cloakMode, clientUserAgent) {
+		// Even without cloaking, billing header placeholders must be resolved
+		// since checkSystemInstructionsWithMode already injected them.
+		payload = finalizeBillingHeader(payload)
 		return payload, "", nil
 	}
 
@@ -2055,6 +2087,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		matcher := buildSensitiveWordMatcher(sensitiveWords)
 		payload = obfuscateSensitiveWords(payload, matcher)
 	}
+
+	// Replace billing header placeholders with real build hash and cch now
+	// that all injections (system-reminder, deferred-tools, etc.) are done.
+	payload = finalizeBillingHeader(payload)
 
 	return payload, poolSessionID, nil
 }

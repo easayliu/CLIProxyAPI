@@ -79,12 +79,33 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 	case proxyURL == nil:
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	case proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h":
-		return dialViaSocks5(ctx, proxyURL, addr)
+		conn, err := dialViaSocks5(ctx, proxyURL, addr)
+		if err == nil {
+			logProxyExitIP(proxyURL, conn)
+		}
+		return conn, err
 	case proxyURL.Scheme == "http" || proxyURL.Scheme == "https":
-		return dialViaHTTPConnect(ctx, proxyURL, addr)
+		conn, err := dialViaHTTPConnect(ctx, proxyURL, addr)
+		if err == nil {
+			logProxyExitIP(proxyURL, conn)
+		}
+		return conn, err
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme: %s", proxyURL.Scheme)
 	}
+}
+
+// logProxyExitIP logs the proxy exit IP by resolving the proxy hostname.
+func logProxyExitIP(proxyURL *url.URL, conn net.Conn) {
+	proxyHost := proxyURL.Hostname()
+	ips, err := net.LookupHost(proxyHost)
+	if err != nil {
+		log.Infof("proxy %s -> target via %s (DNS resolve failed: %v), local=%s",
+			proxyURL.Scheme, proxyURL.Host, err, conn.LocalAddr())
+		return
+	}
+	log.Infof("proxy %s -> exit IP %s (proxy=%s), local=%s",
+		proxyURL.Scheme, ips[0], proxyURL.Host, conn.LocalAddr())
 }
 
 // dialViaSocks5 establishes a TCP connection through a SOCKS5 proxy.

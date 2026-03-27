@@ -17,14 +17,18 @@ import (
 )
 
 // TelemetryEmitter generates and sends CLI telemetry events to Anthropic
-// alongside v1/messages requests, using the same upstream auth identity.
-// Event structure and timing are derived from real Claude Code CLI 2.1.84
-// MITM captures (see /tmp/proxy_captures/).
+// using a buffered flush model matching the real CLI's OTLP BatchLogRecordProcessor.
+//
+// Real CLI behavior (from MITM capture 20260327_153339):
+//   - Events are buffered, flushed every ~10 seconds (scheduledDelayMillis=10000)
+//   - Init batch (#011) fires ~10s after startup requests (#001-#010)
+//   - Post-init batch (#013) fires ~31s after startup
+//   - Per-message events are batched across multiple API calls
+//   - Periodic standalone batches (version_cleanup, notification) fire independently
 type TelemetryEmitter struct {
 	client   *http.Client
 	upstream string // "https://api.anthropic.com"
 
-	// Track per-auth session state
 	mu       sync.Mutex
 	sessions map[string]*telemetrySession // keyed by upstream API key
 }
@@ -37,14 +41,20 @@ type telemetrySession struct {
 	rh          string
 	email       string
 	model       string
-	initialized bool      // whether init events have been sent
-	msgCount    int       // messages sent in this session
-	createdAt   time.Time
-	expireAt    time.Time // randomized TTL, matching session pool range
+	authToken   string // cached for flush goroutine
+	isOAuth     bool
 
-	// firstTokenTime is the epoch millis when session was created,
-	// used in GrowthbookExperimentEvent user_attributes.
-	firstTokenTime int64
+	initialized     bool      // whether init events have been queued
+	postInitSent    bool      // whether post-init batch has been sent
+	msgCount        int       // messages sent in this session
+	createdAt       time.Time
+	expireAt        time.Time // randomized TTL, matching session pool range
+	firstTokenTime  int64     // epoch millis for GrowthBook user_attributes
+	lastCleanupAt   time.Time // last periodic cleanup batch time
+
+	// Buffered events waiting for the next flush cycle.
+	pendingEvents []map[string]any
+	flushTimer    *time.Timer // 10-second flush timer
 }
 
 const (
@@ -89,39 +99,132 @@ type TelemetryIdentity struct {
 }
 
 // EmitForMessage is called after each successful v1/messages forwarding.
-// It generates appropriate telemetry events and sends them to Anthropic.
+// Events are buffered and flushed on a 10-second timer matching the real
+// CLI's OTLP BatchLogRecordProcessor (scheduledDelayMillis=10000).
 func (te *TelemetryEmitter) EmitForMessage(apiKey, authToken string, isOAuth bool, model, email string, identity TelemetryIdentity) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Errorf("[telemetry-emitter] panic recovered: %v", r)
-			}
-		}()
+	te.mu.Lock()
+	session := te.getOrCreateSessionLocked(apiKey, model, email, identity)
+	session.authToken = authToken
+	session.isOAuth = isOAuth
 
-		session := te.getOrCreateSession(apiKey, model, email, identity)
+	if !session.initialized {
+		// Queue init events — they will be flushed ~10s later,
+		// matching real CLI timing where init batch (#011) arrives
+		// ~10s after startup requests (#001-#010).
+		initEvents := session.emitSessionInit()
+		session.pendingEvents = append(session.pendingEvents, initEvents...)
+		session.initialized = true
 
-		if !session.initialized {
-			events := session.emitSessionInit()
-			te.sendEventBatch(authToken, isOAuth, events)
-			te.mu.Lock()
-			session.initialized = true
-			te.mu.Unlock()
-		}
+		// Schedule post-init batch ~20s later (real CLI #013 at t+31s,
+		// but init flush is at t+10s, so post-init is ~20s after that).
+		go te.schedulePostInit(apiKey, 20*time.Second+time.Duration(rand.IntN(5000))*time.Millisecond)
 
-		msgEvents := session.emitMessageEvents()
-		te.sendEventBatch(authToken, isOAuth, msgEvents)
+		// Schedule periodic cleanup batch (~9 min, then ~30 min)
+		go te.schedulePeriodicCleanup(apiKey, 9*time.Minute+time.Duration(rand.IntN(60000))*time.Millisecond)
+	}
 
-		te.mu.Lock()
-		session.msgCount++
-		te.mu.Unlock()
-	}()
+	// Queue per-message events into the buffer.
+	msgEvents := session.emitMessageEvents()
+	session.pendingEvents = append(session.pendingEvents, msgEvents...)
+	session.msgCount++
+
+	// Start or reset the 10-second flush timer.
+	te.ensureFlushTimerLocked(apiKey, session)
+	te.mu.Unlock()
 }
 
-// getOrCreateSession looks up or creates a telemetry session for the given API key.
-func (te *TelemetryEmitter) getOrCreateSession(apiKey, model, email string, identity TelemetryIdentity) *telemetrySession {
-	te.mu.Lock()
-	defer te.mu.Unlock()
+// ensureFlushTimerLocked starts a 10-second flush timer if not already running.
+// Must be called with te.mu held.
+func (te *TelemetryEmitter) ensureFlushTimerLocked(apiKey string, session *telemetrySession) {
+	if session.flushTimer != nil {
+		return // timer already running, events will be flushed on next tick
+	}
+	delay := 9*time.Second + time.Duration(rand.IntN(2000))*time.Millisecond // 9-11s jitter
+	session.flushTimer = time.AfterFunc(delay, func() {
+		te.flushSession(apiKey)
+	})
+}
 
+// flushSession sends all pending events for a session and resets the buffer.
+func (te *TelemetryEmitter) flushSession(apiKey string) {
+	te.mu.Lock()
+	session, ok := te.sessions[apiKey]
+	if !ok || len(session.pendingEvents) == 0 {
+		if ok {
+			session.flushTimer = nil
+		}
+		te.mu.Unlock()
+		return
+	}
+
+	events := session.pendingEvents
+	session.pendingEvents = nil
+	session.flushTimer = nil
+	authToken := session.authToken
+	isOAuth := session.isOAuth
+	te.mu.Unlock()
+
+	log.Infof("[telemetry-emitter] flushing %d events for session", len(events))
+	te.sendEventBatch(authToken, isOAuth, events)
+}
+
+// schedulePostInit sends the post-init batch (#013) after a delay.
+// Contains MCP completion events: mcp_tools_commands_loaded, context_size, etc.
+func (te *TelemetryEmitter) schedulePostInit(apiKey string, delay time.Duration) {
+	time.Sleep(delay)
+	te.mu.Lock()
+	session, ok := te.sessions[apiKey]
+	if !ok || session.postInitSent {
+		te.mu.Unlock()
+		return
+	}
+	session.postInitSent = true
+	authToken := session.authToken
+	isOAuth := session.isOAuth
+	te.mu.Unlock()
+
+	events := session.emitPostInit()
+	if len(events) > 0 {
+		log.Infof("[telemetry-emitter] sending post-init batch (%d events)", len(events))
+		te.sendEventBatch(authToken, isOAuth, events)
+	}
+}
+
+// schedulePeriodicCleanup sends standalone periodic batches
+// (native_version_cleanup at ~9min, then every ~30min).
+func (te *TelemetryEmitter) schedulePeriodicCleanup(apiKey string, initialDelay time.Duration) {
+	time.Sleep(initialDelay)
+	for {
+		te.mu.Lock()
+		session, ok := te.sessions[apiKey]
+		if !ok || time.Now().After(session.expireAt) {
+			te.mu.Unlock()
+			return
+		}
+		authToken := session.authToken
+		isOAuth := session.isOAuth
+		session.lastCleanupAt = time.Now()
+		te.mu.Unlock()
+
+		ts := time.Now().UTC().Format(time.RFC3339Nano)
+		events := []map[string]any{
+			session.buildEvent("tengu_native_version_cleanup", ts, map[string]any{
+				"rh": session.rh, "total_count": 3, "deleted_count": 0,
+				"protected_count": 1, "retained_count": 2,
+				"lock_failed_count": 0, "error_count": 0,
+			}),
+		}
+		log.Infof("[telemetry-emitter] sending periodic cleanup batch")
+		te.sendEventBatch(authToken, isOAuth, events)
+
+		// Next cleanup in ~30 min (matching real CLI pattern)
+		time.Sleep(30*time.Minute + time.Duration(rand.IntN(120000))*time.Millisecond)
+	}
+}
+
+// getOrCreateSessionLocked looks up or creates a telemetry session for the given API key.
+// Must be called with te.mu held.
+func (te *TelemetryEmitter) getOrCreateSessionLocked(apiKey, model, email string, identity TelemetryIdentity) *telemetrySession {
 	session, ok := te.sessions[apiKey]
 	now := time.Now()
 
@@ -426,6 +529,53 @@ func (s *telemetrySession) emitSessionInit() []map[string]any {
 	events = append(events, s.buildEvent("tengu_native_version_cleanup", ts57, map[string]any{
 		"rh": s.rh, "total_count": 3, "deleted_count": 0, "protected_count": 1,
 		"retained_count": 2, "lock_failed_count": 0, "error_count": 0,
+	}))
+
+	return events
+}
+
+// --- Post-Init Batch ---
+// Matches real CLI 2.1.85 MITM capture 20260327_153339 #013 (6 events at t+31s).
+// Fires after MCP connections complete / time out.
+
+func (s *telemetrySession) emitPostInit() []map[string]any {
+	events := make([]map[string]any, 0, 8)
+	now := time.Now().UTC()
+	ts := now.Format(time.RFC3339Nano)
+
+	// tengu_mcp_server_connection_failed x2 (MCP timeout after ~30s)
+	events = append(events, s.buildEvent("tengu_mcp_server_connection_failed", ts, map[string]any{
+		"rh": s.rh, "connectionDurationMs": 30000 + rand.IntN(100),
+		"totalServers": 2, "stdioCount": 1, "sseCount": 0, "httpCount": 0,
+		"sseIdeCount": 0, "wsIdeCount": 0, "transportType": "stdio",
+	}))
+	events = append(events, s.buildEvent("tengu_mcp_server_connection_failed", now.Add(591*time.Millisecond).Format(time.RFC3339Nano), map[string]any{
+		"rh": s.rh, "connectionDurationMs": 30000 + rand.IntN(100),
+		"totalServers": 3, "stdioCount": 1, "sseCount": 0, "httpCount": 0,
+		"sseIdeCount": 0, "wsIdeCount": 1, "transportType": "stdio",
+	}))
+
+	// tengu_mcp_tools_commands_loaded x2
+	events = append(events, s.buildEvent("tengu_mcp_tools_commands_loaded", ts, map[string]any{
+		"rh": s.rh, "tools_count": 18, "commands_count": 0, "commands_metadata_length": 0,
+	}))
+	events = append(events, s.buildEvent("tengu_mcp_tools_commands_loaded", ts, map[string]any{
+		"rh": s.rh, "tools_count": 18, "commands_count": 0, "commands_metadata_length": 0,
+	}))
+
+	// tengu_context_size
+	events = append(events, s.buildEvent("tengu_context_size", ts, map[string]any{
+		"rh": s.rh, "git_status_size": 800 + rand.IntN(500),
+		"claude_md_size": 2000 + rand.IntN(1000), "total_context_size": 3000 + rand.IntN(1000),
+		"project_file_count_rounded": 2000, "mcp_tools_count": 18, "mcp_servers_count": 1,
+		"mcp_tools_tokens": 3000 + rand.IntN(500), "non_mcp_tools_count": 27,
+		"non_mcp_tools_tokens": 4500 + rand.IntN(500),
+	}))
+
+	// tengu_file_suggestions_git_ls_files
+	events = append(events, s.buildEvent("tengu_file_suggestions_git_ls_files", now.Add(634*time.Millisecond).Format(time.RFC3339Nano), map[string]any{
+		"rh": s.rh, "file_count": 400 + rand.IntN(200), "tracked_count": 400 + rand.IntN(200),
+		"untracked_count": 0, "duration_ms": 15 + rand.IntN(30),
 	}))
 
 	return events

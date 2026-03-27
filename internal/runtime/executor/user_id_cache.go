@@ -46,15 +46,17 @@ var (
 )
 
 const (
-	// Session slot lifetime: each slot lives 1–3 hours (randomized, fixed at creation).
-	// Real developers keep a terminal open for extended periods.
-	sessionSlotBaseTTL = 1 * time.Hour
-	sessionSlotJitter  = 2 * time.Hour // total range: 1–3 hours
+	// Session slot lifetime: each slot lives 6–12 hours (randomized, fixed at creation).
+	// Real developers keep a terminal open for an entire work day. Must align with
+	// SessionInitEmitter TTL (also 6-12h) so a slot does not expire and get replaced
+	// while the init emitter still thinks the old sessionID is valid.
+	sessionSlotBaseTTL = 6 * time.Hour
+	sessionSlotJitter  = 6 * time.Hour // total range: 6–12 hours
 
-	// Per-slot request cap: 80–200 requests before the slot retires.
-	// A real CLI session easily does 100+ requests in a long coding session.
-	sessionSlotBaseReqs  = 80
-	sessionSlotReqJitter = 120 // total range: 80–199
+	// Per-slot request cap: 200–500 requests before the slot retires.
+	// A real CLI session in a long coding day easily does 300+ requests.
+	sessionSlotBaseReqs  = 200
+	sessionSlotReqJitter = 300 // total range: 200–499
 
 	// Default number of concurrent session slots when RPM is not configured.
 	defaultSlotCount = 10

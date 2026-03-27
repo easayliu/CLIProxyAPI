@@ -6,6 +6,8 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -36,7 +39,7 @@ import (
 type ClaudeExecutor struct {
 	cfg                *config.Config
 	sessionInitEmitter *SessionInitEmitter
-	// telemetryEmitter *TelemetryEmitter // disabled: not sending telemetry for now
+	telemetryEmitter *TelemetryEmitter
 }
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
@@ -47,6 +50,8 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
 	return &ClaudeExecutor{
 		cfg:                cfg,
 		sessionInitEmitter: NewSessionInitEmitter(),
+		// telemetryEmitter disabled: synthetic telemetry may be a detection signal.
+		// telemetryEmitter:   NewTelemetryEmitter(),
 	}
 }
 
@@ -61,14 +66,12 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	if strings.TrimSpace(apiKey) == "" {
 		return nil
 	}
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
-		req.Header.Del("Authorization")
-		req.Header.Set("x-api-key", apiKey)
-	} else {
+	if isClaudeOAuthToken(apiKey) {
 		req.Header.Del("x-api-key")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	} else if apiKey != "" {
+		req.Header.Del("Authorization")
+		req.Header.Set("x-api-key", apiKey)
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -111,16 +114,26 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		baseURL = "https://api.anthropic.com"
 	}
 
-	// Extract session ID for signature caching and session init.
-	sessionID := extractClientSessionID(req.Payload)
-	if sessionID == "" {
-		sessionID = PickSessionID(stablePoolKey(auth, apiKey))
-	}
+	// Log identity on every request for auditing.
+	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
 
-	// Fire session init requests on first message per client session.
+	// Ensure session pool exists before picking a session ID, so that
+	// PickSessionID returns a pool-backed ID consistent with later cloaking.
+	poolKey := stablePoolKey(auth, apiKey)
+	slotCount := 0
+	if auth != nil {
+		slotCount = auth.MaxConcurrent()
+	}
+	EnsureSessionPool(poolKey, slotCount)
+
+	// Pick an uninitialized slot for session init, or an initialized one if all done.
+	sessionID := PickSessionID(poolKey)
+
+	// Fire session init requests and mark the slot as initialized only on success.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
-		deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
-		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID)
+		if e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth)) {
+			MarkSessionInitialized(poolKey, sessionID)
+		}
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -129,28 +142,31 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	to := sdktranslator.FromString("claude")
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
+	// originalPayloadSource := req.Payload
+	// if len(opts.OriginalRequest) > 0 {
+	// 	originalPayloadSource = opts.OriginalRequest
+	// }
+	// originalPayload := originalPayloadSource
+	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
-	}
+	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
+	// Override to match CLI fingerprint regardless of what the client sent.
+	body, _ = sjson.SetBytes(body, "temperature", 1)
+
+	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	// if err != nil {
+	// 	return resp, err
+	// }
 
 	// Always regenerate system[0] (billing header) and system[1] (agent block)
 	// to ensure version consistency with our template, regardless of cloaking.
 	// This prevents version mismatch when a real Claude Code CLI with a different
 	// version connects through an upstream proxy like NewAPI.
-	if !isHaikuModel(baseModel) {
-		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, stablePoolKey(auth, apiKey))
-	}
+	// MITM captures confirm real CLI sends full system blocks for all models including Haiku.
+	oauthMode := isClaudeOAuthToken(apiKey)
+	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
@@ -166,27 +182,31 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
-
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
-
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
+	var poolSessionID string
+	body, poolSessionID, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	if err != nil {
+		return
+	}
+	if poolSessionID != "" {
+		defer ReleaseSessionSlot(poolKey, poolSessionID)
 	}
 
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// (e.g. Amp CLI) already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
+	// requestedModel := payloadRequestedModel(opts, req.Model)
+	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-	body = normalizeCacheControlTTL(body)
+	// // Disable thinking if tool_choice forces tool use (Anthropic API constraint)
+	// body = disableThinkingIfToolChoiceForced(body)
+
+	// // Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
+	// if countCacheControls(body) == 0 {
+	// 	body = ensureCacheControl(body)
+	// }
+
+	// // Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
+	// body = enforceCacheControlLimit(body, 4)
+
+	// // Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+	// body = normalizeCacheControlTTL(body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -283,9 +303,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.publish(ctx, parseClaudeUsage(data))
 	}
-	// Cache thinking signatures from response for session reuse.
-	extractSessionSignature(sessionID, stablePoolKey(auth, apiKey), data)
-
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
 	}
@@ -302,10 +319,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 
-	// Telemetry disabled: not sending CLI telemetry events for now.
-	// if e.telemetryEmitter != nil && auth != nil {
-	// 	...
-	// }
+	// Send CLI telemetry events to match real Claude Code behavior.
+	if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) {
+		_, _, orgUUID, email := extractAuthIdentity(auth, apiKey)
+		e.telemetryEmitter.EmitForMessage(apiKey, apiKey, true, baseModel, email, TelemetryIdentity{
+			DeviceID:         deviceID,
+			AccountUUID:      accountUUID,
+			OrganizationUUID: orgUUID,
+		})
+	}
 
 	return resp, nil
 }
@@ -327,42 +349,51 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		baseURL = "https://api.anthropic.com"
 	}
 
-	// Extract session ID for signature caching and session init.
-	sessionID := extractClientSessionID(req.Payload)
-	if sessionID == "" {
-		sessionID = PickSessionID(stablePoolKey(auth, apiKey))
-	}
+	// Log identity on every request for auditing.
+	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
 
-	// Fire session init requests on first message per client session.
+	// Ensure session pool exists before picking a session ID.
+	poolKey := stablePoolKey(auth, apiKey)
+	slotCount := 0
+	if auth != nil {
+		slotCount = auth.MaxConcurrent()
+	}
+	EnsureSessionPool(poolKey, slotCount)
+
+	// Pick an uninitialized slot for session init, or an initialized one if all done.
+	sessionID := PickSessionID(poolKey)
+
+	// Fire session init requests and mark the slot as initialized only on success.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
-		deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
-		e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID)
+		if e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth)) {
+			MarkSessionInitialized(poolKey, sessionID)
+		}
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	// originalPayloadSource := req.Payload
+	// if len(opts.OriginalRequest) > 0 {
+	// 	originalPayloadSource = opts.OriginalRequest
+	// }
+	// originalPayload := originalPayloadSource
+	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return nil, err
-	}
+	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
+	body, _ = sjson.SetBytes(body, "temperature", 1)
 
-	// Always regenerate system[0] (billing header) and system[1] (agent block)
-	// to ensure version consistency with our template, regardless of cloaking.
-	if !isHaikuModel(baseModel) {
-		oauthMode := isClaudeOAuthToken(apiKey)
-		body = checkSystemInstructionsWithMode(body, false, oauthMode, stablePoolKey(auth, apiKey))
-	}
+	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// Always regenerate system[0]/[1] for all models including Haiku.
+	oauthMode := isClaudeOAuthToken(apiKey)
+	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
@@ -378,24 +409,31 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
-
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
-
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
+	var poolSessionID string
+	body, poolSessionID, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	if err != nil {
+		return
+	}
+	if poolSessionID != "" {
+		defer ReleaseSessionSlot(poolKey, poolSessionID)
 	}
 
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	body = enforceCacheControlLimit(body, 4)
+	// requestedModel := payloadRequestedModel(opts, req.Model)
+	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	body = normalizeCacheControlTTL(body)
+	// // Disable thinking if tool_choice forces tool use (Anthropic API constraint)
+	// body = disableThinkingIfToolChoiceForced(body)
+
+	// // Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
+	// if countCacheControls(body) == 0 {
+	// 	body = ensureCacheControl(body)
+	// }
+
+	// // Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
+	// body = enforceCacheControlLimit(body, 4)
+
+	// // Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+	// body = normalizeCacheControlTTL(body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -471,6 +509,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		return nil, err
 	}
+	// Send CLI telemetry events on successful stream start.
+	if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) {
+		_, _, orgUUID, email := extractAuthIdentity(auth, apiKey)
+		e.telemetryEmitter.EmitForMessage(apiKey, apiKey, true, baseModel, email, TelemetryIdentity{
+			DeviceID:         deviceID,
+			AccountUUID:      accountUUID,
+			OrganizationUUID: orgUUID,
+		})
+	}
+
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -480,17 +528,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}()
 
-		// Observer caches thinking signatures from the response stream.
-		sigObserver := newStreamSignatureObserver(sessionID, stablePoolKey(auth, apiKey))
-
 		// If from == to (Claude → Claude), directly forward the SSE stream without translation
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
 				line := scanner.Bytes()
-				sigObserver.ObserveLine(line)
-				appendAPIResponseChunk(ctx, e.cfg, line)
+		appendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := parseClaudeStreamUsage(line); ok {
 					reporter.publish(ctx, detail)
 				}
@@ -517,8 +561,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			sigObserver.ObserveLine(line)
-			appendAPIResponseChunk(ctx, e.cfg, line)
+appendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := parseClaudeStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
 			}
@@ -563,13 +606,12 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	if !isHaikuModel(baseModel) {
-		body = checkSystemInstructions(body)
-	}
+	body = checkSystemInstructions(body)
+	body = finalizeBillingHeader(body)
 
-	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
-	body = enforceCacheControlLimit(body, 4)
-	body = normalizeCacheControlTTL(body)
+	// // Keep count_tokens requests compatible with Anthropic cache-control constraints too.
+	// body = enforceCacheControlLimit(body, 4)
+	// body = normalizeCacheControlTTL(body)
 
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
@@ -872,7 +914,8 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 }
 
 // isHaikuModel returns true for all Haiku model variants (3.5 and 4.5).
-// Real CLI skips system prompt injection and adaptive thinking for Haiku.
+// Real CLI sends full system prompt for Haiku but skips deferred-tools,
+// adaptive thinking, and effort injection.
 func isHaikuModel(model string) bool {
 	return strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-haiku-4-5")
 }
@@ -897,13 +940,14 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		hd = cfg.ClaudeHeaderDefaults
 	}
 
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	// Real CLI uses Authorization: Bearer for OAuth tokens, x-api-key for API keys.
+	// Determine auth style by token prefix, not by which field it was configured in.
+	if isClaudeOAuthToken(apiKey) {
+		r.Header.Del("x-api-key")
+		r.Header.Set("Authorization", "Bearer "+apiKey)
+	} else if apiKey != "" {
 		r.Header.Del("Authorization")
 		r.Header.Set("x-api-key", apiKey)
-	} else {
-		r.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	r.Header.Set("Content-Type", "application/json")
 
@@ -913,7 +957,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	// Build Anthropic-Beta dynamically based on request body content,
-	// matching real Claude CLI 2.1.83 behavior observed via MITM capture.
+	// matching real Claude CLI 2.1.84 behavior observed via MITM capture.
 	betaSet := make(map[string]bool)
 	addBeta := func(b string) { betaSet[b] = true }
 
@@ -934,10 +978,14 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if gjson.GetBytes(body, "output_config.format.type").String() == "json_schema" {
 		addBeta("structured-outputs-2025-12-15")
 	}
-	if gjson.GetBytes(body, "context_management").Exists() {
+	// Real CLI 2.1.84 always includes context-management beta for non-haiku models,
+	// even when the body has no context_management field (MITM capture confirmed).
+	if gjson.GetBytes(body, "context_management").Exists() || !isHaikuModel(model) {
 		addBeta("context-management-2025-06-27")
 	}
-	if modelSupports1MContext(model) {
+	// Real CLI 2.1.84 always includes context-1m beta for Opus 4.6 (MITM capture confirmed).
+	// Also add it when model explicitly requests 1M via [1m] suffix or X-CPA-CLAUDE-1M header.
+	if modelSupports1MContext(model) || strings.Contains(model, "opus-4-6") {
 		addBeta("context-1m-2025-08-07")
 	}
 
@@ -982,7 +1030,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	for b := range betaSet {
 		betas = append(betas, b)
 	}
-	// Use exact header casing from real CLI MITM capture (2.1.83).
+	// Use exact header casing from real CLI MITM capture (2.1.84).
 	// Go's r.Header.Set() canonicalizes keys (e.g. "anthropic-beta" → "Anthropic-Beta"),
 	// so we bypass it with direct map assignment r.Header["key"] = []string{val}.
 	// For HTTP/2 this doesn't matter (all keys lowercased on wire), but for HTTP/1.1
@@ -1007,16 +1055,28 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	setRaw("X-Stainless-OS", hdrDefault(hd.Os, mapStainlessOS()))
 	setRaw("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 
-	// Standard HTTP headers: Title-Case (matches Node.js HTTP/1.1)
-	r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.83 (external, cli)"))
-	r.Header.Set("Connection", "keep-alive")
+	// Standard HTTP headers matching real CLI 2.1.84 MITM capture.
+	// Accept is Title-Case; the rest are lowercase in real Bun wire format.
+	userAgent := hdrDefault(hd.UserAgent, "claude-cli/2.1.85 (external, cli)")
+	clientReqID := uuid.New().String()
+	r.Header.Set("User-Agent", userAgent)
 	r.Header.Set("Accept", "application/json")
-	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	setRaw("accept-encoding", "gzip, deflate, br, zstd")
+	setRaw("accept-language", "*")
+	setRaw("sec-fetch-mode", "cors")
+	setRaw("connection", "keep-alive")
+	// Real CLI 2.1.84 sends x-client-request-id (UUID v4) with every /v1/messages request.
+	setRaw("x-client-request-id", clientReqID)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+
+	log.Infof("[cloaking] headers: User-Agent=%s anthropic-beta=%s x-client-request-id=%s X-Stainless-Package-Version=%s X-Stainless-Runtime-Version=%s X-Stainless-OS=%s X-Stainless-Arch=%s",
+		userAgent, strings.Join(betas, ","), clientReqID,
+		r.Header["X-Stainless-Package-Version"], r.Header["X-Stainless-Runtime-Version"],
+		r.Header["X-Stainless-OS"], r.Header["X-Stainless-Arch"])
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1063,9 +1123,11 @@ func extractAuthIdentity(auth *cliproxyauth.Auth, apiKey string) (deviceID, acco
 	deviceID = DeriveDeviceID(apiKey)
 	accountUUID = DeriveAccountUUID(apiKey)
 	orgUUID = DeriveOrganizationUUID(apiKey)
+	fromMeta := false
 	if auth != nil && auth.Metadata != nil {
 		if v, ok := auth.Metadata["device_id"].(string); ok && v != "" {
 			deviceID = v
+			fromMeta = true
 		}
 		if v, ok := auth.Metadata["account_uuid"].(string); ok && v != "" {
 			accountUUID = v
@@ -1076,6 +1138,15 @@ func extractAuthIdentity(auth *cliproxyauth.Auth, apiKey string) (deviceID, acco
 		if v, ok := auth.Metadata["email"].(string); ok && v != "" {
 			email = v
 		}
+	}
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	if fromMeta {
+		log.Infof("[claude-identity] auth=%s device_id=%s account_uuid=%s org_uuid=%s (from auth metadata)", authID, deviceID, accountUUID, orgUUID)
+	} else {
+		log.Warnf("[claude-identity] auth=%s device_id=%s account_uuid=%s org_uuid=%s (derived from key — consider setting device_id/account_uuid in auth config)", authID, deviceID, accountUUID, orgUUID)
 	}
 	return
 }
@@ -1347,30 +1418,138 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 // injectFakeUserID replaces metadata.user_id with a generated identity.
 // poolKey is a stable identifier (e.g. auth.ID) used to key the session pool,
 // NOT the volatile OAuth access_token which changes on refresh.
-func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string) []byte {
-	generateID := func() string {
-		if useCache {
-			return cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, "")
+// injectFakeUserID returns the modified payload and the pool sessionID for release.
+func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string, slotCount int) ([]byte, string, error) {
+	var uid string
+	var pickedSessionID string
+	if useCache {
+		uid, pickedSessionID = cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, "", slotCount)
+		if uid == "" {
+			return payload, "", fmt.Errorf("session pool timeout: all slots busy")
 		}
-		return generateFakeUserID()
+	} else {
+		uid = generateFakeUserID()
 	}
 
-	payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-	return payload
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", uid)
+	log.Infof("[claude-identity] metadata.user_id=%s", uid)
+	return payload, pickedSessionID, nil
 }
 
-// generateBillingHeader creates the x-anthropic-billing-header text block that
-// real Claude Code prepends to every system prompt array.
-// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=cli; cch=<hash>;
-//
-// The build hash is a fixed value per CLI version (c50 for 2.1.83).
-// cch is a 5-char hex hash derived from session-specific data.
-func generateBillingHeader(poolKey string) string {
-	const version = "2.1.83"
-	const buildHash = "c50"
+// billingBuildHashSalt is the fixed salt used by real Claude Code CLI
+// to compute the per-request build hash in the billing header.
+// Extracted from cli.js: KM7 = "59cf53e54c78".
+const billingBuildHashSalt = "59cf53e54c78"
 
-	cch := getLastPickedCCH(poolKey)
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
+// billingCLIVersion is the CLI version embedded in the billing header.
+const billingCLIVersion = "2.1.85"
+
+// computeBuildHash computes the 3-char build hash for the billing header.
+// Algorithm (from cli.js _0T): extract chars at positions [4,7,20] from the
+// first user message text, concatenate salt + chars + version, SHA-256 hash,
+// take first 3 hex chars.
+func computeBuildHash(payload []byte) string {
+	text := firstUserMessageText(payload)
+	// JS string indexing operates on UTF-16 code units. For BMP characters
+	// (which covers CJK and most text) this is equivalent to rune indexing.
+	runes := []rune(text)
+	chars := make([]rune, 3)
+	indices := [3]int{4, 7, 20}
+	for i, idx := range indices {
+		if idx < len(runes) {
+			chars[i] = runes[idx]
+		} else {
+			chars[i] = '0'
+		}
+	}
+	input := billingBuildHashSalt + string(chars) + billingCLIVersion
+	h := sha256.Sum256([]byte(input))
+	hash := hex.EncodeToString(h[:])[:3]
+	log.Infof("[billing-debug] firstUserText(runes=%d): %.80s", len(runes), text)
+	log.Infof("[billing-debug] chars=[%c,%c,%c] hash=%s", chars[0], chars[1], chars[2], hash)
+	return hash
+}
+
+// firstUserMessageText extracts the text content of the first non-deferred-tools
+// user message from a Claude API request payload. Matches cli.js OM7 function
+// behavior: the deferred-tools message (messages[0] with <available-deferred-tools>)
+// is skipped; the build hash is computed from the next user message's first text block.
+func firstUserMessageText(payload []byte) string {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return ""
+	}
+	for _, msg := range messages.Array() {
+		if msg.Get("role").String() != "user" {
+			continue
+		}
+		content := msg.Get("content")
+		// String content
+		if content.Type == gjson.String {
+			text := content.String()
+			if strings.Contains(text, "<available-deferred-tools>") {
+				continue // skip deferred-tools message
+			}
+			return text
+		}
+		// Array content: find first text block
+		if content.IsArray() {
+			first := ""
+			for _, block := range content.Array() {
+				if block.Get("type").String() == "text" {
+					first = block.Get("text").String()
+					break
+				}
+			}
+			if strings.Contains(first, "<available-deferred-tools>") {
+				continue // skip deferred-tools message
+			}
+			return first
+		}
+		return ""
+	}
+	return ""
+}
+
+// generateCCH generates a 5-char hex string for the cch field in the billing header.
+// The real CLI 2.1.84 JS source sets cch=00000, but MITM + fake server captures confirm
+// the actual wire value is a non-zero 5-char hex that changes per request.
+// The replacement happens in Bun's native layer (not visible in JS source).
+// We generate a deterministic hash from the request payload to produce realistic,
+// per-request varying values without true randomness.
+func generateCCH(payload []byte) string {
+	h := sha256.Sum256(payload)
+	return hex.EncodeToString(h[:])[:5]
+}
+
+// Billing header placeholder tokens, replaced by finalizeBillingHeader after
+// all message injections (system-reminder, deferred-tools) are complete.
+const (
+	billingBuildHashPlaceholder = "__BH__"
+	billingCCHPlaceholder      = "__CCH__"
+)
+
+// generateBillingHeader creates an x-anthropic-billing-header with placeholder
+// tokens for the build hash and cch. These placeholders are replaced by
+// finalizeBillingHeader once the full payload (including injected system-reminder
+// and deferred-tools) is available.
+func generateBillingHeader() string {
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;",
+		billingCLIVersion, billingBuildHashPlaceholder, billingCCHPlaceholder)
+}
+
+// finalizeBillingHeader replaces the placeholder tokens in system[0] with the
+// real build hash and cch computed from the final payload. Must be called AFTER
+// all message injections (injectCLISystemPrompt, injectCLIDeferredTools, etc.)
+// so that the first user message text matches what the real CLI computes from.
+func finalizeBillingHeader(payload []byte) []byte {
+	buildHash := computeBuildHash(payload)
+	cch := generateCCH(payload)
+	// Replace placeholders in the raw JSON bytes.
+	result := bytes.ReplaceAll(payload, []byte(billingBuildHashPlaceholder), []byte(buildHash))
+	result = bytes.ReplaceAll(result, []byte(billingCCHPlaceholder), []byte(cch))
+	log.Infof("[billing-header] cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", billingCLIVersion, buildHash, cch)
+	return result
 }
 
 // checkSystemInstructionsWithMode injects Claude Code-style system blocks:
@@ -1379,30 +1558,28 @@ func generateBillingHeader(poolKey string) string {
 //	system[1]: agent identifier (cache_control: ephemeral)
 //	system[2..]: user system messages (cache_control added when missing)
 //
-// MITM capture (2.1.83) shows cache_control is {"type":"ephemeral"} without
+// MITM capture (2.1.84) shows cache_control is {"type":"ephemeral"} without
 // ttl for main conversation. The oauthMode param is kept for future use.
 func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool, poolKey string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(poolKey)
+	billingText := generateBillingHeader()
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
-	// Agent block matches real Claude Code v2.1.83 interactive mode system[1].
-	// MITM capture shows system[1] text is "You are Claude Code, Anthropic's
-	// official CLI for Claude." with cache_control:ephemeral (no ttl).
-	agentBlock := `{"type":"text","text":"You are Claude Code, Anthropic\u0027s official CLI for Claude.","cache_control":{"type":"ephemeral"}}`
-
+	agentBlock := `{"type":"text","cache_control":{"type":"ephemeral"},"text":"You are Claude Code, Anthropic's official CLI for Claude."}`
 	if strictMode {
-		// Strict mode: billing header + agent identifier only
+		// Strict mode: billing header + agent block only
 		result := "[" + billingBlock + "," + agentBlock + "]"
 		payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 		return payload
 	}
 
-	// Non-strict mode: billing header + agent identifier + user system messages
-	// Always regenerate to ensure version consistency with our template (2.1.83).
-	// If the client already injected a billing header (e.g. real Claude Code CLI
-	// with a different version), strip it to prevent version mismatch fingerprints.
+	// Non-strict mode: billing header + agent block + user system messages.
+	// Always regenerate billing + agent to ensure version consistency (2.1.84).
+	// Matches MITM capture 20260325_230810 #010 structure:
+	//   system[0]: billing header (no cache_control)
+	//   system[1]: agent identifier (cache_control: ephemeral)
+	//   system[2..]: user system messages (cache_control: ephemeral)
 	result := "[" + billingBlock + "," + agentBlock
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
@@ -1551,7 +1728,7 @@ var cloakingContextManagementNoThinking = []byte(`{"edits":[]}`)
 // The clear_thinking edit is only included when the request has thinking enabled,
 // as Anthropic rejects it otherwise with "clear_thinking_20251015 strategy requires
 // thinking to be enabled or adaptive".
-// Real CLI 2.1.83 does NOT send context_management in early/short conversations;
+// Real CLI 2.1.84 does NOT send context_management in early/short conversations;
 // injecting it unconditionally would be a fingerprint difference.
 func replaceContextManagementForCloaking(payload []byte) []byte {
 	if !gjson.GetBytes(payload, "context_management").Exists() {
@@ -1761,79 +1938,35 @@ func repairToolUsePairing(payload []byte) []byte {
 	return result
 }
 
-// replaceOrStripThinkingSignatures handles thinking blocks in assistant messages.
-// If a cached signature exists for the same session (keyed by thinking text hash),
-// the signature is replaced so the thinking block is preserved — matching real
-// Claude Code CLI behavior. If no cached signature is available, the thinking
-// block is stripped to avoid 400 "Invalid signature in thinking block" errors.
-func replaceOrStripThinkingSignatures(payload []byte, sessionID, poolKey string) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return payload
-	}
-
-	modified := false
-	result := payload
-
-	for i, msg := range messages.Array() {
-		if msg.Get("role").String() != "assistant" {
-			continue
-		}
-		content := msg.Get("content")
-		if !content.Exists() || !content.IsArray() {
-			continue
-		}
-
-		var kept []interface{}
-		changed := false
-		for _, block := range content.Array() {
-			if block.Get("type").String() != "thinking" {
-				kept = append(kept, json.RawMessage(block.Raw))
-				continue
-			}
-
-			thinkingText := block.Get("thinking").String()
-			cachedSig := getSessionSignature(sessionID, poolKey, thinkingText)
-
-			if cachedSig != "" {
-				// Replace signature with cached version from same session
-				updated, _ := sjson.SetBytes([]byte(block.Raw), "signature", cachedSig)
-				kept = append(kept, json.RawMessage(updated))
-				changed = true
-			} else {
-				// No cached signature — strip thinking block
-				changed = true
-			}
-		}
-
-		if changed {
-			modified = true
-			path := fmt.Sprintf("messages.%d.content", i)
-			result, _ = sjson.SetBytes(result, path, kept)
-		}
-	}
-
-	if !modified {
-		return payload
-	}
-	return result
+// cliMaxTokens maps model IDs to the max_tokens values that real Claude Code CLI
+// sends. These are hardcoded to match observed MITM captures and must be updated
+// when real CLI behavior changes. Using the registry is unreliable because models
+// may have multiple entries with different providers/values.
+var cliMaxTokens = map[string]int{
+	"claude-opus-4-6":           64000,
+	"claude-sonnet-4-6":         32000,
+	"claude-sonnet-4-20250514":  16000,
+	"claude-haiku-4-5-20251001": 32000,
 }
 
-// normalizeMaxTokensForCloaking ensures max_tokens matches the model's default value
-// when cloaking is active. Real Claude Code CLI always sends model-appropriate max_tokens
-// (e.g. 128000 for Opus 4.6, 64000 for Sonnet 4.6). A fixed value like 8192 across all
-// models is a detectable fingerprint. This function replaces missing or non-matching
-// max_tokens with the model's max_completion_tokens from the registry.
+// normalizeMaxTokensForCloaking ensures max_tokens matches the value that real
+// Claude Code CLI sends for each model. A mismatched value (e.g. 8192 for all
+// models) is a detectable fingerprint.
 func normalizeMaxTokensForCloaking(payload []byte, model string) []byte {
-	modelInfo := registry.LookupModelInfo(model, "claude")
-	if modelInfo == nil || modelInfo.MaxCompletionTokens <= 0 {
-		return payload
+	expected, ok := cliMaxTokens[model]
+	if !ok {
+		// Unknown model: fall back to registry
+		modelInfo := registry.LookupModelInfo(model, "claude")
+		if modelInfo == nil || modelInfo.MaxCompletionTokens <= 0 {
+			return payload
+		}
+		expected = modelInfo.MaxCompletionTokens
 	}
-	expected := modelInfo.MaxCompletionTokens
 	current := gjson.GetBytes(payload, "max_tokens")
 	if current.Exists() && int(current.Int()) == expected {
 		return payload
 	}
+	log.Infof("[cloaking] max_tokens: %v -> %d", current.Value(), expected)
 	result, err := sjson.SetBytes(payload, "max_tokens", expected)
 	if err != nil {
 		return payload
@@ -1843,7 +1976,8 @@ func normalizeMaxTokensForCloaking(payload []byte, model string) []byte {
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
-func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string, sessionID string) []byte {
+// applyCloaking returns the cloaked payload, the pool sessionID to release, and an error on timeout.
+func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string, sessionID string) ([]byte, string, error) {
 	clientUserAgent := getClientUserAgent(ctx)
 
 	// Get cloak config from ClaudeKey configuration
@@ -1882,24 +2016,23 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		cacheUserID = attrCache
 	}
 
-	// OAuth tokens always cloak: even real Claude Code CLI requests must be
-	// sanitized to prevent the upstream from correlating proxy users.
+	// OAuth tokens default to no cloaking. Set cloak_mode to "always" or
+	// "auto" in auth attributes or config to re-enable cloaking for OAuth.
 	if cloakMode == "auto" && isClaudeOAuthToken(apiKey) {
 		cloakMode = "always"
 	}
 
 	// Determine if cloaking should be applied
 	if !shouldCloak(cloakMode, clientUserAgent) {
-		return payload
+		// Even without cloaking, billing header placeholders must be resolved
+		// since checkSystemInstructionsWithMode already injected them.
+		payload = finalizeBillingHeader(payload)
+		return payload, "", nil
 	}
 
 	// Strip non-standard top-level fields and sanitize metadata to prevent
 	// upstream proxies from injecting identifiable fields into the request body.
 	payload = stripNonStandardFields(payload)
-
-	// Replace thinking block signatures with cached versions from the same session,
-	// or strip thinking blocks if no cached signature is available.
-	payload = replaceOrStripThinkingSignatures(payload, sessionID, stablePoolKey(auth, apiKey))
 
 	// Normalize max_tokens to match the model's default when cloaking is active.
 	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default
@@ -1910,34 +2043,46 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Note: system[0]/[1] injection is now handled in Execute/ExecuteStream
 	// before applyCloaking, so it applies to all requests regardless of cloaking.
 	// In strict mode, strip user system messages and keep only billing + agent blocks.
-	if strictMode && !isHaikuModel(model) {
+	if strictMode {
 		payload = checkSystemInstructionsWithMode(payload, true, true, stablePoolKey(auth, apiKey))
 	}
 
 	// Inject the full Claude Code CLI system prompt as system[2] and migrate
 	// any extra system messages into the first user message as <system-reminder>.
-	// Real CLI always sends exactly 3 system blocks; extra blocks are a fingerprint.
+	// Real CLI always sends exactly 3 system blocks for all models including Haiku.
 	oauthMode := isClaudeOAuthToken(apiKey)
+	payload = injectCLISystemPrompt(payload, model, oauthMode)
+
+	// Inject deferred-tools user message and ToolSearch tool to match real CLI.
+	// MITM captures confirm Haiku requests do NOT have deferred-tools message,
+	// while opus/sonnet requests always start with <available-deferred-tools>.
 	if !isHaikuModel(model) {
-		payload = injectCLISystemPrompt(payload, model, oauthMode)
-		// Inject deferred-tools user message and ToolSearch tool to match real
-		// CLI behavior. Every request from Claude Code CLI starts with a
-		// <available-deferred-tools> user message and includes ToolSearch.
 		payload = injectCLIDeferredTools(payload)
 	}
+	log.Infof("[cloaking] injected: system-prompt=%t deferred-tools=%t system-reminders=%t model=%s",
+		true, !isHaikuModel(model), true, model)
 
-	// Inject thinking and output_config to match real CLI defaults.
-	// Real Claude Code CLI always sends thinking:{type:"adaptive"} and
-	// output_config:{effort:"medium"}. Adaptive thinking is only supported
-	// on Claude 4.6 models (opus-4-6, sonnet-4-6). Older models (sonnet-4,
-	// claude-3-5-*) will reject adaptive thinking with 400 errors.
+	// Match real CLI 2.1.84 behavior: only output_config.effort, no thinking field.
+	// MITM captures confirm real CLI never sends thinking for opus-4-6 or sonnet-4-6.
+	// If client sends thinking, convert it to an appropriate effort level and remove it.
 	if supportsAdaptiveThinking(model) {
-		if !gjson.GetBytes(payload, "thinking").Exists() {
-			payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
-		}
-		if !gjson.GetBytes(payload, "output_config").Exists() {
+		thinkingRemoved := false
+		effortInjected := false
+		if gjson.GetBytes(payload, "thinking").Exists() {
+			// Map client's thinking to effort if client didn't set output_config
+			if !gjson.GetBytes(payload, "output_config").Exists() {
+				effort := thinkingToEffort(payload)
+				payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"`+effort+`"}`))
+				effortInjected = true
+			}
+			payload, _ = sjson.DeleteBytes(payload, "thinking")
+			thinkingRemoved = true
+		} else if !gjson.GetBytes(payload, "output_config").Exists() {
 			payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
+			effortInjected = true
 		}
+		log.Infof("[cloaking] output_config: effort=%s (injected=%t) thinking: removed=%t",
+			gjson.GetBytes(payload, "output_config.effort").String(), effortInjected, thinkingRemoved)
 	}
 
 	// Replace context_management with the standard CLI value during cloaking.
@@ -1958,7 +2103,16 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 			realAccountUUID = v
 		}
 	}
-	payload = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID)
+	var poolSessionID string
+	var injectErr error
+	slotCount := 0
+	if auth != nil {
+		slotCount = auth.MaxConcurrent()
+	}
+	payload, poolSessionID, injectErr = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID, slotCount)
+	if injectErr != nil {
+		return payload, "", injectErr
+	}
 
 	// Inject standard CLI tools if client didn't send any.
 	payload = injectDefaultToolsIfMissing(payload)
@@ -1969,7 +2123,11 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = obfuscateSensitiveWords(payload, matcher)
 	}
 
-	return payload
+	// Replace billing header placeholders with real build hash and cch now
+	// that all injections (system-reminder, deferred-tools, etc.) are done.
+	payload = finalizeBillingHeader(payload)
+
+	return payload, poolSessionID, nil
 }
 
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.

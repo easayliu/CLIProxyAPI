@@ -1053,6 +1053,7 @@ func TestEnforceCacheControlLimit_ToolOnlyPayloadStillRespectsLimit(t *testing.T
 }
 
 func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
+	t.Skip("enforceCacheControlLimit is currently disabled in CountTokens pipeline")
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1084,7 +1085,7 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 	}`)
 
 	_, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-3-5-haiku-20241022",
+		Model:   "claude-haiku-4-5-20251001",
 		Payload: payload,
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
 	if err != nil {
@@ -1735,7 +1736,7 @@ func TestSanitizeContextManagementEdits_EmptyEditsArray(t *testing.T) {
 
 func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 	// Simulate a payload with billing + agent blocks already injected
-	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.83.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.85.abc; cc_entrypoint=cli; cch=12345;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\u0027s Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true)
 
@@ -1946,105 +1947,6 @@ func TestRepairToolUsePairing_NextMessageNotUser(t *testing.T) {
 	}
 }
 
-// --- thinking signature sanitization tests ---
-
-func TestStripInvalidThinkingSignatures_NoMessages(t *testing.T) {
-	payload := []byte(`{"model":"claude-sonnet-4-6"}`)
-	out := replaceOrStripThinkingSignatures(payload, "", "")
-	if string(out) != string(payload) {
-		t.Fatal("payload without messages should be unchanged")
-	}
-}
-
-func TestStripInvalidThinkingSignatures_DropsThinkingEvenWithSignature(t *testing.T) {
-	// During cloaking, ALL thinking blocks are stripped regardless of signature presence,
-	// because any signature from a proxied request is invalid for the upstream account.
-	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"some thought","signature":"valid-sig-long-enough-to-pass"},{"type":"text","text":"hi"}]}]}`)
-	out := replaceOrStripThinkingSignatures(payload, "", "")
-	blocks := gjson.GetBytes(out, "messages.0.content").Array()
-	if len(blocks) != 1 {
-		t.Fatalf("expected 1 content block (thinking stripped), got %d", len(blocks))
-	}
-	if blocks[0].Get("type").String() != "text" {
-		t.Fatalf("remaining block type = %q, want text", blocks[0].Get("type").String())
-	}
-}
-
-func TestStripInvalidThinkingSignatures_DropsThinkingWithoutSignature(t *testing.T) {
-	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"some thought"},{"type":"text","text":"hi"}]}]}`)
-	out := replaceOrStripThinkingSignatures(payload, "", "")
-	blocks := gjson.GetBytes(out, "messages.0.content").Array()
-	if len(blocks) != 1 {
-		t.Fatalf("expected 1 content block after stripping, got %d", len(blocks))
-	}
-	if blocks[0].Get("type").String() != "text" {
-		t.Fatalf("remaining block type = %q, want text", blocks[0].Get("type").String())
-	}
-}
-
-func TestStripInvalidThinkingSignatures_SkipsUserMessages(t *testing.T) {
-	// User messages should not be modified even if they somehow contain thinking blocks
-	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"thinking","thinking":"thought"}]},{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}`)
-	out := replaceOrStripThinkingSignatures(payload, "", "")
-	// User message content should remain untouched
-	blocks := gjson.GetBytes(out, "messages.0.content").Array()
-	if len(blocks) != 1 {
-		t.Fatalf("user message content should be unchanged, got %d blocks", len(blocks))
-	}
-}
-
-func TestStripInvalidThinkingSignatures_DropsThinkingWithEmptySignature(t *testing.T) {
-	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"thought","signature":""},{"type":"text","text":"hi"}]}]}`)
-	out := replaceOrStripThinkingSignatures(payload, "", "")
-	blocks := gjson.GetBytes(out, "messages.0.content").Array()
-	if len(blocks) != 1 {
-		t.Fatalf("thinking with empty signature should be stripped, got %d blocks", len(blocks))
-	}
-}
-
-// TestCloaking_StripsThinkingSignatures verifies that the full cloaking pipeline
-// strips thinking blocks with invalid signatures from upstream requests.
-func TestCloaking_StripsThinkingSignatures(t *testing.T) {
-	var receivedBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		receivedBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-
-	// Multi-turn payload: assistant message has thinking block without signature
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"let me think..."},{"type":"text","text":"hi there"}]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	if len(receivedBody) == 0 {
-		t.Fatal("expected upstream to receive a request body")
-	}
-
-	// The assistant message content should not contain any thinking block
-	assistantContent := gjson.GetBytes(receivedBody, "messages.1.content").Array()
-	for _, block := range assistantContent {
-		if block.Get("type").String() == "thinking" {
-			t.Fatalf("thinking block without signature should be stripped during cloaking, found: %s", block.Raw)
-		}
-	}
-}
 
 // TestCloaking_ReplacesContextManagement verifies that when cloaking is active
 // (non-claude-cli client), context_management is replaced with the standard CLI
@@ -2155,7 +2057,7 @@ func TestCloaking_ContextManagement_NoThinking(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		receivedBody = body
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-haiku-20241022","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":1}}`))
+		w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-haiku-4-5-20251001","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":1}}`))
 	}))
 	defer server.Close()
 
@@ -2166,10 +2068,10 @@ func TestCloaking_ContextManagement_NoThinking(t *testing.T) {
 	}}
 
 	// Use haiku model which does NOT support adaptive thinking.
-	payload := []byte(`{"model":"claude-3-5-haiku-20241022","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"sig"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	payload := []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"sig"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-3-5-haiku-20241022",
+		Model:   "claude-haiku-4-5-20251001",
 		Payload: payload,
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("claude"),

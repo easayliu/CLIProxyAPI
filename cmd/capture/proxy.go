@@ -24,8 +24,7 @@ import (
 )
 
 const (
-	proxyAddr     = "127.0.0.1:19877"
-	upstreamProxy = "http://127.0.0.1:6152"
+	proxyAddr = "127.0.0.1:19877"
 )
 
 var proxyDumpDir string
@@ -53,11 +52,18 @@ func runHTTPProxy() {
 	var counter atomic.Int64
 	var mu sync.Mutex
 
-	// Build HTTP client with upstream proxy
-	proxyURL, _ := url.Parse(upstreamProxy)
+	// Build HTTP client, optionally with upstream proxy
 	upstreamTransport := &http.Transport{
-		Proxy:           http.ProxyURL(proxyURL),
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	if envProxy := os.Getenv("CAPTURE_UPSTREAM_PROXY"); envProxy != "" {
+		proxyURL, err := url.Parse(envProxy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid CAPTURE_UPSTREAM_PROXY %q: %v\n", envProxy, err)
+			os.Exit(1)
+		}
+		upstreamTransport.Proxy = http.ProxyURL(proxyURL)
+		fmt.Printf("Upstream proxy: %s\n", envProxy)
 	}
 	upstreamClient := &http.Client{Transport: upstreamTransport}
 
@@ -75,6 +81,9 @@ func runHTTPProxy() {
 	fmt.Printf("  HTTP_PROXY=http://%s HTTPS_PROXY=http://%s \\\n", proxyAddr, proxyAddr)
 	fmt.Println("  NODE_TLS_REJECT_UNAUTHORIZED=0 \\")
 	fmt.Println("  claude -p \"say hi\"")
+	fmt.Println()
+	fmt.Println("Optional: set CAPTURE_UPSTREAM_PROXY to chain through another proxy, e.g.:")
+	fmt.Println("  CAPTURE_UPSTREAM_PROXY=http://127.0.0.1:6152 go run ./cmd/capture httpproxy")
 	fmt.Println()
 	fmt.Printf("Dumps: %s/\n", proxyDumpDir)
 	fmt.Println("Press Ctrl+C to stop")
@@ -194,10 +203,15 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tlsConn.Close()
 
-	// Read the actual HTTPS request from the client
-	clientReader := bufio.NewReader(tlsConn)
+	// Read the actual HTTPS request from the client.
+	// Wrap with rawCapture to record raw bytes before Go's HTTP parser
+	// canonicalizes header names (e.g. "accept" → "Accept").
+	rawBuf := &rawCapture{}
+	teeReader := io.TeeReader(tlsConn, rawBuf)
+	clientReader := bufio.NewReader(teeReader)
 
 	for {
+		rawBuf.Reset()
 		req, err := http.ReadRequest(clientReader)
 		if err != nil {
 			if err != io.EOF {
@@ -205,6 +219,9 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+
+		// Capture raw header bytes BEFORE body is read.
+		rawHeaderBytes := rawBuf.Bytes()
 
 		seq := p.counter.Add(1)
 		ts := time.Now()
@@ -215,8 +232,11 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			reqBody, _ = io.ReadAll(req.Body)
 		}
 
+		// Extract raw headers from the captured bytes (preserving original casing)
+		rawHeaders := extractRawHeaders(rawHeaderBytes)
+
 		fullURL := fmt.Sprintf("https://%s%s", host, req.URL.RequestURI())
-		p.logRequest(seq, ts, req.Method, fullURL, req.Header, reqBody)
+		p.logRequestWithRaw(seq, ts, req.Method, fullURL, req.Header, rawHeaders, reqBody)
 
 		// Forward to real server
 		outReq, _ := http.NewRequest(req.Method, fullURL, strings.NewReader(string(reqBody)))
@@ -260,8 +280,44 @@ func (p *httpProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_, _ = tlsConn.Write([]byte(respBuf.String()))
 		_, _ = tlsConn.Write(respBody)
 
-		p.logResponse(seq, ts, req.Method, fullURL, req.Header, reqBody, resp, respBody)
+		p.logResponseWithRaw(seq, ts, req.Method, fullURL, req.Header, rawHeaders, reqBody, resp, respBody)
 	}
+}
+
+// rawCapture accumulates bytes written via TeeReader.
+type rawCapture struct {
+	buf []byte
+}
+
+func (r *rawCapture) Write(p []byte) (int, error) {
+	r.buf = append(r.buf, p...)
+	return len(p), nil
+}
+
+func (r *rawCapture) Bytes() []byte { return r.buf }
+func (r *rawCapture) Reset()        { r.buf = r.buf[:0] }
+
+// extractRawHeaders parses raw HTTP/1.x bytes and returns header lines
+// with their original casing preserved (before Go's canonical formatting).
+func extractRawHeaders(raw []byte) map[string]string {
+	headers := make(map[string]string)
+	lines := strings.Split(string(raw), "\r\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue // skip request line (GET /path HTTP/1.1)
+		}
+		if line == "" {
+			break // end of headers
+		}
+		idx := strings.IndexByte(line, ':')
+		if idx < 0 {
+			continue
+		}
+		key := line[:idx]
+		val := strings.TrimSpace(line[idx+1:])
+		headers[key] = val
+	}
+	return headers
 }
 
 func (p *httpProxy) logRequest(seq int64, ts time.Time, method, url string, headers http.Header, body []byte) {
@@ -309,14 +365,64 @@ func (p *httpProxy) logRequest(seq int64, ts time.Time, method, url string, head
 	}
 }
 
+// logRequestWithRaw prints request with raw (original casing) headers.
+func (p *httpProxy) logRequestWithRaw(seq int64, ts time.Time, method, url string, _ http.Header, rawHeaders map[string]string, body []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	fmt.Printf("\n%s\n", strings.Repeat("=", 70))
+	fmt.Printf("[#%d] %s  %s %s  (%d bytes)\n", seq, ts.Format("15:04:05.000"), method, url, len(body))
+	fmt.Printf("%s\n", strings.Repeat("=", 70))
+
+	fmt.Println("  --- Raw Headers (original casing) ---")
+	for k, v := range rawHeaders {
+		kl := strings.ToLower(k)
+		display := v
+		if kl == "authorization" || kl == "x-api-key" {
+			if len(display) > 20 {
+				display = display[:20] + "..."
+			}
+		}
+		fmt.Printf("    %s: %s\n", k, display)
+	}
+
+	if len(body) > 0 {
+		var d map[string]interface{}
+		if json.Unmarshal(body, &d) == nil {
+			fmt.Printf("  --- Body (%d bytes, JSON) ---\n", len(body))
+			if m, ok := d["model"]; ok {
+				fmt.Printf("    model: %v\n", m)
+			}
+		}
+	}
+}
+
+// logResponse saves response with canonical (Go-formatted) headers for HTTP path.
 func (p *httpProxy) logResponse(seq int64, ts time.Time, method, url string, reqHeaders http.Header, reqBody []byte, resp *http.Response, respBody []byte) {
+	p.logResponseWithRaw(seq, ts, method, url, reqHeaders, headerMap(reqHeaders), reqBody, resp, respBody)
+}
+
+// logResponseWithRaw saves response with raw request headers preserved.
+func (p *httpProxy) logResponseWithRaw(seq int64, ts time.Time, method, url string, _ http.Header, rawHeaders map[string]string, reqBody []byte, resp *http.Response, respBody []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	elapsed := time.Since(ts)
 	fmt.Printf("[#%d] RESPONSE: %d (%d bytes, %.1fs)\n", seq, resp.StatusCode, len(respBody), elapsed.Seconds())
 
-	// Save to file
+	// Redact auth tokens in raw headers for file output
+	safeRaw := make(map[string]string, len(rawHeaders))
+	for k, v := range rawHeaders {
+		kl := strings.ToLower(k)
+		if kl == "authorization" || kl == "x-api-key" {
+			if len(v) > 20 {
+				v = v[:20] + "..."
+			}
+		}
+		safeRaw[k] = v
+	}
+
+	// Save to file with raw headers (original casing)
 	dump := map[string]interface{}{
 		"seq":       seq,
 		"timestamp": ts.Format(time.RFC3339Nano),
@@ -324,7 +430,7 @@ func (p *httpProxy) logResponse(seq int64, ts time.Time, method, url string, req
 		"request": map[string]interface{}{
 			"method":  method,
 			"url":     url,
-			"headers": headerMap(reqHeaders),
+			"headers": safeRaw,
 		},
 		"response": map[string]interface{}{
 			"status":  resp.StatusCode,

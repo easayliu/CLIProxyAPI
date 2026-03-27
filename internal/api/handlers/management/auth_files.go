@@ -480,9 +480,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
-	// Expose rpm limit from Metadata for management dashboard display.
+	// Expose rpm limit and max_concurrent from Metadata for management dashboard display.
 	if rpm := auth.RPMLimit(); rpm > 0 {
 		entry["rpm"] = rpm
+	}
+	if mc := auth.MaxConcurrent(); mc > 0 {
+		entry["max_concurrent"] = mc
 	}
 	// Expose quota state so management dashboards can display it.
 	if auth.Quota.Exceeded || auth.Quota.Reason != "" || !auth.Quota.NextRecoverAt.IsZero() {
@@ -1188,11 +1191,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name          string  `json:"name"`
+		Prefix        *string `json:"prefix"`
+		ProxyURL      *string `json:"proxy_url"`
+		Priority      *int    `json:"priority"`
+		Note          *string `json:"note"`
+		RPM           *int    `json:"rpm"`
+		MaxConcurrent *int    `json:"max_concurrent"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1235,7 +1240,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		targetAuth.ProxyURL = *req.ProxyURL
 		changed = true
 	}
-	if req.Priority != nil || req.Note != nil {
+	if req.Priority != nil || req.Note != nil || req.RPM != nil || req.MaxConcurrent != nil {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
@@ -1260,6 +1265,20 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			} else {
 				targetAuth.Metadata["note"] = trimmedNote
 				targetAuth.Attributes["note"] = trimmedNote
+			}
+		}
+		if req.RPM != nil {
+			if *req.RPM <= 0 {
+				delete(targetAuth.Metadata, "rpm")
+			} else {
+				targetAuth.Metadata["rpm"] = *req.RPM
+			}
+		}
+		if req.MaxConcurrent != nil {
+			if *req.MaxConcurrent <= 0 {
+				delete(targetAuth.Metadata, "max_concurrent")
+			} else {
+				targetAuth.Metadata["max_concurrent"] = *req.MaxConcurrent
 			}
 		}
 		changed = true

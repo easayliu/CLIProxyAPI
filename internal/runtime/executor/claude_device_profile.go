@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"net/http"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +15,7 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.83 (external, cli)"
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.85 (external, cli)"
 	defaultClaudeFingerprintPackageVersion = "0.74.0"
 	defaultClaudeFingerprintRuntimeVersion = "v24.3.0"
 	defaultClaudeFingerprintOS             = "MacOS"
@@ -112,34 +111,14 @@ func defaultClaudeDeviceProfile(cfg *config.Config) claudeDeviceProfile {
 	return profile
 }
 
-// mapStainlessOS maps runtime.GOOS to Stainless SDK OS names.
+// mapStainlessOS returns a fixed macOS identifier regardless of the actual OS.
 func mapStainlessOS() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "MacOS"
-	case "windows":
-		return "Windows"
-	case "linux":
-		return "Linux"
-	case "freebsd":
-		return "FreeBSD"
-	default:
-		return "Other::" + runtime.GOOS
-	}
+	return "MacOS"
 }
 
-// mapStainlessArch maps runtime.GOARCH to Stainless SDK architecture names.
+// mapStainlessArch returns a fixed arm64 identifier regardless of the actual architecture.
 func mapStainlessArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x64"
-	case "arm64":
-		return "arm64"
-	case "386":
-		return "x86"
-	default:
-		return "other::" + runtime.GOARCH
-	}
+	return "arm64"
 }
 
 func parseClaudeCLIVersion(userAgent string) (claudeCLIVersion, bool) {

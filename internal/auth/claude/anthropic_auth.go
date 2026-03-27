@@ -246,7 +246,7 @@ func applyOAuthRequestHeaders(req *http.Request) {
 	// Real Claude Code CLI token exchange uses axios defaults — only
 	// Content-Type and User-Agent, no Stainless or Accept headers.
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "axios/1.13.4")
+	req.Header.Set("User-Agent", "axios/1.13.6")
 }
 
 // RefreshTokens refreshes the access token using the refresh token.

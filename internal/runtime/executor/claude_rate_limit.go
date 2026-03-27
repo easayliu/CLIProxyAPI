@@ -8,19 +8,17 @@ import (
 )
 
 const (
-	// rpmWaitTimeout is the maximum time to block waiting for an RPM slot.
-	// Claude Code streaming requests can be long-lived, so 30s is reasonable
-	// for the client to wait before we give up.
-	rpmWaitTimeout = 30 * time.Second
+	// defaultRPM is the default RPM limit per auth when not configured.
+	// A real CLI user averages ~0.5 RPM with bursts up to 4-6 during retries.
+	// Setting 2 allows normal usage while preventing detectable high-frequency patterns.
+	// Override via auth file metadata "rpm" for higher throughput.
+	defaultRPM = 2
 )
 
 // checkClaudeRateLimit enforces per-auth RPM (requests per minute) limit.
-// Instead of returning 429 (which triggers cooldown cascades in the conductor),
-// it blocks until a slot opens within the sliding window.
-// Returns nil when the request may proceed, or a context-style error on timeout.
-//
-// The request is recorded in the global RPM tracker so that the RPM-aware
-// selector can see real-time load when picking the next auth.
+// Defaults to 2 RPM when not configured, matching real CLI usage patterns.
+// Returns 429 immediately when exceeded so the conductor can failover
+// to the next auth without delay.
 func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 	if auth == nil {
 		return nil
@@ -33,20 +31,16 @@ func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 
 	rpm := auth.RPMLimit()
 	if rpm <= 0 {
-		// No explicit RPM limit configured — still record for selector awareness.
-		cliproxyauth.GlobalRPMTracker.Record(authID)
-		return nil
+		rpm = defaultRPM
 	}
 
-	// Block until a slot opens (or timeout).
-	if !cliproxyauth.GlobalRPMTracker.WaitForSlot(authID, rpm, rpmWaitTimeout) {
-		log.Warnf("claude rate limit: auth %s still at %d rpm after %s wait, proceeding anyway", authID, rpm, rpmWaitTimeout)
-		// Proceed anyway instead of returning 429 — let upstream decide.
-		// This avoids triggering the conductor cooldown spiral that causes
-		// cascading account bans.
+	// Non-blocking check: if at limit, return 429 immediately for fast failover.
+	// Use 1ms timeout to allow a single check iteration without actual waiting.
+	if !cliproxyauth.GlobalRPMTracker.WaitForSlot(authID, rpm, time.Millisecond) {
+		log.Debugf("claude rate limit: auth %s at %d rpm, failing over", authID, rpm)
+		return statusErr{code: 429, msg: "rate limit exceeded for this auth"}
 	}
 
-	// Record this request.
 	cliproxyauth.GlobalRPMTracker.Record(authID)
 	return nil
 }

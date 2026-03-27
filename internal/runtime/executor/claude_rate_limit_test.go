@@ -20,30 +20,44 @@ func TestCheckClaudeRateLimit_NilAuth(t *testing.T) {
 	}
 }
 
-func TestCheckClaudeRateLimit_NoRPMSet(t *testing.T) {
+func TestCheckClaudeRateLimit_DefaultRPM(t *testing.T) {
+	// Without explicit rpm, defaultRPM (2) applies.
 	auth := &cliproxyauth.Auth{
-		ID:       "test-no-rpm",
+		ID:       "test-default-rpm",
 		Provider: "claude",
 		Metadata: map[string]any{},
 	}
-	if err := checkClaudeRateLimit(auth); err != nil {
-		t.Fatalf("expected nil error when rpm not set, got %v", err)
+	// First 2 should pass.
+	for i := 0; i < defaultRPM; i++ {
+		if err := checkClaudeRateLimit(auth); err != nil {
+			t.Fatalf("request %d: expected pass within default RPM, got %v", i+1, err)
+		}
+	}
+	// Next should be rejected immediately.
+	if err := checkClaudeRateLimit(auth); err == nil {
+		t.Fatalf("expected 429 after exceeding default RPM")
 	}
 }
 
-func TestCheckClaudeRateLimit_NeverReturns429(t *testing.T) {
-	// The new rate limiter should NEVER return an error (it blocks or proceeds).
-	// This prevents conductor cooldown spirals.
-	auth := makeAuthWithRPM("test-never-429", 1000)
-	for i := 0; i < 10; i++ {
+func TestCheckClaudeRateLimit_Returns429OnExceed(t *testing.T) {
+	auth := makeAuthWithRPM("test-429-exceed", 3)
+	for i := 0; i < 3; i++ {
 		if err := checkClaudeRateLimit(auth); err != nil {
-			t.Fatalf("request %d: rate limiter should never return error, got %v", i+1, err)
+			t.Fatalf("request %d: expected pass, got %v", i+1, err)
 		}
+	}
+	// 4th request should be rejected immediately (non-blocking).
+	err := checkClaudeRateLimit(auth)
+	if err == nil {
+		t.Fatalf("expected 429 after exceeding RPM limit")
+	}
+	if se, ok := err.(statusErr); !ok || se.code != 429 {
+		t.Fatalf("expected statusErr with code 429, got %v", err)
 	}
 }
 
 func TestCheckClaudeRateLimit_RecordsToGlobalTracker(t *testing.T) {
-	auth := makeAuthWithRPM("test-records-tracker", 1000)
+	auth := makeAuthWithRPM("test-records-tracker-v2", 1000)
 	authID := auth.EnsureIndex()
 
 	before := cliproxyauth.GlobalRPMTracker.CurrentRPM(authID)
@@ -52,24 +66,5 @@ func TestCheckClaudeRateLimit_RecordsToGlobalTracker(t *testing.T) {
 
 	if after <= before {
 		t.Fatalf("expected RPM to increase after request, before=%d after=%d", before, after)
-	}
-}
-
-func TestCheckClaudeRateLimit_RecordsEvenWithoutRPMLimit(t *testing.T) {
-	// Even without an explicit RPM limit, requests should be recorded
-	// so the RPM-aware selector can see the load.
-	auth := &cliproxyauth.Auth{
-		ID:       "test-no-limit-records",
-		Provider: "claude",
-		Metadata: map[string]any{},
-	}
-	authID := auth.EnsureIndex()
-
-	before := cliproxyauth.GlobalRPMTracker.CurrentRPM(authID)
-	_ = checkClaudeRateLimit(auth)
-	after := cliproxyauth.GlobalRPMTracker.CurrentRPM(authID)
-
-	if after <= before {
-		t.Fatalf("expected RPM to increase even without limit, before=%d after=%d", before, after)
 	}
 }

@@ -59,10 +59,10 @@ const (
 	sessionSlotBaseReqs  = 200
 	sessionSlotReqJitter = 300 // total range: 200–499
 
-	// Default number of concurrent session slots when RPM is not configured.
-	// Real users typically run 1-3 terminal windows on a single device.
-	// Higher values (e.g. 10) create a detectable fingerprint.
-	defaultSlotCount = 3
+	// Default number of concurrent session slots per auth.
+	// A real CLI user has exactly 1 terminal window per session.
+	// Override via auth file metadata "max_concurrent" for higher throughput.
+	defaultSlotCount = 1
 
 	// Cleanup interval for expired pools.
 	sessionPoolCleanupInterval = 15 * time.Minute

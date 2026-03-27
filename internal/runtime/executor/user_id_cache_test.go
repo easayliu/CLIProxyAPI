@@ -73,11 +73,13 @@ func TestCachedUserID_ReusesWithinPool(t *testing.T) {
 
 func TestCachedUserID_PoolUsesMultipleSessions(t *testing.T) {
 	resetSessionPool()
-	ensurePoolAndInit("api-key-multi")
+	// Explicitly create a pool with 5 slots to test multi-session behavior.
+	EnsureSessionPool("api-key-multi", 5)
+	initializeAll("api-key-multi")
 
 	seen := make(map[string]bool)
 	for i := 0; i < 100; i++ {
-		id, _ := cachedUserID("api-key-multi", "", "", 0)
+		id, _ := cachedUserID("api-key-multi", "", "", 5)
 		sid := extractSessionID(id)
 		if sid == "" {
 			t.Fatalf("iteration %d: empty session_id", i)

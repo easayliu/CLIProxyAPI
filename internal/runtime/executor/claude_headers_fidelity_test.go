@@ -53,11 +53,11 @@ var captureMainHeaders = map[string]string{
 // opus-4-6 main conversation with tools + effort + context-management.
 var captureMainBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
 
-// captureQuotaBetas is from capture #007 (haiku quota check, with context-management).
-var captureQuotaBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+// captureQuotaBetas is from capture 20260327_153339 #008 (haiku quota check, with redact-thinking).
+var captureQuotaBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
 
-// captureTitleBetas is from capture (haiku title gen, with structured-outputs + context-management).
-var captureTitleBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
+// captureTitleBetas is from capture (haiku title gen, with redact-thinking + structured-outputs).
+var captureTitleBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
 
 // captureBillingHeader prefix; build hash is now dynamic per-request.
 const captureBillingHeaderPrefix = "x-anthropic-billing-header: cc_version=2.1.85."

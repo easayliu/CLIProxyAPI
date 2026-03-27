@@ -50,8 +50,7 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
 	return &ClaudeExecutor{
 		cfg:                cfg,
 		sessionInitEmitter: NewSessionInitEmitter(),
-		// telemetryEmitter disabled: synthetic telemetry may be a detection signal.
-		// telemetryEmitter:   NewTelemetryEmitter(),
+		telemetryEmitter:   NewTelemetryEmitter(),
 	}
 }
 
@@ -127,13 +126,21 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	EnsureSessionPool(poolKey, slotCount)
 
 	// Pick an uninitialized slot for session init, or an initialized one if all done.
-	sessionID := PickSessionID(poolKey)
+	sessionID, slotDeviceID := PickSessionID(poolKey)
+	// Use per-slot deviceID when available
+	if slotDeviceID != "" {
+		deviceID = slotDeviceID
+	}
 
 	// Fire session init requests and mark the slot as initialized only on success.
+	// For non-OAuth keys (or when no emitter is configured), mark initialized
+	// immediately so the slot is eligible for request picking.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
 		if e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth)) {
 			MarkSessionInitialized(poolKey, sessionID)
 		}
+	} else {
+		MarkSessionInitialized(poolKey, sessionID)
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -329,6 +336,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			DeviceID:         deviceID,
 			AccountUUID:      accountUUID,
 			OrganizationUUID: orgUUID,
+			SessionID:        sessionID,
 		})
 	}
 
@@ -364,13 +372,21 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	EnsureSessionPool(poolKey, slotCount)
 
 	// Pick an uninitialized slot for session init, or an initialized one if all done.
-	sessionID := PickSessionID(poolKey)
+	sessionID, slotDeviceID := PickSessionID(poolKey)
+	// Use per-slot deviceID when available
+	if slotDeviceID != "" {
+		deviceID = slotDeviceID
+	}
 
 	// Fire session init requests and mark the slot as initialized only on success.
+	// For non-OAuth keys (or when no emitter is configured), mark initialized
+	// immediately so the slot is eligible for request picking.
 	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
 		if e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth)) {
 			MarkSessionInitialized(poolKey, sessionID)
 		}
+	} else {
+		MarkSessionInitialized(poolKey, sessionID)
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -522,6 +538,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			DeviceID:         deviceID,
 			AccountUUID:      accountUUID,
 			OrganizationUUID: orgUUID,
+			SessionID:        sessionID,
 		})
 	}
 
@@ -1425,11 +1442,11 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 // poolKey is a stable identifier (e.g. auth.ID) used to key the session pool,
 // NOT the volatile OAuth access_token which changes on refresh.
 // injectFakeUserID returns the modified payload and the pool sessionID for release.
-func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string, slotCount int) ([]byte, string, error) {
+func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string, slotCount int, hintSessionID string) ([]byte, string, error) {
 	var uid string
 	var pickedSessionID string
 	if useCache {
-		uid, pickedSessionID = cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, "", slotCount)
+		uid, pickedSessionID = cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, hintSessionID, slotCount)
 		if uid == "" {
 			return payload, "", fmt.Errorf("session pool timeout: all slots busy")
 		}
@@ -2115,7 +2132,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	if auth != nil {
 		slotCount = auth.MaxConcurrent()
 	}
-	payload, poolSessionID, injectErr = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID, slotCount)
+	payload, poolSessionID, injectErr = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID, slotCount, sessionID)
 	if injectErr != nil {
 		return payload, "", injectErr
 	}

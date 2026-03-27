@@ -19,6 +19,7 @@ import (
 // session_id, lifetime, and request budget.
 type sessionSlot struct {
 	sessionID   string
+	deviceID    string // per-slot device identity (64-hex), simulates different machines
 	cch         string // stable per-session billing hash (5-char hex)
 	createdAt   time.Time
 	expire      time.Time
@@ -87,6 +88,21 @@ func newSessionSlot() sessionSlot {
 	}
 }
 
+// newSessionSlotWithDevice creates a session slot with a deterministic per-slot deviceID
+// derived from the pool's base seed and the slot index.
+func newSessionSlotWithDevice(baseSeed string, slotIndex int) sessionSlot {
+	s := newSessionSlot()
+	s.deviceID = deriveSlotDeviceID(baseSeed, slotIndex)
+	return s
+}
+
+// deriveSlotDeviceID generates a stable device_id for a specific slot.
+// Each slot gets its own device identity to simulate different machines.
+func deriveSlotDeviceID(baseSeed string, slotIndex int) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("slot-device:%s:%d", baseSeed, slotIndex)))
+	return hex.EncodeToString(h[:])
+}
+
 // randomCCH generates a random 5-char hex string, used once per session slot.
 func randomCCH() string {
 	b := make([]byte, 3)
@@ -127,9 +143,10 @@ func purgeExpiredPools() {
 }
 
 
-// pickSessionID selects a session_id from the pool for this API key.
+// pickSessionID selects a session_id and its per-slot deviceID from the pool for this API key.
 // slotCount determines the number of concurrent slots; 0 uses defaultSlotCount.
-func pickSessionID(apiKey string, slotCount int) string {
+// Returns (sessionID, deviceID). deviceID is the per-slot 64-hex device identity.
+func pickSessionID(apiKey string, slotCount int) (string, string) {
 	if slotCount <= 0 {
 		slotCount = defaultSlotCount
 	}
@@ -145,7 +162,7 @@ func pickSessionID(apiKey string, slotCount int) string {
 	if !ok {
 		slots := make([]sessionSlot, slotCount)
 		for i := range slots {
-			slots[i] = newSessionSlot()
+			slots[i] = newSessionSlotWithDevice(cacheKey, i)
 		}
 		pool = &sessionPool{
 			slots: slots,
@@ -156,14 +173,14 @@ func pickSessionID(apiKey string, slotCount int) string {
 	// Refresh any dead slots.
 	for i := range pool.slots {
 		if !pool.slots[i].alive(now) {
-			pool.slots[i] = newSessionSlot()
+			pool.slots[i] = newSessionSlotWithDevice(cacheKey, i)
 		}
 	}
 
 	// Adapt pool size.
 	desired := slotCount
 	for len(pool.slots) < desired {
-		pool.slots = append(pool.slots, newSessionSlot())
+		pool.slots = append(pool.slots, newSessionSlotWithDevice(cacheKey, len(pool.slots)))
 	}
 	// Shrink: only remove excess slots that are not busy.
 	if len(pool.slots) > desired {
@@ -174,7 +191,7 @@ func pickSessionID(apiKey string, slotCount int) string {
 			}
 		}
 		for len(live) < desired {
-			live = append(live, newSessionSlot())
+			live = append(live, newSessionSlotWithDevice(cacheKey, len(live)))
 		}
 		pool.slots = live
 	}
@@ -208,7 +225,7 @@ func pickSessionID(apiKey string, slotCount int) string {
 			if time.Now().After(deadline) {
 				log.Errorf("[session-pool] key=%.16s timeout after 10s, no initialized+idle slots", cacheKey)
 				sessionPoolsMu.Unlock()
-				return ""
+				return "", ""
 			}
 			sessionPoolsMu.Unlock()
 		}
@@ -229,7 +246,7 @@ func pickSessionID(apiKey string, slotCount int) string {
 		if s.busy {
 			status = "busy"
 		}
-		sids = append(sids, fmt.Sprintf("[%s%s %s reqs=%d]", marker, s.sessionID, status, s.requests))
+		sids = append(sids, fmt.Sprintf("[%s%s dev=%.8s %s reqs=%d]", marker, s.sessionID, s.deviceID, status, s.requests))
 	}
 	log.Infof("[session-pool] key=%.16s slots=%d picked=%d sessions=%s", cacheKey, len(pool.slots), idx, strings.Join(sids, ", "))
 
@@ -239,8 +256,9 @@ func pickSessionID(apiKey string, slotCount int) string {
 	lastPickedCCHMu.Unlock()
 
 	sid := pool.slots[idx].sessionID
+	did := pool.slots[idx].deviceID
 	sessionPoolsMu.Unlock()
-	return sid
+	return sid, did
 }
 
 // EnsureSessionPool creates the session pool for the given key if it doesn't
@@ -267,7 +285,7 @@ func EnsureSessionPool(apiKey string, slotCount int) {
 	}
 	slots := make([]sessionSlot, slotCount)
 	for i := range slots {
-		slots[i] = newSessionSlot()
+		slots[i] = newSessionSlotWithDevice(cacheKey, i)
 	}
 	sessionPools[cacheKey] = &sessionPool{slots: slots}
 	log.Infof("[session-pool] key=%.16s pre-initialized %d slots", cacheKey, slotCount)
@@ -295,6 +313,45 @@ func ReleaseSessionSlot(apiKey string, sessionID string) {
 			return
 		}
 	}
+}
+
+// pickSpecificSessionID finds the slot with the given sessionID, marks it busy,
+// increments its request count, and returns (sessionID, deviceID).
+// Returns ("", "") if the slot is not found, not alive, not initialized, or busy.
+// Used to ensure the request body uses the same slot (and deviceID) as session init.
+func pickSpecificSessionID(apiKey string, targetSessionID string) (string, string) {
+	if apiKey == "" || targetSessionID == "" {
+		return "", ""
+	}
+	h := sha256.Sum256([]byte("session-pool:" + apiKey))
+	cacheKey := hex.EncodeToString(h[:])
+
+	sessionPoolsMu.Lock()
+	defer sessionPoolsMu.Unlock()
+
+	pool, ok := sessionPools[cacheKey]
+	if !ok {
+		return "", ""
+	}
+
+	now := time.Now()
+	for i := range pool.slots {
+		if pool.slots[i].sessionID == targetSessionID {
+			if !pool.slots[i].alive(now) || !pool.slots[i].initialized || pool.slots[i].busy {
+				return "", ""
+			}
+			pool.slots[i].busy = true
+			pool.slots[i].requests++
+
+			// Update cch cache so billing header stays consistent.
+			lastPickedCCHMu.Lock()
+			lastPickedCCH[cacheKey] = pool.slots[i].cch
+			lastPickedCCHMu.Unlock()
+
+			return pool.slots[i].sessionID, pool.slots[i].deviceID
+		}
+	}
+	return "", ""
 }
 
 // getLastPickedCCH returns the cch associated with the most recently picked
@@ -355,12 +412,12 @@ func DeriveRH(apiKey string) string {
 	return hex.EncodeToString(h[:8])
 }
 
-// PickSessionID returns a session_id from the pool without marking the slot as busy.
+// PickSessionID returns a (sessionID, deviceID) from the pool without marking the slot as busy.
 // Prioritizes uninitialized alive slots so that session init can be triggered for them.
 // If all alive slots are initialized, returns the first alive slot (init will be skipped).
-func PickSessionID(apiKey string) string {
+func PickSessionID(apiKey string) (string, string) {
 	if apiKey == "" {
-		return uuid.New().String()
+		return uuid.New().String(), ""
 	}
 	h := sha256.Sum256([]byte("session-pool:" + apiKey))
 	cacheKey := hex.EncodeToString(h[:])
@@ -370,22 +427,22 @@ func PickSessionID(apiKey string) string {
 
 	pool, ok := sessionPools[cacheKey]
 	if !ok {
-		return uuid.New().String()
+		return uuid.New().String(), ""
 	}
 	now := time.Now()
 	// Prefer the first uninitialized alive slot (needs init).
 	for _, s := range pool.slots {
 		if s.alive(now) && !s.initialized {
-			return s.sessionID
+			return s.sessionID, s.deviceID
 		}
 	}
 	// All alive slots are initialized; return the first alive one.
 	for _, s := range pool.slots {
 		if s.alive(now) {
-			return s.sessionID
+			return s.sessionID, s.deviceID
 		}
 	}
-	return uuid.New().String()
+	return uuid.New().String(), ""
 }
 
 // MarkSessionInitialized marks the slot with the given sessionID as initialized.
@@ -421,8 +478,9 @@ func cachedUserID(apiKey string, realDeviceID string, realAccountUUID string, sl
 }
 
 // cachedUserIDWithSession is like cachedUserID but allows preserving a client-provided
-// session_id. When clientSessionID is non-empty, it is used directly instead of the
-// pool-selected value.
+// session_id. When clientSessionID is non-empty, the function first tries to lock
+// that specific slot (to keep deviceID consistent with session init). If the slot is
+// unavailable, it falls back to picking a random idle+initialized slot.
 // cachedUserIDWithSession returns the JSON user_id string and the pool-picked sessionID
 // so callers can release the slot after the request completes.
 func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID string, clientSessionID string, slotCount int) (string, string) {
@@ -430,23 +488,32 @@ func cachedUserIDWithSession(apiKey string, realDeviceID string, realAccountUUID
 		return generateFakeUserID(), ""
 	}
 
-	deviceID := DeriveDeviceID(apiKey)
-	if realDeviceID != "" {
-		deviceID = realDeviceID
-	}
-
 	accountUUID := DeriveAccountUUID(apiKey)
 	if realAccountUUID != "" {
 		accountUUID = realAccountUUID
 	}
 
-	sessionID := pickSessionID(apiKey, slotCount)
-	if sessionID == "" && clientSessionID == "" {
-		// Pool timeout — no slot available.
-		return "", ""
-	}
+	var sessionID, slotDeviceID string
 	if clientSessionID != "" {
-		sessionID = clientSessionID
+		// Try to lock the specific slot that was used for session init,
+		// so deviceID in the request body matches the session init deviceID.
+		sessionID, slotDeviceID = pickSpecificSessionID(apiKey, clientSessionID)
+	}
+	if sessionID == "" {
+		// No hint, or the hinted slot was unavailable — pick any idle slot.
+		sessionID, slotDeviceID = pickSessionID(apiKey, slotCount)
+		if sessionID == "" {
+			return "", ""
+		}
+	}
+
+	// Per-slot deviceID takes priority over account-level or real deviceID.
+	deviceID := slotDeviceID
+	if deviceID == "" {
+		deviceID = DeriveDeviceID(apiKey)
+		if realDeviceID != "" {
+			deviceID = realDeviceID
+		}
 	}
 
 	payload := userIDPayload{

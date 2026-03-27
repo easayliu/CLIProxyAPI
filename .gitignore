@@ -56,3 +56,6 @@ CLAUDE.md
 
 capture_dumps
 claude_code_capture.txt
+
+# Claude Code deobfuscated source
+claude-code-deobfuscated/

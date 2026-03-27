@@ -875,13 +875,22 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	}
 	t.Logf("user_id[0] (model=%s): %s", requestModels[0], userIDs[0])
 	t.Logf("user_id[1] (model=%s): %s", requestModels[1], userIDs[1])
-	if userIDs[0] != userIDs[1] {
-		t.Fatalf("expected user_id to be reused across models, got %q and %q", userIDs[0], userIDs[1])
+	// With per-slot deviceIDs, device_id and session_id may differ across requests
+	// (different slots picked). Only account_uuid is guaranteed stable per API key.
+	var p0, p1 userIDPayload
+	if err := json.Unmarshal([]byte(userIDs[0]), &p0); err != nil {
+		t.Fatalf("failed to parse user_id[0]: %v", err)
 	}
-	if !isValidUserID(userIDs[0]) {
-		t.Fatalf("user_id %q is not valid", userIDs[0])
+	if err := json.Unmarshal([]byte(userIDs[1]), &p1); err != nil {
+		t.Fatalf("failed to parse user_id[1]: %v", err)
 	}
-	t.Logf("✓ End-to-end test passed: Same user_id (%s) was used for both models", userIDs[0])
+	if p0.AccountUUID != p1.AccountUUID {
+		t.Fatalf("expected stable account_uuid across models, got %q and %q", p0.AccountUUID, p1.AccountUUID)
+	}
+	if !isValidUserID(userIDs[0]) || !isValidUserID(userIDs[1]) {
+		t.Fatalf("user_ids should be valid: %q, %q", userIDs[0], userIDs[1])
+	}
+	t.Logf("End-to-end test passed: account_uuid stable (%s), device_ids: %s, %s", p0.AccountUUID, p0.DeviceID, p1.DeviceID)
 }
 
 func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
@@ -930,8 +939,9 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	if err := json.Unmarshal([]byte(userIDs[1]), &p1); err != nil {
 		t.Fatalf("failed to parse user_id[1]: %v", err)
 	}
-	if p0.DeviceID != p1.DeviceID {
-		t.Fatalf("expected stable device_id, got %q and %q", p0.DeviceID, p1.DeviceID)
+	// device_id may differ between requests (per-slot deviceID), but must be valid 64-char hex.
+	if len(p0.DeviceID) != 64 || len(p1.DeviceID) != 64 {
+		t.Fatalf("expected 64-char hex device_ids, got %q (%d) and %q (%d)", p0.DeviceID, len(p0.DeviceID), p1.DeviceID, len(p1.DeviceID))
 	}
 	if p0.AccountUUID != p1.AccountUUID {
 		t.Fatalf("expected stable account_uuid, got %q and %q", p0.AccountUUID, p1.AccountUUID)
@@ -1989,14 +1999,11 @@ func TestCloaking_ReplacesContextManagement(t *testing.T) {
 		t.Fatal("context_management should be present after cloaking (replaced with standard CLI value)")
 	}
 	edits := cm.Get("edits").Array()
-	if len(edits) != 1 {
-		t.Fatalf("expected 1 edit in context_management, got %d", len(edits))
-	}
-	if edits[0].Get("type").String() != "clear_thinking_20251015" {
-		t.Errorf("expected clear_thinking_20251015 edit, got %s", edits[0].Get("type").String())
-	}
-	if edits[0].Get("signature").Exists() {
-		t.Error("standard CLI edit should not have a signature field")
+	// For non-OAuth keys, thinking is not injected, so the cloaked
+	// context_management uses cloakingContextManagementNoThinking (empty edits).
+	// clear_thinking_20251015 is only included when thinking is enabled/adaptive.
+	if len(edits) != 0 {
+		t.Fatalf("expected 0 edits in context_management (no thinking for non-OAuth key), got %d", len(edits))
 	}
 }
 

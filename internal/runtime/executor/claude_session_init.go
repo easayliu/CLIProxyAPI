@@ -124,19 +124,29 @@ func (si *SessionInitEmitter) needsInit(sessionID string) bool {
 	return true
 }
 
-// fireAll sends init requests matching DISABLE_NONESSENTIAL_TRAFFIC=1 mode
-// (MITM capture 20260327_104953): only mcp_servers, plugins_check, title_gen.
+// fireAll sends init requests matching the real CLI default mode (no
+// DISABLE_NONESSENTIAL_TRAFFIC). This includes bootstrap, feature flags,
+// account settings, grove, penguin mode, MCP servers, plugins, version
+// check, and title generation — matching the full startup request set.
 // Returns true only if the critical title_generation request succeeded.
 func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey string, isOAuth bool, deviceID, accountUUID string) bool {
 	var wg sync.WaitGroup
 
-	// First wave: mcp_servers + plugins check (matches capture #001, #002).
-	reqs := []func(){
-		func() { si.fireMCPServers(client, apiKey, isOAuth) },
-		func() { si.firePluginsCheck(client) },
+	// Wave 1: all startup requests fire in parallel, matching real CLI
+	// MITM capture 20260327_153339 (#001-#009).
+	wave1 := []func(){
+		func() { si.fireGrowthBookEval(client, apiKey, isOAuth, sessionID, deviceID, accountUUID) }, // #001 POST /api/eval/
+		func() { si.fireAccountSettings(client, apiKey, isOAuth) },                                  // #002
+		func() { si.fireGrove(client, apiKey, isOAuth, "cli") },                                     // #003
+		func() { si.fireBootstrap(client, apiKey, isOAuth) },                                        // #004
+		func() { si.firePenguinMode(client, apiKey, isOAuth) },                                      // #005
+		func() { si.fireMCPServers(client, apiKey, isOAuth) },                                       // #006
+		func() { si.fireMCPRegistry(client) },                                                       // #007 (no auth)
+		func() { si.fireQuotaCheck(client, apiKey, isOAuth, sessionID, deviceID, accountUUID) },     // #008
+		func() { si.fireCLIVersionCheck(client) },                                                   // #009 (no auth)
 	}
 
-	for _, fn := range reqs {
+	for _, fn := range wave1 {
 		wg.Add(1)
 		go func(f func()) {
 			defer wg.Done()
@@ -145,14 +155,14 @@ func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey str
 	}
 	wg.Wait()
 
-	// Second wave: mcp_servers (2nd) + title_generation (matches capture #003, #004).
+	// Wave 2: mcp_servers (2nd fetch, #010) + title_generation.
 	// title_generation is the critical request — its success determines init status.
 	var titleOK bool
 	var wg2 sync.WaitGroup
 	wg2.Add(2)
 	go func() {
 		defer wg2.Done()
-		si.fireMCPServers(client, apiKey, isOAuth)
+		si.fireMCPServers(client, apiKey, isOAuth) // #010
 	}()
 	go func() {
 		defer wg2.Done()
@@ -161,11 +171,48 @@ func (si *SessionInitEmitter) fireAll(client *http.Client, sessionID, apiKey str
 	wg2.Wait()
 
 	if titleOK {
-		log.Infof("[session-init] all startup requests completed (essential-only mode)")
+		log.Infof("[session-init] all startup requests completed (full default mode)")
 	} else {
 		log.Warnf("[session-init] title_generation failed, sessionID=%s will not be marked initialized", sessionID)
 	}
 	return titleOK
+}
+
+// fireGrowthBookEval sends a POST to Anthropic's GrowthBook remoteEval
+// endpoint, matching MITM capture 20260327_153339 #001.
+// Uses Bun/1.3.11 User-Agent and sends user attributes for experiment bucketing.
+func (si *SessionInitEmitter) fireGrowthBookEval(client *http.Client, apiKey string, isOAuth bool, sessionID, deviceID, accountUUID string) {
+	const clientKey = "sdk-zAZezfDKGoZuXXKe"
+
+	body := map[string]any{
+		"attributes": map[string]any{
+			"id":               deviceID,
+			"deviceID":         deviceID,
+			"accountUUID":      accountUUID,
+			"organizationUUID": "", // filled from auth if available
+			"sessionId":        sessionID,
+			"platform":         "darwin",
+			"userType":         "external",
+			"subscriptionType": "max",
+			"rateLimitTier":    "default_claude_max_20x",
+			"appVersion":       initCliVersion,
+			"firstTokenTime":   time.Now().UnixMilli(),
+		},
+		"forcedFeatures":   []any{},
+		"forcedVariations": map[string]any{},
+		"url":              "",
+	}
+	data, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest(http.MethodPost, si.upstream+"/api/eval/"+clientKey, bytes.NewReader(data))
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Bun/1.3.11")
+	req.Header["anthropic-beta"] = []string{"oauth-2025-04-20"}
+	si.setAuth(req, apiKey, isOAuth)
+	si.doRequest(client, req, "growthbook_eval")
 }
 
 // --- Individual request senders ---
@@ -274,11 +321,11 @@ func (si *SessionInitEmitter) fireQuotaCheck(client *http.Client, apiKey string,
 	}
 	data, _ := json.Marshal(body)
 
-	// Headers match MITM capture 20260326_091714 #007 (Stainless SDK style).
+	// Headers match MITM capture 20260327_153339 #008 (Stainless SDK style).
 	req, _ := http.NewRequest(http.MethodPost, si.upstream+"/v1/messages?beta=true", bytes.NewReader(data))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05")
+	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05")
 	req.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
@@ -335,11 +382,11 @@ func (si *SessionInitEmitter) fireTitleGeneration(client *http.Client, apiKey st
 	}
 	data, _ := json.Marshal(body)
 
-	// Headers match MITM capture 20260326_091714 (Stainless SDK style).
+	// Headers match MITM capture 20260327_153339 (Stainless SDK style).
 	req, _ := http.NewRequest(http.MethodPost, si.upstream+"/v1/messages?beta=true", bytes.NewReader(data))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15")
+	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15")
 	req.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")

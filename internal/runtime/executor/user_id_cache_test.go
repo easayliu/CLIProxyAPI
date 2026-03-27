@@ -29,8 +29,31 @@ func releaseAll(apiKey string) {
 	}
 }
 
+// initializeAll marks all slots in the pool as initialized so they become
+// eligible for pickSessionID selection. In production this is done by
+// MarkSessionInitialized after session init telemetry completes.
+func initializeAll(apiKey string) {
+	h := sha256.Sum256([]byte("session-pool:" + apiKey))
+	cacheKey := hex.EncodeToString(h[:])
+	sessionPoolsMu.Lock()
+	defer sessionPoolsMu.Unlock()
+	if pool, ok := sessionPools[cacheKey]; ok {
+		for i := range pool.slots {
+			pool.slots[i].initialized = true
+		}
+	}
+}
+
+// ensurePoolAndInit creates the pool and marks all slots as initialized.
+// Convenience wrapper for tests that need a ready-to-use pool.
+func ensurePoolAndInit(apiKey string) {
+	EnsureSessionPool(apiKey, 0)
+	initializeAll(apiKey)
+}
+
 func TestCachedUserID_ReusesWithinPool(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-1")
 
 	first, _ := cachedUserID("api-key-1", "", "", 0)
 	if first == "" {
@@ -50,6 +73,7 @@ func TestCachedUserID_ReusesWithinPool(t *testing.T) {
 
 func TestCachedUserID_PoolUsesMultipleSessions(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-multi")
 
 	seen := make(map[string]bool)
 	for i := 0; i < 100; i++ {
@@ -70,8 +94,9 @@ func TestCachedUserID_PoolUsesMultipleSessions(t *testing.T) {
 
 func TestCachedUserID_DefaultFiveSlots(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-five")
 
-	// First call creates pool with 5 slots.
+	// First call uses the pre-initialized pool.
 	_, _ = cachedUserID("api-key-five", "", "", 0)
 	releaseAll("api-key-five")
 
@@ -89,6 +114,8 @@ func TestCachedUserID_DefaultFiveSlots(t *testing.T) {
 
 func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-1")
+	ensurePoolAndInit("api-key-2")
 
 	first, _ := cachedUserID("api-key-1", "", "", 0)
 	releaseAll("api-key-1")
@@ -100,35 +127,35 @@ func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
 	}
 }
 
-func TestCachedUserID_StableDeviceAndAccount(t *testing.T) {
+func TestCachedUserID_StableAccountUUID(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-stable")
 
-	// device_id and account_uuid should be stable across calls for the same API key.
-	var deviceIDs, accountIDs []string
+	// account_uuid should be stable across calls for the same API key.
+	// device_id varies per slot (per-slot deviceID), so we only check account_uuid stability.
+	var accountIDs []string
 	for i := 0; i < 10; i++ {
 		id, _ := cachedUserID("api-key-stable", "", "", 0)
 		var p userIDPayload
 		if err := json.Unmarshal([]byte(id), &p); err != nil {
 			t.Fatalf("failed to parse user_id: %v", err)
 		}
-		deviceIDs = append(deviceIDs, p.DeviceID)
 		accountIDs = append(accountIDs, p.AccountUUID)
 		releaseAll("api-key-stable")
 	}
 
-	for i := 1; i < len(deviceIDs); i++ {
-		if deviceIDs[i] != deviceIDs[0] {
-			t.Fatalf("device_id changed: %q vs %q", deviceIDs[0], deviceIDs[i])
-		}
+	for i := 1; i < len(accountIDs); i++ {
 		if accountIDs[i] != accountIDs[0] {
 			t.Fatalf("account_uuid changed: %q vs %q", accountIDs[0], accountIDs[i])
 		}
 	}
 }
 
-func TestCachedUserID_UsesRealDeviceID(t *testing.T) {
+func TestCachedUserID_PerSlotDeviceIDTakesPriority(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-real")
 
+	// With per-slot deviceID, the slot's deviceID takes priority over realDeviceID.
 	realDevice := "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd" + "aabbccdd"
 	id, _ := cachedUserID("api-key-real", realDevice, "", 0)
 	releaseAll("api-key-real")
@@ -137,13 +164,17 @@ func TestCachedUserID_UsesRealDeviceID(t *testing.T) {
 	if err := json.Unmarshal([]byte(id), &p); err != nil {
 		t.Fatalf("failed to parse user_id: %v", err)
 	}
-	if p.DeviceID != realDevice {
-		t.Fatalf("expected device_id=%q, got %q", realDevice, p.DeviceID)
+	if p.DeviceID == realDevice {
+		t.Fatalf("expected per-slot deviceID to take priority over realDeviceID, but got realDeviceID")
+	}
+	if len(p.DeviceID) != 64 {
+		t.Fatalf("expected 64-char hex deviceID, got %d chars: %q", len(p.DeviceID), p.DeviceID)
 	}
 }
 
 func TestCachedUserID_UsesRealAccountUUID(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-real")
 
 	realAccount := "12345678-1234-1234-1234-123456789abc"
 	id, _ := cachedUserID("api-key-real", "", realAccount, 0)
@@ -160,8 +191,9 @@ func TestCachedUserID_UsesRealAccountUUID(t *testing.T) {
 
 func TestCachedUserID_BusySlotsNotReused(t *testing.T) {
 	resetSessionPool()
+	ensurePoolAndInit("api-key-busy")
 
-	// Acquire all 5 slots without releasing.
+	// Acquire all slots without releasing.
 	sids := make(map[string]bool)
 	for i := 0; i < defaultSlotCount; i++ {
 		_, sid := cachedUserID("api-key-busy", "", "", 0)
@@ -175,6 +207,90 @@ func TestCachedUserID_BusySlotsNotReused(t *testing.T) {
 		t.Fatalf("expected %d unique session_ids, got %d", defaultSlotCount, len(sids))
 	}
 	releaseAll("api-key-busy")
+}
+
+// TestPerSlotDeviceID verifies that each slot in a pool gets a unique, stable,
+// 64-char hex deviceID derived from the pool seed and slot index.
+func TestPerSlotDeviceID(t *testing.T) {
+	resetSessionPool()
+
+	const apiKey = "api-key-per-slot-device"
+	const slotCount = 3
+	EnsureSessionPool(apiKey, slotCount)
+
+	h := sha256.Sum256([]byte("session-pool:" + apiKey))
+	cacheKey := hex.EncodeToString(h[:])
+
+	// Collect deviceIDs from all slots.
+	sessionPoolsMu.Lock()
+	pool := sessionPools[cacheKey]
+	if pool == nil {
+		sessionPoolsMu.Unlock()
+		t.Fatal("pool not created")
+	}
+	deviceIDs := make([]string, len(pool.slots))
+	for i, s := range pool.slots {
+		deviceIDs[i] = s.deviceID
+	}
+	sessionPoolsMu.Unlock()
+
+	if len(deviceIDs) != slotCount {
+		t.Fatalf("expected %d slots, got %d", slotCount, len(deviceIDs))
+	}
+
+	// Each slot should have a different deviceID.
+	seen := make(map[string]bool)
+	for i, did := range deviceIDs {
+		if len(did) != 64 {
+			t.Fatalf("slot %d: expected 64-char hex deviceID, got %d chars: %q", i, len(did), did)
+		}
+		// Verify it's valid hex.
+		if _, err := hex.DecodeString(did); err != nil {
+			t.Fatalf("slot %d: deviceID is not valid hex: %v", i, err)
+		}
+		if seen[did] {
+			t.Fatalf("slot %d: duplicate deviceID %q", i, did)
+		}
+		seen[did] = true
+	}
+
+	// Verify stability: recreating a pool with same key should produce same deviceIDs.
+	resetSessionPool()
+	EnsureSessionPool(apiKey, slotCount)
+
+	sessionPoolsMu.Lock()
+	pool2 := sessionPools[cacheKey]
+	deviceIDs2 := make([]string, len(pool2.slots))
+	for i, s := range pool2.slots {
+		deviceIDs2[i] = s.deviceID
+	}
+	sessionPoolsMu.Unlock()
+
+	for i := range deviceIDs {
+		if deviceIDs[i] != deviceIDs2[i] {
+			t.Fatalf("slot %d: deviceID not stable across pool recreations: %q vs %q", i, deviceIDs[i], deviceIDs2[i])
+		}
+	}
+}
+
+// TestPickSessionID_ReturnsDeviceID verifies that PickSessionID returns the
+// per-slot deviceID along with the sessionID.
+func TestPickSessionID_ReturnsDeviceID(t *testing.T) {
+	resetSessionPool()
+
+	const apiKey = "api-key-pick-device"
+	EnsureSessionPool(apiKey, 3)
+
+	sid, did := PickSessionID(apiKey)
+	if sid == "" {
+		t.Fatal("expected non-empty sessionID")
+	}
+	if did == "" {
+		t.Fatal("expected non-empty deviceID from PickSessionID")
+	}
+	if len(did) != 64 {
+		t.Fatalf("expected 64-char hex deviceID, got %d chars: %q", len(did), did)
+	}
 }
 
 // extractSessionID parses the session_id from a cached user_id JSON string.
@@ -194,6 +310,8 @@ func TestConcurrent10Requests(t *testing.T) {
 
 	const numReqs = 10
 	const apiKey = "api-key-concurrent"
+	EnsureSessionPool(apiKey, numReqs)
+	initializeAll(apiKey)
 
 	var wg sync.WaitGroup
 	results := make([]string, numReqs) // collected session IDs
@@ -206,7 +324,7 @@ func TestConcurrent10Requests(t *testing.T) {
 			defer wg.Done()
 			<-start // wait for all goroutines to be ready
 
-			uid, sid := cachedUserID(apiKey, "", "", 0)
+			uid, sid := cachedUserID(apiKey, "", "", numReqs)
 			if uid == "" {
 				errors[idx] = fmt.Errorf("goroutine %d: got empty uid (timeout)", idx)
 				return
@@ -265,6 +383,8 @@ func TestConcurrent15Requests_10Slots(t *testing.T) {
 
 	const numReqs = 15
 	const apiKey = "api-key-overflow"
+	EnsureSessionPool(apiKey, 10)
+	initializeAll(apiKey)
 
 	var wg sync.WaitGroup
 	results := make([]string, numReqs)
@@ -277,7 +397,7 @@ func TestConcurrent15Requests_10Slots(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			uid, sid := cachedUserID(apiKey, "", "", 0)
+			uid, sid := cachedUserID(apiKey, "", "", 10)
 			if uid == "" {
 				errors[idx] = fmt.Errorf("goroutine %d: got empty uid (timeout)", idx)
 				return

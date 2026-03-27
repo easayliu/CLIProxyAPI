@@ -153,7 +153,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
 	// Override to match CLI fingerprint regardless of what the client sent.
+	// Also remove top_p since Anthropic rejects requests with both temperature and top_p.
 	body, _ = sjson.SetBytes(body, "temperature", 1)
+	body, _ = sjson.DeleteBytes(body, "top_p")
+	body, _ = sjson.DeleteBytes(body, "top_k")
 
 	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	// if err != nil {
@@ -384,7 +387,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
+	// Also remove top_p since Anthropic rejects requests with both temperature and top_p.
 	body, _ = sjson.SetBytes(body, "temperature", 1)
+	body, _ = sjson.DeleteBytes(body, "top_p")
+	body, _ = sjson.DeleteBytes(body, "top_k")
 
 	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	// if err != nil {

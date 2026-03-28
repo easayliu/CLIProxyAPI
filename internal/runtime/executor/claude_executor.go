@@ -547,7 +547,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		defer close(out)
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
-				log.Errorf("response body close error: %v", errClose)
+				log.Debugf("response body close error: %v", errClose)
 			}
 		}()
 

@@ -1,6 +1,9 @@
 package executor
 
 import (
+	"fmt"
+	"math"
+	"net/http"
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -15,10 +18,10 @@ const (
 	defaultRPM = 2
 )
 
-// checkClaudeRateLimit enforces per-auth RPM (requests per minute) limit.
-// Defaults to 2 RPM when not configured, matching real CLI usage patterns.
-// Returns 429 immediately when exceeded so the conductor can failover
-// to the next auth without delay.
+// checkClaudeRateLimit enforces per-auth RPM (requests per minute) limit and
+// upstream error cooldown. If the auth is in a cooldown period (set after a
+// 500/502/503/504 upstream error), returns 503 immediately so the client backs
+// off instead of hammering the upstream again.
 func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 	if auth == nil {
 		return nil
@@ -27,6 +30,14 @@ func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 	authID := auth.EnsureIndex()
 	if authID == "" {
 		return nil
+	}
+
+	// Check auth-level cooldown (set after upstream 5xx errors).
+	now := time.Now()
+	if !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		retryIn := int(math.Ceil(auth.NextRetryAfter.Sub(now).Seconds()))
+		log.Debugf("claude rate limit: auth %s in cooldown, retry in %ds", authID, retryIn)
+		return &upstreamCooldownErr{retryAfterSeconds: retryIn}
 	}
 
 	rpm := auth.RPMLimit()
@@ -43,4 +54,24 @@ func checkClaudeRateLimit(auth *cliproxyauth.Auth) error {
 
 	cliproxyauth.GlobalRPMTracker.Record(authID)
 	return nil
+}
+
+// upstreamCooldownErr is returned when the auth is in a post-5xx cooldown period.
+// It surfaces as 503 to the client with a Retry-After header.
+type upstreamCooldownErr struct {
+	retryAfterSeconds int
+}
+
+func (e *upstreamCooldownErr) Error() string {
+	return fmt.Sprintf("upstream error cooldown, retry after %ds", e.retryAfterSeconds)
+}
+
+func (e *upstreamCooldownErr) StatusCode() int {
+	return http.StatusServiceUnavailable
+}
+
+func (e *upstreamCooldownErr) Headers() http.Header {
+	h := make(http.Header)
+	h.Set("Retry-After", fmt.Sprintf("%d", e.retryAfterSeconds))
+	return h
 }

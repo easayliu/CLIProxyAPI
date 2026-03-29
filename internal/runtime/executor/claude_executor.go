@@ -6,6 +6,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -22,7 +23,6 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -106,7 +106,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := req.Model
 
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {
@@ -114,34 +114,14 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	// Log identity on every request for auditing.
-	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
+	_, _, _, _ = extractAuthIdentity(auth, apiKey)
 
-	// Ensure session pool exists before picking a session ID, so that
-	// PickSessionID returns a pool-backed ID consistent with later cloaking.
+	// Session pool and init removed: no session management needed.
 	poolKey := stablePoolKey(auth, apiKey)
-	slotCount := 0
-	if auth != nil {
-		slotCount = auth.MaxConcurrent()
-	}
-	EnsureSessionPool(poolKey, slotCount)
-
-	// Pick an uninitialized slot for session init, or an initialized one if all done.
-	sessionID, slotDeviceID := PickSessionID(poolKey)
-	// Use per-slot deviceID when available
-	if slotDeviceID != "" {
-		deviceID = slotDeviceID
-	}
-
-	// Fire session init requests and mark the slot as initialized only on success.
-	// For non-OAuth keys (or when no emitter is configured), mark initialized
-	// immediately so the slot is eligible for request picking.
-	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
-		if e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth)) {
-			MarkSessionInitialized(poolKey, sessionID)
-		}
-	} else {
-		MarkSessionInitialized(poolKey, sessionID)
-	}
+	var sessionID string
+	// EnsureSessionPool(poolKey, slotCount)
+	// sessionID, slotDeviceID := PickSessionID(poolKey)
+	// EmitSessionInit(...)
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
@@ -155,28 +135,24 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// }
 	// originalPayload := originalPayloadSource
 	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	// translateRequest and model override removed: upstream is always claude format,
+	// payload is passed through as-is.
+	body := req.Payload
 
-	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
-	// Override to match CLI fingerprint regardless of what the client sent.
-	// Also remove top_p since Anthropic rejects requests with both temperature and top_p.
-	body, _ = sjson.SetBytes(body, "temperature", 1)
-	body, _ = sjson.DeleteBytes(body, "top_p")
-	body, _ = sjson.DeleteBytes(body, "top_k")
+	// temperature/top_p/top_k override and system[0]/[1] injection removed:
+	// clients send their own correct values.
+	// if !isClaudeCodeClient(getClientUserAgent(ctx)) {
+	// 	body, _ = sjson.SetBytes(body, "temperature", 1)
+	// 	body, _ = sjson.DeleteBytes(body, "top_p")
+	// 	body, _ = sjson.DeleteBytes(body, "top_k")
+	// 	oauthMode := isClaudeOAuthToken(apiKey)
+	// 	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
+	// }
 
 	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	// if err != nil {
 	// 	return resp, err
 	// }
-
-	// Always regenerate system[0] (billing header) and system[1] (agent block)
-	// to ensure version consistency with our template, regardless of cloaking.
-	// This prevents version mismatch when a real Claude Code CLI with a different
-	// version connects through an upstream proxy like NewAPI.
-	// MITM captures confirm real CLI sends full system blocks for all models including Haiku.
-	oauthMode := isClaudeOAuthToken(apiKey)
-	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
@@ -199,6 +175,45 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	if poolSessionID != "" {
 		defer ReleaseSessionSlot(poolKey, poolSessionID)
+	}
+
+	// Replace metadata.user_id: use auth's real device_id + account_uuid,
+	// preserve session_id from the client's original user_id for session continuity.
+	{
+		realDeviceID := ""
+		realAccountUUID := ""
+		if auth != nil && auth.Metadata != nil {
+			if v, ok := auth.Metadata["device_id"].(string); ok {
+				realDeviceID = v
+			}
+			if v, ok := auth.Metadata["account_uuid"].(string); ok {
+				realAccountUUID = v
+			}
+		}
+		// Extract session_id from client's original metadata.user_id.
+		clientSessionID := extractFieldFromUserID(gjson.GetBytes(body, "metadata.user_id").String(), "session_id")
+		if clientSessionID == "" {
+			clientSessionID = uuid.New().String()
+		}
+		// Use real values from auth when available, otherwise generate random.
+		devID := realDeviceID
+		if devID == "" {
+			hexBytes := make([]byte, 32)
+			_, _ = rand.Read(hexBytes)
+			devID = hex.EncodeToString(hexBytes)
+		}
+		accUUID := realAccountUUID
+		if accUUID == "" {
+			accUUID = uuid.New().String()
+		}
+		data, _ := json.Marshal(userIDPayload{
+			DeviceID:    devID,
+			AccountUUID: accUUID,
+			SessionID:   clientSessionID,
+		})
+		uid := string(data)
+		body, _ = sjson.SetBytes(body, "metadata.user_id", uid)
+		log.Infof("[claude-identity] metadata.user_id=%s", uid)
 	}
 
 	// requestedModel := payloadRequestedModel(opts, req.Model)
@@ -329,16 +344,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 
-	// Send CLI telemetry events to match real Claude Code behavior.
-	if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) {
-		_, _, orgUUID, email := extractAuthIdentity(auth, apiKey)
-		e.telemetryEmitter.EmitForMessage(apiKey, apiKey, true, baseModel, email, TelemetryIdentity{
-			DeviceID:         deviceID,
-			AccountUUID:      accountUUID,
-			OrganizationUUID: orgUUID,
-			SessionID:        sessionID,
-		})
-	}
+	// Telemetry removed.
+	// if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) { ... }
 
 	return resp, nil
 }
@@ -353,7 +360,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := req.Model
 
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {
@@ -361,33 +368,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	// Log identity on every request for auditing.
-	deviceID, accountUUID, _, _ := extractAuthIdentity(auth, apiKey)
+	_, _, _, _ = extractAuthIdentity(auth, apiKey)
 
-	// Ensure session pool exists before picking a session ID.
+	// Session pool and init removed: no session management needed.
 	poolKey := stablePoolKey(auth, apiKey)
-	slotCount := 0
-	if auth != nil {
-		slotCount = auth.MaxConcurrent()
-	}
-	EnsureSessionPool(poolKey, slotCount)
-
-	// Pick an uninitialized slot for session init, or an initialized one if all done.
-	sessionID, slotDeviceID := PickSessionID(poolKey)
-	// Use per-slot deviceID when available
-	if slotDeviceID != "" {
-		deviceID = slotDeviceID
-	}
-
-	// Fire session init requests and mark the slot as initialized only on success.
-	// For non-OAuth keys (or when no emitter is configured), mark initialized
-	// immediately so the slot is eligible for request picking.
-	if e.sessionInitEmitter != nil && isClaudeOAuthToken(apiKey) {
-		if e.sessionInitEmitter.EmitSessionInit(sessionID, apiKey, true, deviceID, accountUUID, ResolveProxyURL(e.cfg, auth)) {
-			MarkSessionInitialized(poolKey, sessionID)
-		}
-	} else {
-		MarkSessionInitialized(poolKey, sessionID)
-	}
+	var sessionID string
+	// EnsureSessionPool(poolKey, slotCount)
+	// sessionID, slotDeviceID := PickSessionID(poolKey)
+	// EmitSessionInit(...)
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
@@ -399,23 +387,24 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// }
 	// originalPayload := originalPayloadSource
 	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	// translateRequest and model override removed: upstream is always claude format,
+	// payload is passed through as-is.
+	body := req.Payload
 
-	// Real Claude Code CLI always sends temperature:1 for main conversation requests.
-	// Also remove top_p since Anthropic rejects requests with both temperature and top_p.
-	body, _ = sjson.SetBytes(body, "temperature", 1)
-	body, _ = sjson.DeleteBytes(body, "top_p")
-	body, _ = sjson.DeleteBytes(body, "top_k")
+	// temperature/top_p/top_k override and system[0]/[1] injection removed:
+	// clients send their own correct values.
+	// if !isClaudeCodeClient(getClientUserAgent(ctx)) {
+	// 	body, _ = sjson.SetBytes(body, "temperature", 1)
+	// 	body, _ = sjson.DeleteBytes(body, "top_p")
+	// 	body, _ = sjson.DeleteBytes(body, "top_k")
+	// 	oauthMode := isClaudeOAuthToken(apiKey)
+	// 	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
+	// }
 
 	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	// if err != nil {
 	// 	return nil, err
 	// }
-
-	// Always regenerate system[0]/[1] for all models including Haiku.
-	oauthMode := isClaudeOAuthToken(apiKey)
-	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
 
 	// Sanitize context_management.edits: remove unsupported edit types before
 	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
@@ -438,6 +427,45 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	if poolSessionID != "" {
 		defer ReleaseSessionSlot(poolKey, poolSessionID)
+	}
+
+	// Replace metadata.user_id: use auth's real device_id + account_uuid,
+	// preserve session_id from the client's original user_id for session continuity.
+	{
+		realDeviceID := ""
+		realAccountUUID := ""
+		if auth != nil && auth.Metadata != nil {
+			if v, ok := auth.Metadata["device_id"].(string); ok {
+				realDeviceID = v
+			}
+			if v, ok := auth.Metadata["account_uuid"].(string); ok {
+				realAccountUUID = v
+			}
+		}
+		// Extract session_id from client's original metadata.user_id.
+		clientSessionID := extractFieldFromUserID(gjson.GetBytes(body, "metadata.user_id").String(), "session_id")
+		if clientSessionID == "" {
+			clientSessionID = uuid.New().String()
+		}
+		// Use real values from auth when available, otherwise generate random.
+		devID := realDeviceID
+		if devID == "" {
+			hexBytes := make([]byte, 32)
+			_, _ = rand.Read(hexBytes)
+			devID = hex.EncodeToString(hexBytes)
+		}
+		accUUID := realAccountUUID
+		if accUUID == "" {
+			accUUID = uuid.New().String()
+		}
+		data, _ := json.Marshal(userIDPayload{
+			DeviceID:    devID,
+			AccountUUID: accUUID,
+			SessionID:   clientSessionID,
+		})
+		uid := string(data)
+		body, _ = sjson.SetBytes(body, "metadata.user_id", uid)
+		log.Infof("[claude-identity] metadata.user_id=%s", uid)
 	}
 
 	// requestedModel := payloadRequestedModel(opts, req.Model)
@@ -531,16 +559,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		return nil, err
 	}
-	// Send CLI telemetry events on successful stream start.
-	if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) {
-		_, _, orgUUID, email := extractAuthIdentity(auth, apiKey)
-		e.telemetryEmitter.EmitForMessage(apiKey, apiKey, true, baseModel, email, TelemetryIdentity{
-			DeviceID:         deviceID,
-			AccountUUID:      accountUUID,
-			OrganizationUUID: orgUUID,
-			SessionID:        sessionID,
-		})
-	}
+	// Telemetry removed.
+	// if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) { ... }
 
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -615,7 +635,7 @@ appendAPIResponseChunk(ctx, e.cfg, line)
 }
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := req.Model
 
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {
@@ -951,6 +971,28 @@ func modelSupports1MContext(model string) bool {
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config, model string, body []byte) {
+	var ginHeaders http.Header
+	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header
+	}
+
+	// CLI clients: passthrough original headers, only replace auth credentials.
+	if ginHeaders != nil && isClaudeCodeClient(ginHeaders.Get("User-Agent")) {
+		for k, v := range ginHeaders {
+			r.Header[k] = v
+		}
+		// Replace auth with proxy's credentials.
+		if isClaudeOAuthToken(apiKey) {
+			r.Header.Del("x-api-key")
+			r.Header.Set("Authorization", "Bearer "+apiKey)
+		} else if apiKey != "" {
+			r.Header.Del("Authorization")
+			r.Header.Set("x-api-key", apiKey)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		return
+	}
+
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
 			return cfgVal
@@ -974,10 +1016,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Content-Type", "application/json")
 
-	var ginHeaders http.Header
-	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header
-	}
 
 	// Build Anthropic-Beta dynamically based on request body content,
 	// matching real Claude CLI 2.1.84 behavior observed via MITM capture.
@@ -2010,20 +2048,16 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	var cloakMode string
 	var strictMode bool
 	var sensitiveWords []string
-	cacheUserID := true
 
 	if cloakCfg != nil {
 		cloakMode = cloakCfg.Mode
 		strictMode = cloakCfg.StrictMode
 		sensitiveWords = cloakCfg.SensitiveWords
-		if cloakCfg.CacheUserID != nil {
-			cacheUserID = *cloakCfg.CacheUserID
-		}
 	}
 
 	// Fallback to auth attributes if no config found
 	if cloakMode == "" {
-		attrMode, attrStrict, attrWords, attrCache := getCloakConfigFromAuth(auth)
+		attrMode, attrStrict, attrWords, _ := getCloakConfigFromAuth(auth)
 		cloakMode = attrMode
 		if !strictMode {
 			strictMode = attrStrict
@@ -2031,17 +2065,11 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		if len(sensitiveWords) == 0 {
 			sensitiveWords = attrWords
 		}
-		if cloakCfg == nil || cloakCfg.CacheUserID == nil {
-			cacheUserID = attrCache
-		}
-	} else if cloakCfg == nil || cloakCfg.CacheUserID == nil {
-		_, _, _, attrCache := getCloakConfigFromAuth(auth)
-		cacheUserID = attrCache
 	}
 
 	// OAuth tokens default to no cloaking. Set cloak_mode to "always" or
 	// "auto" in auth attributes or config to re-enable cloaking for OAuth.
-	if cloakMode == "auto" && isClaudeOAuthToken(apiKey) {
+	if cloakMode == "auto" && isClaudeOAuthToken(apiKey) && !isClaudeCodeClient(clientUserAgent) {
 		cloakMode = "always"
 	}
 
@@ -2063,27 +2091,21 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Claude Code CLI sends model-appropriate values (e.g. 128000 for Opus 4.6).
 	payload = normalizeMaxTokensForCloaking(payload, model)
 
-	// Note: system[0]/[1] injection is now handled in Execute/ExecuteStream
-	// before applyCloaking, so it applies to all requests regardless of cloaking.
-	// In strict mode, strip user system messages and keep only billing + agent blocks.
-	if strictMode {
-		payload = checkSystemInstructionsWithMode(payload, true, true, stablePoolKey(auth, apiKey))
-	}
-
-	// Inject the full Claude Code CLI system prompt as system[2] and migrate
-	// any extra system messages into the first user message as <system-reminder>.
-	// Real CLI always sends exactly 3 system blocks for all models including Haiku.
+	// Inject system[0] (billing header) and system[1] (agent block) for non-CLI clients.
+	// Non-strict: prepend billing + agent, keep client system messages.
+	// Strict: replace all system with billing + agent only.
 	oauthMode := isClaudeOAuthToken(apiKey)
-	payload = injectCLISystemPrompt(payload, model, oauthMode)
+	payload = checkSystemInstructionsWithMode(payload, strictMode, oauthMode, stablePoolKey(auth, apiKey))
 
-	// Inject deferred-tools user message and ToolSearch tool to match real CLI.
-	// MITM captures confirm Haiku requests do NOT have deferred-tools message,
-	// while opus/sonnet requests always start with <available-deferred-tools>.
-	if !isHaikuModel(model) {
-		payload = injectCLIDeferredTools(payload)
-	}
-	log.Infof("[cloaking] injected: system-prompt=%t deferred-tools=%t system-reminders=%t model=%s",
-		true, !isHaikuModel(model), true, model)
+	// system[2] injection removed: non-CLI clients manage their own system prompts.
+	// oauthMode := isClaudeOAuthToken(apiKey)
+	// payload = injectCLISystemPrompt(payload, model, oauthMode)
+
+	// deferred-tools injection removed: non-CLI clients should not have
+	// CLI-specific tool messages injected.
+	// if !isHaikuModel(model) {
+	// 	payload = injectCLIDeferredTools(payload)
+	// }
 
 	// Match real CLI 2.1.84 behavior: only output_config.effort, no thinking field.
 	// MITM captures confirm real CLI never sends thinking for opus-4-6 or sonnet-4-6.
@@ -2108,37 +2130,13 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 			gjson.GetBytes(payload, "output_config.effort").String(), effortInjected, thinkingRemoved)
 	}
 
-	// Replace context_management with the standard CLI value during cloaking.
-	// Must run AFTER thinking injection so the function can check if thinking is
-	// enabled — Anthropic rejects clear_thinking_20251015 when thinking is off.
-	// Server-signed edits (compact, clear_tool_uses) are stripped because their
-	// signatures are session-bound and will cause 400 "signature: Field required".
-	payload = replaceContextManagementForCloaking(payload)
+	// context_management replacement removed: clients manage their own context.
+	// payload = replaceContextManagementForCloaking(payload)
 
-	// Inject fake user ID, using real device_id and account_uuid from OAuth if available.
-	realDeviceID := ""
-	realAccountUUID := ""
-	if auth != nil && auth.Metadata != nil {
-		if v, ok := auth.Metadata["device_id"].(string); ok {
-			realDeviceID = v
-		}
-		if v, ok := auth.Metadata["account_uuid"].(string); ok {
-			realAccountUUID = v
-		}
-	}
 	var poolSessionID string
-	var injectErr error
-	slotCount := 0
-	if auth != nil {
-		slotCount = auth.MaxConcurrent()
-	}
-	payload, poolSessionID, injectErr = injectFakeUserID(payload, stablePoolKey(auth, apiKey), cacheUserID, realDeviceID, realAccountUUID, slotCount, sessionID)
-	if injectErr != nil {
-		return payload, "", injectErr
-	}
 
-	// Inject standard CLI tools if client didn't send any.
-	payload = injectDefaultToolsIfMissing(payload)
+	// default tools injection removed: non-CLI clients send their own tools.
+	// payload = injectDefaultToolsIfMissing(payload)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {

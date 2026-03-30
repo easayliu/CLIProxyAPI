@@ -2166,15 +2166,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	oauthMode := isClaudeOAuthToken(apiKey)
 	payload = checkSystemInstructionsWithMode(payload, strictMode, oauthMode, stablePoolKey(auth, apiKey))
 
-	// system[2] injection removed: non-CLI clients manage their own system prompts.
-	// oauthMode := isClaudeOAuthToken(apiKey)
-	// payload = injectCLISystemPrompt(payload, model, oauthMode)
-
-	// deferred-tools injection removed: non-CLI clients should not have
-	// CLI-specific tool messages injected.
-	// if !isHaikuModel(model) {
-	// 	payload = injectCLIDeferredTools(payload)
-	// }
+	// Prepend default system-reminders to first user message for consistent
+	// build hash. Real CLI always has these as the first text block, producing
+	// a fixed build hash regardless of client content.
+	payload = migrateSystemToUserMessage(payload, defaultSystemReminders())
 
 	// Match real CLI 2.1.84 behavior: only output_config.effort, no thinking field.
 	// MITM captures confirm real CLI never sends thinking for opus-4-6 or sonnet-4-6.

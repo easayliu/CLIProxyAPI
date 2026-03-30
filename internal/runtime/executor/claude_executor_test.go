@@ -1815,51 +1815,6 @@ func TestInjectCLISystemPrompt_MigratesExtraToUserMessage(t *testing.T) {
 	}
 }
 
-func TestCloaking_InjectsCLISystemPrompt(t *testing.T) {
-	var receivedBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		receivedBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	if len(receivedBody) == 0 {
-		t.Fatal("expected upstream to receive a request body")
-	}
-
-	// Verify system has at least 3 blocks (billing + agent + CLI prompt)
-	systemBlocks := gjson.GetBytes(receivedBody, "system").Array()
-	if len(systemBlocks) < 3 {
-		t.Fatalf("expected at least 3 system blocks in cloaked request, got %d", len(systemBlocks))
-	}
-
-	// system[2] should be the CLI system prompt
-	text := systemBlocks[2].Get("text").String()
-	if !strings.Contains(text, "You are an interactive agent") {
-		t.Fatalf("system[2] should be CLI system prompt, got: %.100s...", text)
-	}
-}
-
 // --- tool_use/tool_result pairing repair tests ---
 
 func TestRepairToolUsePairing_NothingToRepair(t *testing.T) {
@@ -1972,52 +1927,6 @@ func TestRepairToolUsePairing_NextMessageNotUser(t *testing.T) {
 // TestCloaking_ReplacesContextManagement verifies that when cloaking is active
 // (non-claude-cli client), context_management is replaced with the standard CLI
 // value (clear_thinking edit) and server-signed edits are stripped.
-func TestCloaking_ReplacesContextManagement(t *testing.T) {
-	var receivedBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		receivedBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":1}}`))
-	}))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-api03-test-key",
-		"base_url": server.URL,
-	}}
-
-	// Payload with context_management containing server-signed edits
-	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"context_management":{"edits":[{"type":"compact_20260112","signature":"server-sig"}]},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-sonnet-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("claude"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	if len(receivedBody) == 0 {
-		t.Fatal("expected upstream to receive a request body")
-	}
-
-	cm := gjson.GetBytes(receivedBody, "context_management")
-	if !cm.Exists() {
-		t.Fatal("context_management should be present after cloaking (replaced with standard CLI value)")
-	}
-	edits := cm.Get("edits").Array()
-	// For non-OAuth keys, thinking is not injected, so the cloaked
-	// context_management uses cloakingContextManagementNoThinking (empty edits).
-	// clear_thinking_20251015 is only included when thinking is enabled/adaptive.
-	if len(edits) != 0 {
-		t.Fatalf("expected 0 edits in context_management (no thinking for non-OAuth key), got %d", len(edits))
-	}
-}
-
 // TestCloaking_ReplacesContextManagement_Stream verifies that context_management
 // with valid signed edits survives sanitization.  Cloaking does not trigger for
 // non-OAuth keys, so the signed edit is forwarded as-is.

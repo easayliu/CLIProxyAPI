@@ -6,7 +6,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -102,37 +101,47 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	return resp, err
 }
 
-func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	tEntry := time.Now()
-	if opts.Alt == "responses/compact" {
-		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
-	}
+// upstreamPrepResult holds the prepared request and related metadata produced by prepareUpstream.
+type upstreamPrepResult struct {
+	httpReq            *http.Request
+	apiKey             string
+	bodyForTranslation []byte
+	from               sdktranslator.Format
+	to                 sdktranslator.Format
+	reporter           *usageReporter
+	prepDuration       time.Duration
+}
 
-	// Enforce per-auth RPM limit before proceeding
+// prepareUpstream contains the shared preparation logic for Execute and ExecuteStream.
+// It performs rate limiting, body sanitization, cloaking, header injection, and builds
+// the upstream HTTP request. The caller is responsible for sending the request.
+func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, streaming bool, callerTag string) (*upstreamPrepResult, error) {
+	tEntry := time.Now()
+
+	// Enforce per-auth RPM limit before proceeding.
 	t0 := time.Now()
 	if err := checkClaudeRateLimit(auth); err != nil {
-		return resp, err
+		return nil, err
 	}
 	if d := time.Since(t0); d > 50*time.Millisecond {
-		logWithRequestID(ctx).Warnf("[timing] Execute checkClaudeRateLimit took %s", d)
+		logWithRequestID(ctx).Warnf("[timing] %s checkClaudeRateLimit took %s", callerTag, d)
 	}
 
 	baseModel := req.Model
-
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
 
 	// Log identity on every request for auditing.
-	_, _, _, _ = extractAuthIdentity(auth, apiKey)
+	extractAuthIdentity(auth, apiKey)
 
 	poolKey := stablePoolKey(auth, apiKey)
+	isCliClient := isClaudeCodeClient(getClientUserAgent(ctx))
 
-	// Map CLI client session_id to a bounded pool of sessions per auth,
-	// preventing exposure of too many distinct sessions from one account.
+	// Map CLI client session_id to a bounded pool of sessions per auth.
 	var mappedSessionID string
-	if isClaudeCodeClient(getClientUserAgent(ctx)) {
+	if isCliClient {
 		clientSID := extractClientSessionID(req.Payload)
 		if clientSID != "" {
 			mappedSessionID = MapCLISessionID(poolKey, clientSID, 0)
@@ -140,81 +149,34 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
-	// Use streaming translation to preserve function calling, except for claude.
-	stream := from != to
-	// originalPayloadSource := req.Payload
-	// if len(opts.OriginalRequest) > 0 {
-	// 	originalPayloadSource = opts.OriginalRequest
-	// }
-	// originalPayload := originalPayloadSource
-	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	// translateRequest and model override removed: upstream is always claude format,
-	// payload is passed through as-is.
+
 	body := req.Payload
 
-	// temperature/top_p/top_k override and system[0]/[1] injection removed:
-	// clients send their own correct values.
-	// if !isClaudeCodeClient(getClientUserAgent(ctx)) {
-	// 	body, _ = sjson.SetBytes(body, "temperature", 1)
-	// 	body, _ = sjson.DeleteBytes(body, "top_p")
-	// 	body, _ = sjson.DeleteBytes(body, "top_k")
-	// 	oauthMode := isClaudeOAuthToken(apiKey)
-	// 	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
-	// }
-
-	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	// if err != nil {
-	// 	return resp, err
-	// }
-
 	// Sanitize context_management.edits: remove edits without server-issued signatures.
-	// Required for ALL clients (including CLI) because unsigned edits like
-	// clear_thinking_20251015 cause upstream 400/500 errors.
 	body = sanitizeContextManagementEdits(body)
 
 	// For non-CLI clients only: repair malformed body structures.
-	// CLI clients send well-formed requests, skip to preserve body as-is.
-	if !isClaudeCodeClient(getClientUserAgent(ctx)) {
+	if !isCliClient {
 		body = repairToolUsePairing(body)
 		body = sanitizeEmptyTextBlocks(body)
 	}
 
-	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
-	// based on client type and configuration.
+	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation).
 	t0 = time.Now()
-	body, _, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, "")
+	body, _, err := applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, "")
 	if err != nil {
-		return
+		return nil, err
 	}
 	if d := time.Since(t0); d > 50*time.Millisecond {
-		logWithRequestID(ctx).Warnf("[timing] Execute applyCloaking took %s", d)
+		logWithRequestID(ctx).Warnf("[timing] %s applyCloaking took %s", callerTag, d)
 	}
 
-	// Replace metadata.user_id: use auth's real device_id + account_uuid,
-	// and mapped session_id for CLI clients.
-	body = replaceMetadataUserID(body, auth, mappedSessionID)
+	// Replace metadata.user_id with auth's real identity.
+	body = replaceMetadataUserID(body, auth, poolKey, mappedSessionID)
 
-	// requestedModel := payloadRequestedModel(opts, req.Model)
-	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-
-	// // Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	// body = disableThinkingIfToolChoiceForced(body)
-
-	// // Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	// if countCacheControls(body) == 0 {
-	// 	body = ensureCacheControl(body)
-	// }
-
-	// // Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// body = enforceCacheControlLimit(body, 4)
-
-	// // Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// body = normalizeCacheControlTTL(body)
-
-	// Extract betas from body and convert to header
+	// Extract betas from body and convert to header.
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
 	bodyForTranslation := body
@@ -226,71 +188,99 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
-		return resp, err
+		return nil, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel, bodyForUpstream, mappedSessionID)
-	// Debug: log actual upstream request headers and body for capture comparison.
+	applyClaudeHeaders(httpReq, auth, apiKey, streaming, extraBetas, e.cfg, baseModel, bodyForUpstream, mappedSessionID)
+
 	if log.IsLevelEnabled(log.DebugLevel) {
 		hdrs, _ := json.Marshal(httpReq.Header)
 		log.Debugf("[upstream-debug] url=%s headers=%s", url, string(hdrs))
 		log.Debugf("[upstream-debug] body=%s", string(bodyForUpstream))
 	}
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      bodyForUpstream,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
 
-	prepDuration := time.Since(tEntry)
+	recordAPIRequest(ctx, e.cfg, buildUpstreamLog(url, bodyForUpstream, httpReq.Header, e.Identifier(), auth))
+
+	return &upstreamPrepResult{
+		httpReq:            httpReq,
+		apiKey:             apiKey,
+		bodyForTranslation: bodyForTranslation,
+		from:               from,
+		to:                 to,
+		reporter:           reporter,
+		prepDuration:       time.Since(tEntry),
+	}, nil
+}
+
+// buildUpstreamLog constructs an upstreamRequestLog from auth info.
+func buildUpstreamLog(url string, body []byte, headers http.Header, provider string, auth *cliproxyauth.Auth) upstreamRequestLog {
+	info := upstreamRequestLog{
+		URL:      url,
+		Method:   http.MethodPost,
+		Headers:  headers.Clone(),
+		Body:     body,
+		Provider: provider,
+	}
+	if auth != nil {
+		info.AuthID = auth.ID
+		info.AuthLabel = auth.Label
+		info.AuthType, info.AuthValue = auth.AccountInfo()
+	}
+	return info
+}
+
+// handleUpstreamError handles non-2xx responses from upstream, decompressing and logging
+// the error body. Returns a statusErr with the upstream status code.
+func (e *ClaudeExecutor) handleUpstreamError(ctx context.Context, httpResp *http.Response) error {
+	errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+	if decErr != nil {
+		recordAPIResponseError(ctx, e.cfg, decErr)
+		msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
+		logWithRequestID(ctx).Warn(msg)
+		return statusErr{code: httpResp.StatusCode, msg: msg}
+	}
+	b, readErr := io.ReadAll(errBody)
+	if readErr != nil {
+		recordAPIResponseError(ctx, e.cfg, readErr)
+		msg := fmt.Sprintf("failed to read error response body: %v", readErr)
+		logWithRequestID(ctx).Warn(msg)
+		b = []byte(msg)
+	}
+	appendAPIResponseChunk(ctx, e.cfg, b)
+	logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+	if errClose := errBody.Close(); errClose != nil {
+		log.Errorf("response body close error: %v", errClose)
+	}
+	return statusErr{code: httpResp.StatusCode, msg: string(b)}
+}
+
+func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.Alt == "responses/compact" {
+		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+
+	prep, err := e.prepareUpstream(ctx, auth, req, opts, false, "Execute")
+	if err != nil {
+		return resp, err
+	}
+	reporter := prep.reporter
+	defer reporter.trackFailure(ctx, &err)
+
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
-	t0 = time.Now()
-	httpResp, err := httpClient.Do(httpReq)
+	t0 := time.Now()
+	httpResp, err := httpClient.Do(prep.httpReq)
 	upstreamDuration := time.Since(t0)
 	if err != nil {
-		logWithRequestID(ctx).Warnf("[timing] Execute upstream failed after %s (prep=%s): %v", upstreamDuration, prepDuration, err)
+		logWithRequestID(ctx).Warnf("[timing] Execute upstream failed after %s (prep=%s): %v", upstreamDuration, prep.prepDuration, err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	logWithRequestID(ctx).Infof("[timing] Execute upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prepDuration)
+	logWithRequestID(ctx).Infof("[timing] Execute upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prep.prepDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			recordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return resp, statusErr{code: httpResp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			logWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return resp, err
+		return resp, e.handleUpstreamError(ctx, httpResp)
 	}
+
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -304,12 +294,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			log.Errorf("response body close error: %v", errClose)
 		}
 	}()
+
 	data, err := io.ReadAll(decodedBody)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
+
+	stream := prep.from != prep.to
 	if stream {
 		lines := bytes.Split(data, []byte("\n"))
 		for _, line := range lines {
@@ -320,214 +313,53 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.publish(ctx, parseClaudeUsage(data))
 	}
-	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+
+	if isClaudeOAuthToken(prep.apiKey) && !auth.ToolPrefixDisabled() {
 		data = stripClaudeToolPrefixFromResponse(data, claudeToolPrefix)
 	}
+
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,
-		to,
-		from,
+		prep.to,
+		prep.from,
 		req.Model,
 		opts.OriginalRequest,
-		bodyForTranslation,
+		prep.bodyForTranslation,
 		data,
 		&param,
 	)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
-
-	// Telemetry removed.
-	// if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) { ... }
-
-	return resp, nil
+	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	tEntry := time.Now()
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	// Enforce per-auth RPM limit before proceeding
-	t0 := time.Now()
-	if err := checkClaudeRateLimit(auth); err != nil {
+	prep, err := e.prepareUpstream(ctx, auth, req, opts, true, "ExecuteStream")
+	if err != nil {
 		return nil, err
 	}
-	if d := time.Since(t0); d > 50*time.Millisecond {
-		logWithRequestID(ctx).Warnf("[timing] ExecuteStream checkClaudeRateLimit took %s", d)
-	}
-
-	baseModel := req.Model
-
-	apiKey, baseURL := claudeCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com"
-	}
-
-	// Log identity on every request for auditing.
-	_, _, _, _ = extractAuthIdentity(auth, apiKey)
-
-	poolKey := stablePoolKey(auth, apiKey)
-
-	// Map CLI client session_id to a bounded pool of sessions per auth.
-	var mappedSessionID string
-	if isClaudeCodeClient(getClientUserAgent(ctx)) {
-		clientSID := extractClientSessionID(req.Payload)
-		if clientSID != "" {
-			mappedSessionID = MapCLISessionID(poolKey, clientSID, 0)
-		}
-	}
-
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := prep.reporter
 	defer reporter.trackFailure(ctx, &err)
-	from := opts.SourceFormat
-	to := sdktranslator.FromString("claude")
-	// originalPayloadSource := req.Payload
-	// if len(opts.OriginalRequest) > 0 {
-	// 	originalPayloadSource = opts.OriginalRequest
-	// }
-	// originalPayload := originalPayloadSource
-	// originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	// translateRequest and model override removed: upstream is always claude format,
-	// payload is passed through as-is.
-	body := req.Payload
 
-	// temperature/top_p/top_k override and system[0]/[1] injection removed:
-	// clients send their own correct values.
-	// if !isClaudeCodeClient(getClientUserAgent(ctx)) {
-	// 	body, _ = sjson.SetBytes(body, "temperature", 1)
-	// 	body, _ = sjson.DeleteBytes(body, "top_p")
-	// 	body, _ = sjson.DeleteBytes(body, "top_k")
-	// 	oauthMode := isClaudeOAuthToken(apiKey)
-	// 	body = checkSystemInstructionsWithMode(body, false, oauthMode, poolKey)
-	// }
-
-	// body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	// Sanitize context_management.edits: remove edits without server-issued signatures.
-	// Required for ALL clients (including CLI) because unsigned edits like
-	// clear_thinking_20251015 cause upstream 400/500 errors.
-	body = sanitizeContextManagementEdits(body)
-
-	// For non-CLI clients only: repair malformed body structures.
-	// CLI clients send well-formed requests, skip to preserve body as-is.
-	if !isClaudeCodeClient(getClientUserAgent(ctx)) {
-		body = repairToolUsePairing(body)
-		body = sanitizeEmptyTextBlocks(body)
-	}
-
-	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
-	// based on client type and configuration.
-	t0 = time.Now()
-	body, _, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, "")
-	if err != nil {
-		return
-	}
-	if d := time.Since(t0); d > 50*time.Millisecond {
-		logWithRequestID(ctx).Warnf("[timing] ExecuteStream applyCloaking took %s", d)
-	}
-
-	// Replace metadata.user_id: use auth's real device_id + account_uuid,
-	// and mapped session_id for CLI clients.
-	body = replaceMetadataUserID(body, auth, mappedSessionID)
-
-	// requestedModel := payloadRequestedModel(opts, req.Model)
-	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-
-	// // Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	// body = disableThinkingIfToolChoiceForced(body)
-
-	// // Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	// if countCacheControls(body) == 0 {
-	// 	body = ensureCacheControl(body)
-	// }
-
-	// // Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// body = enforceCacheControlLimit(body, 4)
-
-	// // Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// body = normalizeCacheControlTTL(body)
-
-	// Extract betas from body and convert to header
-	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
-	bodyForTranslation := body
-	bodyForUpstream := body
-	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
-		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
-	}
-
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
-	if err != nil {
-		return nil, err
-	}
-	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, baseModel, bodyForUpstream, mappedSessionID)
-	// Debug: log actual upstream request headers and body for capture comparison.
-	if log.IsLevelEnabled(log.DebugLevel) {
-		hdrs, _ := json.Marshal(httpReq.Header)
-		log.Debugf("[upstream-debug] url=%s headers=%s", url, string(hdrs))
-		log.Debugf("[upstream-debug] body=%s", string(bodyForUpstream))
-	}
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      bodyForUpstream,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	prepDuration := time.Since(tEntry)
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
-	t0 = time.Now()
-	httpResp, err := httpClient.Do(httpReq)
+	t0 := time.Now()
+	httpResp, err := httpClient.Do(prep.httpReq)
 	upstreamDuration := time.Since(t0)
 	if err != nil {
-		logWithRequestID(ctx).Warnf("[timing] ExecuteStream upstream failed after %s (prep=%s): %v", upstreamDuration, prepDuration, err)
+		logWithRequestID(ctx).Warnf("[timing] ExecuteStream upstream failed after %s (prep=%s): %v", upstreamDuration, prep.prepDuration, err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
-	logWithRequestID(ctx).Infof("[timing] ExecuteStream upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prepDuration)
+	logWithRequestID(ctx).Infof("[timing] ExecuteStream upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prep.prepDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			recordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return nil, statusErr{code: httpResp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			logWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return nil, err
+		return nil, e.handleUpstreamError(ctx, httpResp)
 	}
+
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -536,8 +368,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		return nil, err
 	}
-	// Telemetry removed.
-	// if e.telemetryEmitter != nil && auth != nil && isClaudeOAuthToken(apiKey) { ... }
+
+	apiKey := prep.apiKey
+	needStripPrefix := isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled()
 
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -548,20 +381,19 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}()
 
-		// If from == to (Claude → Claude), directly forward the SSE stream without translation
-		if from == to {
+		// If from == to (Claude -> Claude), directly forward the SSE stream without translation.
+		if prep.from == prep.to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
 				line := scanner.Bytes()
-		appendAPIResponseChunk(ctx, e.cfg, line)
+				appendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := parseClaudeStreamUsage(line); ok {
 					reporter.publish(ctx, detail)
 				}
-				if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+				if needStripPrefix {
 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 				}
-				// Forward the line as-is to preserve SSE format
 				cloned := make([]byte, len(line)+1)
 				copy(cloned, line)
 				cloned[len(line)] = '\n'
@@ -575,26 +407,26 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 
-		// For other formats, use translation
+		// For other formats, use translation.
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
-appendAPIResponseChunk(ctx, e.cfg, line)
+			appendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := parseClaudeStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
 			}
-			if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+			if needStripPrefix {
 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 			}
 			chunks := sdktranslator.TranslateStream(
 				ctx,
-				to,
-				from,
+				prep.to,
+				prep.from,
 				req.Model,
 				opts.OriginalRequest,
-				bodyForTranslation,
+				prep.bodyForTranslation,
 				bytes.Clone(line),
 				&param,
 			)
@@ -629,11 +461,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body = checkSystemInstructions(body)
 	body = finalizeBillingHeader(body)
 
-	// // Keep count_tokens requests compatible with Anthropic cache-control constraints too.
-	// body = enforceCacheControlLimit(body, 4)
-	// body = normalizeCacheControlTTL(body)
-
-	// Extract betas from body and convert to header (for count_tokens too)
+	// Extract betas from body and convert to header.
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
@@ -646,23 +474,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel, body)
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      body,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
+	recordAPIRequest(ctx, e.cfg, buildUpstreamLog(url, body, httpReq.Header, e.Identifier(), auth))
 
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
 	tCountTokens := time.Now()
@@ -676,28 +488,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	logWithRequestID(ctx).Infof("[timing] CountTokens upstream responded %d in %s", resp.StatusCode, countTokensDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			recordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			logWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, e.handleUpstreamError(ctx, resp)
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
@@ -1233,7 +1024,7 @@ func checkSystemInstructions(payload []byte) []byte {
 //
 // Uses bytes.Replace on the raw JSON to avoid sjson re-serializing the entire
 // body, which corrupts payloads containing redacted thinking content.
-func replaceMetadataUserID(body []byte, auth *cliproxyauth.Auth, overrideSessionID ...string) []byte {
+func replaceMetadataUserID(body []byte, auth *cliproxyauth.Auth, poolKey string, overrideSessionID ...string) []byte {
 	// Extract the original user_id raw JSON value (the escaped string).
 	oldUserID := gjson.GetBytes(body, "metadata.user_id")
 	if !oldUserID.Exists() {
@@ -1264,14 +1055,16 @@ func replaceMetadataUserID(body []byte, auth *cliproxyauth.Auth, overrideSession
 		clientSessionID = uuid.New().String()
 	}
 
-	// Fallbacks for missing identity fields.
-	if realDeviceID == "" {
-		hexBytes := make([]byte, 32)
-		_, _ = rand.Read(hexBytes)
-		realDeviceID = hex.EncodeToString(hexBytes)
-	}
-	if realAccountUUID == "" {
-		realAccountUUID = uuid.New().String()
+	// Fallback: use cached random identity per pool key so the same auth
+	// always gets the same device_id/account_uuid across requests.
+	if realDeviceID == "" || realAccountUUID == "" {
+		cachedDeviceID, cachedAccountUUID := CachedRandomIdentity(poolKey)
+		if realDeviceID == "" {
+			realDeviceID = cachedDeviceID
+		}
+		if realAccountUUID == "" {
+			realAccountUUID = cachedAccountUUID
+		}
 	}
 
 	newPayload, _ := json.Marshal(userIDPayload{

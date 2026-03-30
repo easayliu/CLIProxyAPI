@@ -5,7 +5,49 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
+
+	"github.com/google/uuid"
 )
+
+// identityEntry holds the cached random identity for a given pool key.
+type identityEntry struct {
+	DeviceID    string
+	AccountUUID string
+}
+
+var (
+	identityCacheMu sync.RWMutex
+	identityCache   = make(map[string]*identityEntry)
+)
+
+// CachedRandomIdentity returns a stable random device_id and account_uuid
+// for the given pool key. Values are generated once on first access and
+// reused for all subsequent calls with the same key.
+func CachedRandomIdentity(poolKey string) (deviceID, accountUUID string) {
+	identityCacheMu.RLock()
+	entry, ok := identityCache[poolKey]
+	identityCacheMu.RUnlock()
+	if ok {
+		return entry.DeviceID, entry.AccountUUID
+	}
+
+	identityCacheMu.Lock()
+	defer identityCacheMu.Unlock()
+	// Double-check after acquiring write lock.
+	if entry, ok = identityCache[poolKey]; ok {
+		return entry.DeviceID, entry.AccountUUID
+	}
+
+	hexBytes := make([]byte, 32)
+	_, _ = crand.Read(hexBytes)
+	entry = &identityEntry{
+		DeviceID:    hex.EncodeToString(hexBytes),
+		AccountUUID: uuid.New().String(),
+	}
+	identityCache[poolKey] = entry
+	return entry.DeviceID, entry.AccountUUID
+}
 
 // randomCCH generates a random 5-char hex string, used once per session slot.
 func randomCCH() string {

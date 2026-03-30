@@ -337,33 +337,6 @@ func TestCapture010_SystemArray(t *testing.T) {
 
 // TestCapture010_Temperature verifies temperature is always set to 1
 // (matching capture #010 body).
-func TestCapture010_Temperature(t *testing.T) {
-	server, cap := newCaptureServer(t, false)
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	// Client sends temperature:0.5 — proxy should override to 1
-	payload := []byte(`{
-		"model":"claude-opus-4-6",
-		"max_tokens":1024,
-		"temperature":0.5,
-		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
-	}`)
-
-	_, err := executor.Execute(context.Background(), newTestAuth(server.URL), cliproxyexecutor.Request{
-		Model:   "claude-opus-4-6",
-		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-
-	temp := gjson.GetBytes(cap.Body, "temperature").Float()
-	if temp != 1.0 {
-		t.Errorf("temperature = %v, want 1 (capture #010)", temp)
-	}
-}
-
 // TestCapture010_UserIDFormat verifies metadata.user_id is JSON with
 // device_id, account_uuid, session_id (matching capture #010 body).
 func TestCapture010_UserIDFormat(t *testing.T) {

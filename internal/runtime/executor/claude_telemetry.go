@@ -71,11 +71,18 @@ const (
 	telemetryEventBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
 )
 
-// NewTelemetryEmitter creates a new TelemetryEmitter using the same Bun BoringSSL
-// TLS-fingerprinted HTTP client as the main API requests.
+// NewTelemetryEmitter creates a new TelemetryEmitter using a dedicated HTTP client
+// with Bun BoringSSL TLS fingerprint and a short timeout suitable for telemetry.
+//
+// IMPORTANT: This intentionally creates a separate http.Client instead of reusing
+// the cached one from NewAnthropicHttpClient, because setting Timeout on the shared
+// cached client would affect all API requests (Execute/ExecuteStream) that share
+// the same pointer.
 func NewTelemetryEmitter() *TelemetryEmitter {
-	client := claudeauth.NewAnthropicHttpClient("")
-	client.Timeout = 5 * time.Second
+	client := &http.Client{
+		Transport: claudeauth.NewAnthropicTransport(""),
+		Timeout:   5 * time.Second,
+	}
 	return &TelemetryEmitter{
 		client:   client,
 		upstream: "https://api.anthropic.com",
@@ -246,11 +253,11 @@ func (te *TelemetryEmitter) getOrCreateSessionLocked(apiKey, model, email string
 			orgUUID = identity.OrganizationUUID
 		}
 		// Use the sessionID from the caller (executor) so telemetry identity
-		// matches the API request body. Only fall back to PickSessionID when
-		// the caller did not provide one (should not happen in normal flow).
+		// matches the API request body. Generate a random one as fallback
+		// (should not happen in normal flow).
 		sessionID := identity.SessionID
 		if sessionID == "" {
-			sessionID, _ = PickSessionID(apiKey)
+			sessionID = uuid.New().String()
 		}
 		session = &telemetrySession{
 			deviceID:       deviceID,

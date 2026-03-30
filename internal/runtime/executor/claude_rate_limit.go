@@ -12,10 +12,8 @@ import (
 
 const (
 	// defaultRPM is the default RPM limit per auth when not configured.
-	// A real CLI user averages ~0.5 RPM with bursts up to 4-6 during retries.
-	// Setting 2 allows normal usage while preventing detectable high-frequency patterns.
-	// Override via auth file metadata "rpm" for higher throughput.
-	defaultRPM = 2
+	// Override via auth file metadata "rpm" for custom throughput.
+	defaultRPM = 10
 )
 
 // checkClaudeRateLimit enforces per-auth RPM (requests per minute) limit and

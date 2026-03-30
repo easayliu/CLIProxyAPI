@@ -37,8 +37,7 @@ import (
 // ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
-	cfg                *config.Config
-	sessionInitEmitter *SessionInitEmitter
+	cfg              *config.Config
 	telemetryEmitter *TelemetryEmitter
 }
 
@@ -48,9 +47,8 @@ const claudeToolPrefix = ""
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
 	return &ClaudeExecutor{
-		cfg:                cfg,
-		sessionInitEmitter: NewSessionInitEmitter(),
-		telemetryEmitter:   NewTelemetryEmitter(),
+		cfg:              cfg,
+		telemetryEmitter: NewTelemetryEmitter(),
 	}
 }
 
@@ -93,17 +91,30 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
-	return httpClient.Do(httpReq)
+	t0 := time.Now()
+	resp, err := httpClient.Do(httpReq)
+	elapsed := time.Since(t0)
+	if err != nil {
+		logWithRequestID(ctx).Warnf("[timing] HttpRequest upstream failed after %s: %v", elapsed, err)
+	} else {
+		logWithRequestID(ctx).Infof("[timing] HttpRequest upstream responded %d in %s", resp.StatusCode, elapsed)
+	}
+	return resp, err
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	tEntry := time.Now()
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
 	// Enforce per-auth RPM limit before proceeding
+	t0 := time.Now()
 	if err := checkClaudeRateLimit(auth); err != nil {
 		return resp, err
+	}
+	if d := time.Since(t0); d > 50*time.Millisecond {
+		logWithRequestID(ctx).Warnf("[timing] Execute checkClaudeRateLimit took %s", d)
 	}
 
 	baseModel := req.Model
@@ -116,12 +127,17 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Log identity on every request for auditing.
 	_, _, _, _ = extractAuthIdentity(auth, apiKey)
 
-	// Session pool and init removed: no session management needed.
 	poolKey := stablePoolKey(auth, apiKey)
-	var sessionID string
-	// EnsureSessionPool(poolKey, slotCount)
-	// sessionID, slotDeviceID := PickSessionID(poolKey)
-	// EmitSessionInit(...)
+
+	// Map CLI client session_id to a bounded pool of sessions per auth,
+	// preventing exposure of too many distinct sessions from one account.
+	var mappedSessionID string
+	if isClaudeCodeClient(getClientUserAgent(ctx)) {
+		clientSID := extractClientSessionID(req.Payload)
+		if clientSID != "" {
+			mappedSessionID = MapCLISessionID(poolKey, clientSID, 0)
+		}
+	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
@@ -154,67 +170,32 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// 	return resp, err
 	// }
 
-	// Sanitize context_management.edits: remove unsupported edit types before
-	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
+	// Sanitize context_management.edits: remove edits without server-issued signatures.
+	// Required for ALL clients (including CLI) because unsigned edits like
+	// clear_thinking_20251015 cause upstream 400/500 errors.
 	body = sanitizeContextManagementEdits(body)
 
-	// Repair tool_use/tool_result pairing: inject stub tool_result for any
-	// orphaned tool_use blocks. Clients may forward truncated conversations.
-	body = repairToolUsePairing(body)
-
-	// Remove empty/whitespace-only text blocks that Anthropic rejects with
-	// "text content blocks must contain non-whitespace text".
-	body = sanitizeEmptyTextBlocks(body)
+	// For non-CLI clients only: repair malformed body structures.
+	// CLI clients send well-formed requests, skip to preserve body as-is.
+	if !isClaudeCodeClient(getClientUserAgent(ctx)) {
+		body = repairToolUsePairing(body)
+		body = sanitizeEmptyTextBlocks(body)
+	}
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
-	var poolSessionID string
-	body, poolSessionID, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	t0 = time.Now()
+	body, _, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, "")
 	if err != nil {
 		return
 	}
-	if poolSessionID != "" {
-		defer ReleaseSessionSlot(poolKey, poolSessionID)
+	if d := time.Since(t0); d > 50*time.Millisecond {
+		logWithRequestID(ctx).Warnf("[timing] Execute applyCloaking took %s", d)
 	}
 
 	// Replace metadata.user_id: use auth's real device_id + account_uuid,
-	// preserve session_id from the client's original user_id for session continuity.
-	{
-		realDeviceID := ""
-		realAccountUUID := ""
-		if auth != nil && auth.Metadata != nil {
-			if v, ok := auth.Metadata["device_id"].(string); ok {
-				realDeviceID = v
-			}
-			if v, ok := auth.Metadata["account_uuid"].(string); ok {
-				realAccountUUID = v
-			}
-		}
-		// Extract session_id from client's original metadata.user_id.
-		clientSessionID := extractFieldFromUserID(gjson.GetBytes(body, "metadata.user_id").String(), "session_id")
-		if clientSessionID == "" {
-			clientSessionID = uuid.New().String()
-		}
-		// Use real values from auth when available, otherwise generate random.
-		devID := realDeviceID
-		if devID == "" {
-			hexBytes := make([]byte, 32)
-			_, _ = rand.Read(hexBytes)
-			devID = hex.EncodeToString(hexBytes)
-		}
-		accUUID := realAccountUUID
-		if accUUID == "" {
-			accUUID = uuid.New().String()
-		}
-		data, _ := json.Marshal(userIDPayload{
-			DeviceID:    devID,
-			AccountUUID: accUUID,
-			SessionID:   clientSessionID,
-		})
-		uid := string(data)
-		body, _ = sjson.SetBytes(body, "metadata.user_id", uid)
-		log.Infof("[claude-identity] metadata.user_id=%s", uid)
-	}
+	// and mapped session_id for CLI clients.
+	body = replaceMetadataUserID(body, auth, mappedSessionID)
 
 	// requestedModel := payloadRequestedModel(opts, req.Model)
 	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -247,7 +228,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel, bodyForUpstream)
+	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel, bodyForUpstream, mappedSessionID)
+	// Debug: log actual upstream request headers and body for capture comparison.
+	if log.IsLevelEnabled(log.DebugLevel) {
+		hdrs, _ := json.Marshal(httpReq.Header)
+		log.Debugf("[upstream-debug] url=%s headers=%s", url, string(hdrs))
+		log.Debugf("[upstream-debug] body=%s", string(bodyForUpstream))
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -266,12 +253,17 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		AuthValue: authValue,
 	})
 
+	prepDuration := time.Since(tEntry)
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
+	t0 = time.Now()
 	httpResp, err := httpClient.Do(httpReq)
+	upstreamDuration := time.Since(t0)
 	if err != nil {
+		logWithRequestID(ctx).Warnf("[timing] Execute upstream failed after %s (prep=%s): %v", upstreamDuration, prepDuration, err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	logWithRequestID(ctx).Infof("[timing] Execute upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prepDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -351,13 +343,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	tEntry := time.Now()
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
 	// Enforce per-auth RPM limit before proceeding
+	t0 := time.Now()
 	if err := checkClaudeRateLimit(auth); err != nil {
 		return nil, err
+	}
+	if d := time.Since(t0); d > 50*time.Millisecond {
+		logWithRequestID(ctx).Warnf("[timing] ExecuteStream checkClaudeRateLimit took %s", d)
 	}
 
 	baseModel := req.Model
@@ -370,12 +367,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Log identity on every request for auditing.
 	_, _, _, _ = extractAuthIdentity(auth, apiKey)
 
-	// Session pool and init removed: no session management needed.
 	poolKey := stablePoolKey(auth, apiKey)
-	var sessionID string
-	// EnsureSessionPool(poolKey, slotCount)
-	// sessionID, slotDeviceID := PickSessionID(poolKey)
-	// EmitSessionInit(...)
+
+	// Map CLI client session_id to a bounded pool of sessions per auth.
+	var mappedSessionID string
+	if isClaudeCodeClient(getClientUserAgent(ctx)) {
+		clientSID := extractClientSessionID(req.Payload)
+		if clientSID != "" {
+			mappedSessionID = MapCLISessionID(poolKey, clientSID, 0)
+		}
+	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.trackFailure(ctx, &err)
@@ -406,67 +407,32 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// 	return nil, err
 	// }
 
-	// Sanitize context_management.edits: remove unsupported edit types before
-	// sending to upstream. Unknown types cause 400 errors regardless of cloaking.
+	// Sanitize context_management.edits: remove edits without server-issued signatures.
+	// Required for ALL clients (including CLI) because unsigned edits like
+	// clear_thinking_20251015 cause upstream 400/500 errors.
 	body = sanitizeContextManagementEdits(body)
 
-	// Repair tool_use/tool_result pairing: inject stub tool_result for any
-	// orphaned tool_use blocks. Clients may forward truncated conversations.
-	body = repairToolUsePairing(body)
-
-	// Remove empty/whitespace-only text blocks that Anthropic rejects with
-	// "text content blocks must contain non-whitespace text".
-	body = sanitizeEmptyTextBlocks(body)
+	// For non-CLI clients only: repair malformed body structures.
+	// CLI clients send well-formed requests, skip to preserve body as-is.
+	if !isClaudeCodeClient(getClientUserAgent(ctx)) {
+		body = repairToolUsePairing(body)
+		body = sanitizeEmptyTextBlocks(body)
+	}
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation)
 	// based on client type and configuration.
-	var poolSessionID string
-	body, poolSessionID, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, sessionID)
+	t0 = time.Now()
+	body, _, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey, "")
 	if err != nil {
 		return
 	}
-	if poolSessionID != "" {
-		defer ReleaseSessionSlot(poolKey, poolSessionID)
+	if d := time.Since(t0); d > 50*time.Millisecond {
+		logWithRequestID(ctx).Warnf("[timing] ExecuteStream applyCloaking took %s", d)
 	}
 
 	// Replace metadata.user_id: use auth's real device_id + account_uuid,
-	// preserve session_id from the client's original user_id for session continuity.
-	{
-		realDeviceID := ""
-		realAccountUUID := ""
-		if auth != nil && auth.Metadata != nil {
-			if v, ok := auth.Metadata["device_id"].(string); ok {
-				realDeviceID = v
-			}
-			if v, ok := auth.Metadata["account_uuid"].(string); ok {
-				realAccountUUID = v
-			}
-		}
-		// Extract session_id from client's original metadata.user_id.
-		clientSessionID := extractFieldFromUserID(gjson.GetBytes(body, "metadata.user_id").String(), "session_id")
-		if clientSessionID == "" {
-			clientSessionID = uuid.New().String()
-		}
-		// Use real values from auth when available, otherwise generate random.
-		devID := realDeviceID
-		if devID == "" {
-			hexBytes := make([]byte, 32)
-			_, _ = rand.Read(hexBytes)
-			devID = hex.EncodeToString(hexBytes)
-		}
-		accUUID := realAccountUUID
-		if accUUID == "" {
-			accUUID = uuid.New().String()
-		}
-		data, _ := json.Marshal(userIDPayload{
-			DeviceID:    devID,
-			AccountUUID: accUUID,
-			SessionID:   clientSessionID,
-		})
-		uid := string(data)
-		body, _ = sjson.SetBytes(body, "metadata.user_id", uid)
-		log.Infof("[claude-identity] metadata.user_id=%s", uid)
-	}
+	// and mapped session_id for CLI clients.
+	body = replaceMetadataUserID(body, auth, mappedSessionID)
 
 	// requestedModel := payloadRequestedModel(opts, req.Model)
 	// body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -499,7 +465,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, baseModel, bodyForUpstream)
+	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, baseModel, bodyForUpstream, mappedSessionID)
+	// Debug: log actual upstream request headers and body for capture comparison.
+	if log.IsLevelEnabled(log.DebugLevel) {
+		hdrs, _ := json.Marshal(httpReq.Header)
+		log.Debugf("[upstream-debug] url=%s headers=%s", url, string(hdrs))
+		log.Debugf("[upstream-debug] body=%s", string(bodyForUpstream))
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -518,12 +490,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
+	prepDuration := time.Since(tEntry)
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
+	t0 = time.Now()
 	httpResp, err := httpClient.Do(httpReq)
+	upstreamDuration := time.Since(t0)
 	if err != nil {
+		logWithRequestID(ctx).Warnf("[timing] ExecuteStream upstream failed after %s (prep=%s): %v", upstreamDuration, prepDuration, err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
+	logWithRequestID(ctx).Infof("[timing] ExecuteStream upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prepDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -688,11 +665,15 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	})
 
 	httpClient := newClaudeHTTPClient(e.cfg, auth)
+	tCountTokens := time.Now()
 	resp, err := httpClient.Do(httpReq)
+	countTokensDuration := time.Since(tCountTokens)
 	if err != nil {
+		logWithRequestID(ctx).Warnf("[timing] CountTokens upstream failed after %s: %v", countTokensDuration, err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
+	logWithRequestID(ctx).Infof("[timing] CountTokens upstream responded %d in %s", resp.StatusCode, countTokensDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -956,6 +937,87 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
+// buildAnthropicBeta builds the anthropic-beta header value dynamically based on
+// upstream auth type, model, request body content, and extra betas.
+// Matches real Claude CLI 2.1.87 behavior observed via MITM capture.
+func buildAnthropicBeta(apiKey, model string, body []byte, extraBetas []string, ginHeaders http.Header) string {
+	betaSet := make(map[string]bool)
+	addBeta := func(b string) { betaSet[b] = true }
+
+	// Always present in real CLI with OAuth tokens.
+	if isClaudeOAuthToken(apiKey) {
+		addBeta("oauth-2025-04-20")
+	}
+	addBeta("interleaved-thinking-2025-05-14")
+	addBeta("prompt-caching-scope-2026-01-05")
+
+	// Conditional betas based on body features.
+	hasTools := gjson.GetBytes(body, "tools").IsArray() && len(gjson.GetBytes(body, "tools").Array()) > 0
+	if hasTools {
+		addBeta("claude-code-20250219")
+		addBeta("advanced-tool-use-2025-11-20")
+	}
+	if gjson.GetBytes(body, "thinking").Exists() || gjson.GetBytes(body, "output_config.effort").Exists() {
+		addBeta("effort-2025-11-24")
+	}
+	if gjson.GetBytes(body, "output_config.format.type").String() == "json_schema" {
+		addBeta("structured-outputs-2025-12-15")
+	}
+	if gjson.GetBytes(body, "context_management").Exists() || !isHaikuModel(model) {
+		addBeta("context-management-2025-06-27")
+	}
+	if modelSupports1MContext(model) || strings.Contains(model, "opus-4-6") {
+		addBeta("context-1m-2025-08-07")
+	}
+
+	if ginHeaders != nil {
+		if _, ok := ginHeaders[textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M")]; ok {
+			addBeta("context-1m-2025-08-07")
+		}
+		// Preserve client betas not in our predefined set (e.g. redact-thinking).
+		if clientBeta := ginHeaders.Get("anthropic-beta"); clientBeta != "" {
+			for _, b := range strings.Split(clientBeta, ",") {
+				b = strings.TrimSpace(b)
+				if b != "" {
+					addBeta(b)
+				}
+			}
+		}
+	}
+
+	for _, beta := range extraBetas {
+		beta = strings.TrimSpace(beta)
+		if beta != "" {
+			addBeta(beta)
+		}
+	}
+
+	// Assemble in a stable order matching real CLI output.
+	betaOrder := []string{
+		"claude-code-20250219",
+		"oauth-2025-04-20",
+		"context-1m-2025-08-07",
+		"interleaved-thinking-2025-05-14",
+		"redact-thinking-2026-02-12",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
+		"advanced-tool-use-2025-11-20",
+		"effort-2025-11-24",
+		"structured-outputs-2025-12-15",
+	}
+	var betas []string
+	for _, b := range betaOrder {
+		if betaSet[b] {
+			betas = append(betas, b)
+			delete(betaSet, b)
+		}
+	}
+	for b := range betaSet {
+		betas = append(betas, b)
+	}
+	return strings.Join(betas, ",")
+}
+
 // isHaikuModel returns true for all Haiku model variants (3.5 and 4.5).
 // Real CLI sends full system prompt for Haiku but skips deferred-tools,
 // adaptive thinking, and effort injection.
@@ -970,17 +1032,22 @@ func modelSupports1MContext(model string) bool {
 	return strings.Contains(strings.ToLower(model), "[1m]")
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config, model string, body []byte) {
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config, model string, body []byte, mappedSessionID ...string) {
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	// CLI clients: passthrough original headers, only replace auth credentials.
+	// CLI clients: passthrough original headers, only replace auth credentials
+	// and rebuild anthropic-beta (client generates betas based on proxy key/domain,
+	// which may differ from the actual upstream OAuth context).
 	if ginHeaders != nil && isClaudeCodeClient(ginHeaders.Get("User-Agent")) {
 		for k, v := range ginHeaders {
 			r.Header[k] = v
 		}
+		// Remove proxy-specific headers that must not leak to upstream.
+		r.Header.Del("Host")
+		r.Header.Del("Content-Length") // recalculated by http.Client
 		// Replace auth with proxy's credentials.
 		if isClaudeOAuthToken(apiKey) {
 			r.Header.Del("x-api-key")
@@ -989,7 +1056,22 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 			r.Header.Del("Authorization")
 			r.Header.Set("x-api-key", apiKey)
 		}
-		r.Header.Set("Content-Type", "application/json")
+		// Ensure x-client-request-id is present (real CLI sends it to
+		// api.anthropic.com but may omit it when targeting a proxy domain).
+		if r.Header.Get("x-client-request-id") == "" {
+			r.Header.Set("x-client-request-id", uuid.New().String())
+		}
+		// Replace X-Claude-Code-Session-Id with mapped pool session to
+		// bound the number of visible sessions per auth.
+		if len(mappedSessionID) > 0 && mappedSessionID[0] != "" {
+			r.Header.Set("X-Claude-Code-Session-Id", mappedSessionID[0])
+		}
+		// Rebuild anthropic-beta: start from client's betas, then supplement
+		// any missing betas that the proxy's upstream auth/model context requires.
+		r.Header.Del("anthropic-beta")
+		r.Header.Del("Anthropic-Beta")
+		betaStr := buildAnthropicBeta(apiKey, model, body, extraBetas, ginHeaders)
+		r.Header["anthropic-beta"] = []string{betaStr}
 		return
 	}
 
@@ -1017,80 +1099,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("Content-Type", "application/json")
 
 
-	// Build Anthropic-Beta dynamically based on request body content,
-	// matching real Claude CLI 2.1.84 behavior observed via MITM capture.
-	betaSet := make(map[string]bool)
-	addBeta := func(b string) { betaSet[b] = true }
-
-	// Always present in real CLI.
-	addBeta("oauth-2025-04-20")
-	addBeta("interleaved-thinking-2025-05-14")
-	addBeta("prompt-caching-scope-2026-01-05")
-
-	// Conditional betas based on body features.
-	hasTools := gjson.GetBytes(body, "tools").IsArray() && len(gjson.GetBytes(body, "tools").Array()) > 0
-	if hasTools {
-		addBeta("claude-code-20250219")
-		addBeta("advanced-tool-use-2025-11-20")
-	}
-	if gjson.GetBytes(body, "thinking").Exists() || gjson.GetBytes(body, "output_config.effort").Exists() {
-		addBeta("effort-2025-11-24")
-	}
-	if gjson.GetBytes(body, "output_config.format.type").String() == "json_schema" {
-		addBeta("structured-outputs-2025-12-15")
-	}
-	// Real CLI 2.1.84 always includes context-management beta for non-haiku models,
-	// even when the body has no context_management field (MITM capture confirmed).
-	if gjson.GetBytes(body, "context_management").Exists() || !isHaikuModel(model) {
-		addBeta("context-management-2025-06-27")
-	}
-	// Real CLI 2.1.84 always includes context-1m beta for Opus 4.6 (MITM capture confirmed).
-	// Also add it when model explicitly requests 1M via [1m] suffix or X-CPA-CLAUDE-1M header.
-	if modelSupports1MContext(model) || strings.Contains(model, "opus-4-6") {
-		addBeta("context-1m-2025-08-07")
-	}
-
-	hasClaude1MHeader := false
-	if ginHeaders != nil {
-		if _, ok := ginHeaders[textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M")]; ok {
-			hasClaude1MHeader = true
-		}
-	}
-	if hasClaude1MHeader {
-		addBeta("context-1m-2025-08-07")
-	}
-
-	// Merge extra betas from request body and request flags.
-	for _, beta := range extraBetas {
-		beta = strings.TrimSpace(beta)
-		if beta != "" {
-			addBeta(beta)
-		}
-	}
-
-	// Assemble in a stable order matching real CLI output.
-	betaOrder := []string{
-		"claude-code-20250219",
-		"oauth-2025-04-20",
-		"context-1m-2025-08-07",
-		"interleaved-thinking-2025-05-14",
-		"context-management-2025-06-27",
-		"prompt-caching-scope-2026-01-05",
-		"advanced-tool-use-2025-11-20",
-		"effort-2025-11-24",
-		"structured-outputs-2025-12-15",
-	}
-	var betas []string
-	for _, b := range betaOrder {
-		if betaSet[b] {
-			betas = append(betas, b)
-			delete(betaSet, b)
-		}
-	}
-	// Append any remaining (extra betas not in the predefined order).
-	for b := range betaSet {
-		betas = append(betas, b)
-	}
+	betaStr := buildAnthropicBeta(apiKey, model, body, extraBetas, ginHeaders)
+	betas := strings.Split(betaStr, ",")
 	// Use exact header casing from real CLI MITM capture (2.1.84).
 	// Go's r.Header.Set() canonicalizes keys (e.g. "anthropic-beta" → "Anthropic-Beta"),
 	// so we bypass it with direct map assignment r.Header["key"] = []string{val}.
@@ -1214,6 +1224,69 @@ func extractAuthIdentity(auth *cliproxyauth.Auth, apiKey string) (deviceID, acco
 
 func checkSystemInstructions(payload []byte) []byte {
 	return checkSystemInstructionsWithMode(payload, false, false, "")
+}
+
+// replaceMetadataUserID replaces metadata.user_id in the request body with
+// the auth's real device_id/account_uuid. When overrideSessionID is non-empty,
+// it replaces the client's session_id with the given value; otherwise preserves
+// the client's original session_id.
+//
+// Uses bytes.Replace on the raw JSON to avoid sjson re-serializing the entire
+// body, which corrupts payloads containing redacted thinking content.
+func replaceMetadataUserID(body []byte, auth *cliproxyauth.Auth, overrideSessionID ...string) []byte {
+	// Extract the original user_id raw JSON value (the escaped string).
+	oldUserID := gjson.GetBytes(body, "metadata.user_id")
+	if !oldUserID.Exists() {
+		return body
+	}
+
+	// Get real identity from auth metadata.
+	realDeviceID := ""
+	realAccountUUID := ""
+	if auth != nil && auth.Metadata != nil {
+		if v, ok := auth.Metadata["device_id"].(string); ok {
+			realDeviceID = v
+		}
+		if v, ok := auth.Metadata["account_uuid"].(string); ok {
+			realAccountUUID = v
+		}
+	}
+
+	// Use override session_id if provided (e.g. from CLI session pool mapping),
+	// otherwise preserve client's original session_id for conversation continuity.
+	var clientSessionID string
+	if len(overrideSessionID) > 0 && overrideSessionID[0] != "" {
+		clientSessionID = overrideSessionID[0]
+	} else {
+		clientSessionID = extractFieldFromUserID(oldUserID.String(), "session_id")
+	}
+	if clientSessionID == "" {
+		clientSessionID = uuid.New().String()
+	}
+
+	// Fallbacks for missing identity fields.
+	if realDeviceID == "" {
+		hexBytes := make([]byte, 32)
+		_, _ = rand.Read(hexBytes)
+		realDeviceID = hex.EncodeToString(hexBytes)
+	}
+	if realAccountUUID == "" {
+		realAccountUUID = uuid.New().String()
+	}
+
+	newPayload, _ := json.Marshal(userIDPayload{
+		DeviceID:    realDeviceID,
+		AccountUUID: realAccountUUID,
+		SessionID:   clientSessionID,
+	})
+
+	// Build the new JSON string value (what appears after "user_id":).
+	// oldUserID.Raw is the raw JSON token including quotes, e.g. "{\"device_id\":...}"
+	newRaw, _ := json.Marshal(string(newPayload))
+
+	result := bytes.Replace(body, []byte(oldUserID.Raw), newRaw, 1)
+	log.Infof("[claude-identity] metadata.user_id=%s", string(newPayload))
+	return result
 }
 
 func isClaudeOAuthToken(apiKey string) bool {
@@ -1469,33 +1542,6 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 	return nil
 }
 
-// injectFakeUserID generates and injects a fake user ID into the request metadata.
-// All three fields (device_id, account_uuid, session_id) are replaced to prevent
-// cross-referencing between client telemetry and proxied API requests.
-// When useCache is false, a new user ID is generated for every call.
-//
-// Real Claude Code CLI sends ONLY metadata.user_id — no organization_uuid or other
-// fields in the metadata object. Verified via packet capture of real CLI traffic.
-// injectFakeUserID replaces metadata.user_id with a generated identity.
-// poolKey is a stable identifier (e.g. auth.ID) used to key the session pool,
-// NOT the volatile OAuth access_token which changes on refresh.
-// injectFakeUserID returns the modified payload and the pool sessionID for release.
-func injectFakeUserID(payload []byte, poolKey string, useCache bool, realDeviceID string, realAccountUUID string, slotCount int, hintSessionID string) ([]byte, string, error) {
-	var uid string
-	var pickedSessionID string
-	if useCache {
-		uid, pickedSessionID = cachedUserIDWithSession(poolKey, realDeviceID, realAccountUUID, hintSessionID, slotCount)
-		if uid == "" {
-			return payload, "", fmt.Errorf("session pool timeout: all slots busy")
-		}
-	} else {
-		uid = generateFakeUserID()
-	}
-
-	payload, _ = sjson.SetBytes(payload, "metadata.user_id", uid)
-	log.Infof("[claude-identity] metadata.user_id=%s", uid)
-	return payload, pickedSessionID, nil
-}
 
 // billingBuildHashSalt is the fixed salt used by real Claude Code CLI
 // to compute the per-request build hash in the billing header.
@@ -1764,12 +1810,35 @@ func sanitizeContextManagementEdits(payload []byte) []byte {
 	}
 
 	if len(kept) == 0 {
-		// Remove context_management entirely if no valid edits remain
-		result, _ := sjson.DeleteBytes(payload, "context_management")
+		// Remove context_management entirely if no valid edits remain.
+		// Use bytes-level removal to avoid sjson corrupting large payloads
+		// with redacted thinking content.
+		cmRaw := cm.Raw // e.g. {"edits":[{"keep":"all","type":"clear_thinking_20251015"}]}
+		// Try removing "context_management":{...}, (with trailing comma)
+		target := []byte(`"context_management":` + cmRaw + ",")
+		result := bytes.Replace(payload, target, nil, 1)
+		if len(result) == len(payload) {
+			// Try with leading comma instead (field is last in object)
+			target = []byte(`,"context_management":` + cmRaw)
+			result = bytes.Replace(payload, target, nil, 1)
+		}
+		if len(result) < len(payload) {
+			return result
+		}
+		// Fallback to sjson if bytes.Replace didn't match
+		result, _ = sjson.DeleteBytes(payload, "context_management")
 		return result
 	}
 
-	result, _ := sjson.SetBytes(payload, "context_management.edits", kept)
+	// Replace edits array with only the valid ones.
+	newEdits, _ := json.Marshal(kept)
+	oldEdits := []byte(edits.Raw)
+	result := bytes.Replace(payload, oldEdits, newEdits, 1)
+	if len(result) != len(payload) {
+		return result
+	}
+	// Fallback to sjson if bytes.Replace didn't match
+	result, _ = sjson.SetBytes(payload, "context_management.edits", kept)
 	return result
 }
 
@@ -2133,10 +2202,36 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// context_management replacement removed: clients manage their own context.
 	// payload = replaceContextManagementForCloaking(payload)
 
-	var poolSessionID string
-
-	// default tools injection removed: non-CLI clients send their own tools.
-	// payload = injectDefaultToolsIfMissing(payload)
+	// Inject fake user_id for non-CLI clients to prevent the client's original
+	// identity from leaking to upstream. Uses auth's real device_id/account_uuid
+	// and a pooled session_id to keep the number of visible sessions bounded.
+	poolKey := stablePoolKey(auth, apiKey)
+	realDeviceID, realAccountUUID := "", ""
+	if auth != nil && auth.Metadata != nil {
+		if v, ok := auth.Metadata["device_id"].(string); ok {
+			realDeviceID = v
+		}
+		if v, ok := auth.Metadata["account_uuid"].(string); ok {
+			realAccountUUID = v
+		}
+	}
+	if realDeviceID == "" {
+		realDeviceID = DeriveDeviceID(poolKey)
+	}
+	if realAccountUUID == "" {
+		realAccountUUID = DeriveAccountUUID(poolKey)
+	}
+	// Use a stable session_id from the CLI session pool. For non-CLI clients
+	// without a real session_id, derive one from the pool key so the mapping
+	// is deterministic per auth.
+	fakeSessionID := MapCLISessionID(poolKey, DeriveDeviceID(poolKey+":non-cli"), 0)
+	fakeUID, _ := json.Marshal(userIDPayload{
+		DeviceID:    realDeviceID,
+		AccountUUID: realAccountUUID,
+		SessionID:   fakeSessionID,
+	})
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", string(fakeUID))
+	log.Infof("[cloaking] metadata.user_id=%s", string(fakeUID))
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {
@@ -2148,7 +2243,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// that all injections (system-reminder, deferred-tools, etc.) are done.
 	payload = finalizeBillingHeader(payload)
 
-	return payload, poolSessionID, nil
+	return payload, "", nil
 }
 
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.

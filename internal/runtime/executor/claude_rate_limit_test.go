@@ -21,13 +21,13 @@ func TestCheckClaudeRateLimit_NilAuth(t *testing.T) {
 }
 
 func TestCheckClaudeRateLimit_DefaultRPM(t *testing.T) {
-	// Without explicit rpm, defaultRPM (2) applies.
+	// Without explicit rpm, defaultRPM (10) applies.
 	auth := &cliproxyauth.Auth{
 		ID:       "test-default-rpm",
 		Provider: "claude",
 		Metadata: map[string]any{},
 	}
-	// First 2 should pass.
+	// First defaultRPM requests should pass.
 	for i := 0; i < defaultRPM; i++ {
 		if err := checkClaudeRateLimit(auth); err != nil {
 			t.Fatalf("request %d: expected pass within default RPM, got %v", i+1, err)

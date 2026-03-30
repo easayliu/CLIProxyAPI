@@ -2154,6 +2154,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// upstream proxies from injecting identifiable fields into the request body.
 	payload = stripNonStandardFields(payload)
 
+	// Real Claude Code CLI never sends temperature, top_p, or top_k in main
+	// conversation requests (confirmed via MITM captures). Strip them to match.
+	payload, _ = sjson.DeleteBytes(payload, "temperature")
+	payload, _ = sjson.DeleteBytes(payload, "top_p")
+	payload, _ = sjson.DeleteBytes(payload, "top_k")
+
 	// Normalize max_tokens to match the model's default when cloaking is active.
 	// Non-Claude-Code clients (e.g. NewAPI, OpenAI SDKs) may send a fixed default
 	// (like 8192) for all models, which is a detectable fingerprint since real

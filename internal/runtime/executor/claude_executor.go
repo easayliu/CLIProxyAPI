@@ -282,6 +282,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	logWithRequestID(ctx).Infof("[timing] Execute upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prep.prepDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	updateAuthRateLimit(auth, httpResp.Header)
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		return resp, e.handleUpstreamError(ctx, httpResp)
@@ -361,6 +362,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	logWithRequestID(ctx).Infof("[timing] ExecuteStream upstream responded %d in %s (prep=%s)", httpResp.StatusCode, upstreamDuration, prep.prepDuration)
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	updateAuthRateLimit(auth, httpResp.Header)
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		return nil, e.handleUpstreamError(ctx, httpResp)

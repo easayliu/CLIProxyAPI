@@ -74,6 +74,8 @@ type Auth struct {
 	Metadata map[string]any `json:"metadata,omitempty"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
+	// RateLimit captures Anthropic unified rate limit state from response headers.
+	RateLimit RateLimitState `json:"rate_limit"`
 	// LastError stores the last failure encountered while executing or refreshing.
 	LastError *Error `json:"last_error,omitempty"`
 	// CreatedAt is the creation timestamp in UTC.
@@ -105,6 +107,30 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+}
+
+// RateLimitState captures Anthropic unified rate limit information extracted from
+// response headers. Updated automatically after each successful API request.
+type RateLimitState struct {
+	// OrganizationID is the Anthropic org owning this credential.
+	OrganizationID string `json:"organization_id,omitempty"`
+	// FiveHour window
+	FiveHourUtilization float64 `json:"five_hour_utilization"`
+	FiveHourStatus      string  `json:"five_hour_status,omitempty"`
+	FiveHourReset       int64   `json:"five_hour_reset,omitempty"`
+	// SevenDay window
+	SevenDayUtilization float64 `json:"seven_day_utilization"`
+	SevenDayStatus      string  `json:"seven_day_status,omitempty"`
+	SevenDayReset       int64   `json:"seven_day_reset,omitempty"`
+	// Unified (representative)
+	UnifiedStatus          string `json:"unified_status,omitempty"`
+	UnifiedReset           int64  `json:"unified_reset,omitempty"`
+	RepresentativeClaim    string `json:"representative_claim,omitempty"`
+	FallbackPercentage     float64 `json:"fallback_percentage,omitempty"`
+	OverageStatus          string `json:"overage_status,omitempty"`
+	OverageDisabledReason  string `json:"overage_disabled_reason,omitempty"`
+	// UpdatedAt is when this state was last refreshed.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.

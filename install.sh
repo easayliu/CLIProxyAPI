@@ -659,6 +659,18 @@ EOF
     # Reload systemd daemon
     systemctl --user daemon-reload || log_warning "Could not reload systemd daemon (this is normal on first run)"
 
+    # Enable lingering so user services survive terminal/SSH disconnects.
+    # Without this, systemd kills user services when the last session closes.
+    local linger_user
+    linger_user="$(whoami)"
+    if command -v loginctl &>/dev/null; then
+        if loginctl enable-linger "$linger_user" 2>/dev/null; then
+            log_success "Enabled lingering for user $linger_user (services persist after logout)"
+        else
+            log_warning "Could not enable lingering. Run manually: sudo loginctl enable-linger $linger_user"
+        fi
+    fi
+
     log_success "Systemd service file created: $service_file"
     log_success "Systemd service installed: $systemd_service_file"
     log_info "To enable and start the service:"

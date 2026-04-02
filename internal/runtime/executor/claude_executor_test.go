@@ -2216,3 +2216,98 @@ func TestSanitizeEmptyTextBlocks_E2E_Execute(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// firstUserMessageText / computeBuildHash tests
+// ---------------------------------------------------------------------------
+
+func TestFirstUserMessageText_ReturnsFirstTextBlock(t *testing.T) {
+	// Normal array-content: returns the first text block verbatim.
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"hello world"}]}
+	]}`)
+	got := firstUserMessageText(payload)
+	if got != "hello world" {
+		t.Fatalf("expected 'hello world', got %q", got)
+	}
+}
+
+func TestFirstUserMessageText_ReturnsSystemReminderBlock(t *testing.T) {
+	// The injected combined reminder (starts with <system-reminder>) is the FIRST
+	// text block and must be returned as-is so the billing hash is computed from it.
+	reminder := "<system-reminder>\nThe following deferred tools are now available via ToolSearch:\nAskUserQuestion\n</system-reminder>\n"
+	payload, _ := sjson.SetBytes([]byte(`{"messages":[]}`),
+		"messages",
+		[]map[string]interface{}{
+			{
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "text", "text": reminder},
+					{"type": "text", "text": "actual user question"},
+				},
+			},
+		},
+	)
+	got := firstUserMessageText(payload)
+	if got != reminder {
+		t.Fatalf("expected system-reminder block as first text, got %q", got)
+	}
+}
+
+func TestFirstUserMessageText_SkipsDeferredToolsStringMessage(t *testing.T) {
+	// A user message whose string content contains <available-deferred-tools> is skipped.
+	payload := []byte(`{"messages":[
+		{"role":"user","content":"<available-deferred-tools>...</available-deferred-tools>"},
+		{"role":"user","content":"the real message"}
+	]}`)
+	got := firstUserMessageText(payload)
+	if got != "the real message" {
+		t.Fatalf("expected 'the real message', got %q", got)
+	}
+}
+
+func TestFirstUserMessageText_SkipsDeferredToolsArrayMessage(t *testing.T) {
+	// A user message whose first text block contains <available-deferred-tools> is skipped.
+	payload := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"text","text":"<available-deferred-tools>...</available-deferred-tools>"}]},
+		{"role":"user","content":"actual input"}
+	]}`)
+	got := firstUserMessageText(payload)
+	if got != "actual input" {
+		t.Fatalf("expected 'actual input', got %q", got)
+	}
+}
+
+func TestFirstUserMessageText_SkipsAssistantMessages(t *testing.T) {
+	payload := []byte(`{"messages":[
+		{"role":"assistant","content":"assistant reply"},
+		{"role":"user","content":"user message"}
+	]}`)
+	got := firstUserMessageText(payload)
+	if got != "user message" {
+		t.Fatalf("expected 'user message', got %q", got)
+	}
+}
+
+func TestComputeBuildHash_DefaultSkillsReminderProducesCorrectHash(t *testing.T) {
+	// The injected defaultSkillsReminder starts with:
+	//   "<system-reminder>\nThe following deferred tools..."
+	// positions [4,7,20] = ['t','-','e'] → hash must be "232".
+	// This matches what real CLI 2.1.90 captures show.
+	combined := defaultSkillsReminder + "\n"
+	payload, _ := sjson.SetBytes([]byte(`{"messages":[]}`),
+		"messages",
+		[]map[string]interface{}{
+			{
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "text", "text": combined},
+				},
+			},
+		},
+	)
+	hash := computeBuildHash(payload)
+	if hash != "232" {
+		t.Fatalf("expected hash=232 for defaultSkillsReminder, got %q", hash)
+	}
+}

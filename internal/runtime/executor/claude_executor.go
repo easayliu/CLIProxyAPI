@@ -1416,7 +1416,6 @@ func firstUserMessageText(payload []byte) string {
 			}
 			return first
 		}
-		return ""
 	}
 	return ""
 }

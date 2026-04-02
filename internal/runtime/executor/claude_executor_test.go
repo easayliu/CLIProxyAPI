@@ -990,7 +990,7 @@ func TestApplyClaudeToolPrefix_SkipsBuiltinToolReference(t *testing.T) {
 	}
 }
 
-func TestNormalizeCacheControlTTL_DowngradesLaterOneHourBlocks(t *testing.T) {
+func TestNormalizeCacheControlTTL_UpgradesNonOneHourBlocksToOneHour(t *testing.T) {
 	payload := []byte(`{
 		"tools": [{"name":"t1","cache_control":{"type":"ephemeral","ttl":"1h"}}],
 		"system": [{"type":"text","text":"s1","cache_control":{"type":"ephemeral"}}],
@@ -1002,8 +1002,12 @@ func TestNormalizeCacheControlTTL_DowngradesLaterOneHourBlocks(t *testing.T) {
 	if got := gjson.GetBytes(out, "tools.0.cache_control.ttl").String(); got != "1h" {
 		t.Fatalf("tools.0.cache_control.ttl = %q, want %q", got, "1h")
 	}
-	if gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").Exists() {
-		t.Fatalf("messages.0.content.0.cache_control.ttl should be removed after a default-5m block")
+	// system[0] had no ttl (default 5m), should be upgraded to 1h.
+	if got := gjson.GetBytes(out, "system.0.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("system.0.cache_control.ttl = %q, want %q (should be upgraded)", got, "1h")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("messages.0.content.0.cache_control.ttl = %q, want %q", got, "1h")
 	}
 }
 
@@ -1775,13 +1779,13 @@ func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 		t.Fatalf("system[2] should contain model display name 'Sonnet 4.6', got: %.200s...", text)
 	}
 
-	// Should have cache_control without ttl (matching real CLI behavior)
+	// Should have cache_control with ttl=1h (matching Node CLI 2.1.90 behavior)
 	cc := blocks[2].Get("cache_control")
 	if cc.Get("type").String() != "ephemeral" {
 		t.Fatalf("system[2] cache_control should be ephemeral, got: %s", cc.Raw)
 	}
-	if cc.Get("ttl").Exists() {
-		t.Fatalf("system[2] cache_control should not have ttl, got: %s", cc.Raw)
+	if cc.Get("ttl").String() != "1h" {
+		t.Fatalf("system[2] cache_control.ttl should be 1h, got: %s", cc.Raw)
 	}
 }
 

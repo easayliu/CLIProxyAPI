@@ -2197,27 +2197,24 @@ func countCacheControlsMap(root map[string]any) int {
 	return count
 }
 
-func normalizeTTLForBlock(obj map[string]any, seen5m *bool) bool {
+func normalizeTTLForBlock(obj map[string]any, _ *bool) bool {
 	ccRaw, exists := obj["cache_control"]
 	if !exists {
 		return false
 	}
 	cc, ok := asObject(ccRaw)
 	if !ok {
-		*seen5m = true
 		return false
 	}
 	ttlRaw, ttlExists := cc["ttl"]
 	ttl, ttlIsString := ttlRaw.(string)
-	if !ttlExists || !ttlIsString || ttl != "1h" {
-		*seen5m = true
+	// Already 1h — nothing to do.
+	if ttlExists && ttlIsString && ttl == "1h" {
 		return false
 	}
-	if *seen5m {
-		delete(cc, "ttl")
-		return true
-	}
-	return false
+	// Upgrade 5m (default) to 1h so later 1h blocks don't violate ordering.
+	cc["ttl"] = "1h"
+	return true
 }
 
 func findLastCacheControlIndex(arr []any) int {
@@ -2304,8 +2301,8 @@ func stripMessageCacheControl(messages []any, excess *int) {
 // followed by a 1h block at ANY later position is an error — including within
 // the same section (e.g. system[1]=5m then system[3]=1h).
 //
-// Strategy: walk all cache_control blocks in evaluation order. Once a 5m block
-// is seen, strip ttl from ALL subsequent 1h blocks (downgrading them to 5m).
+// Strategy: upgrade all non-1h cache_control blocks to 1h so the ordering
+// constraint is always satisfied regardless of where 1h blocks appear.
 func normalizeCacheControlTTL(payload []byte) []byte {
 	root, ok := parsePayloadObject(payload)
 	if !ok {

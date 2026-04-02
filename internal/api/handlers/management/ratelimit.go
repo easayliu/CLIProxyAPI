@@ -4,71 +4,36 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 )
 
-// rateLimitEntry is the JSON response for a single auth's rate limit state.
+// rateLimitEntry enriches a snapshot with auth metadata for the API response.
 type rateLimitEntry struct {
-	AuthID       string  `json:"auth_id"`
-	AuthLabel    string  `json:"auth_label,omitempty"`
-	FileName     string  `json:"file_name,omitempty"`
-	Provider     string  `json:"provider"`
-	Disabled     bool    `json:"disabled"`
-	OrgID        string  `json:"organization_id,omitempty"`
-	FiveHourUtil float64 `json:"five_hour_utilization"`
-	FiveHourStat string  `json:"five_hour_status,omitempty"`
-	FiveHourReset int64  `json:"five_hour_reset,omitempty"`
-	SevenDayUtil float64 `json:"seven_day_utilization"`
-	SevenDayStat string  `json:"seven_day_status,omitempty"`
-	SevenDayReset int64  `json:"seven_day_reset,omitempty"`
-	UnifiedStat  string  `json:"unified_status,omitempty"`
-	UnifiedReset int64   `json:"unified_reset,omitempty"`
-	Claim        string  `json:"representative_claim,omitempty"`
-	Fallback     float64 `json:"fallback_percentage,omitempty"`
-	OverageStat  string  `json:"overage_status,omitempty"`
-	OverageReason string `json:"overage_disabled_reason,omitempty"`
-	UpdatedAt    string  `json:"updated_at,omitempty"`
+	*executor.RateLimitSnapshot
+	AuthLabel string `json:"auth_label,omitempty"`
+	FileName  string `json:"file_name,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Disabled  bool   `json:"disabled"`
 }
 
-// GetRateLimits returns the latest rate limit state for all Claude auth entries.
+// GetRateLimits returns the latest in-memory rate limit state for all Claude auth entries.
+// Data is populated from upstream response headers, never persisted to disk.
 func (h *Handler) GetRateLimits(c *gin.Context) {
-	if h.authManager == nil {
-		c.JSON(http.StatusOK, gin.H{"rate_limits": []rateLimitEntry{}})
-		return
-	}
+	snapshots := executor.GetRateLimitSnapshots()
 
-	auths := h.authManager.List()
-	var entries []rateLimitEntry
-	for _, a := range auths {
-		rl := a.RateLimit
-		// Skip auths that have never received rate limit headers.
-		if rl.UpdatedAt.IsZero() {
-			continue
+	entries := make([]rateLimitEntry, 0, len(snapshots))
+	for _, rl := range snapshots {
+		e := rateLimitEntry{RateLimitSnapshot: rl}
+		if h.authManager != nil {
+			if a, ok := h.authManager.GetByID(rl.AuthID); ok {
+				e.AuthLabel = a.Label
+				e.FileName = a.FileName
+				e.Provider = a.Provider
+				e.Disabled = a.Disabled
+			}
 		}
-		entries = append(entries, rateLimitEntry{
-			AuthID:       a.ID,
-			AuthLabel:    a.Label,
-			FileName:     a.FileName,
-			Provider:     a.Provider,
-			Disabled:     a.Disabled,
-			OrgID:        rl.OrganizationID,
-			FiveHourUtil: rl.FiveHourUtilization,
-			FiveHourStat: rl.FiveHourStatus,
-			FiveHourReset: rl.FiveHourReset,
-			SevenDayUtil: rl.SevenDayUtilization,
-			SevenDayStat: rl.SevenDayStatus,
-			SevenDayReset: rl.SevenDayReset,
-			UnifiedStat:  rl.UnifiedStatus,
-			UnifiedReset: rl.UnifiedReset,
-			Claim:        rl.RepresentativeClaim,
-			Fallback:     rl.FallbackPercentage,
-			OverageStat:  rl.OverageStatus,
-			OverageReason: rl.OverageDisabledReason,
-			UpdatedAt:    rl.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-		})
+		entries = append(entries, e)
 	}
 
-	if entries == nil {
-		entries = []rateLimitEntry{}
-	}
 	c.JSON(http.StatusOK, gin.H{"rate_limits": entries})
 }

@@ -2041,6 +2041,10 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = obfuscateSensitiveWords(payload, matcher)
 	}
 
+	// Normalize all cache_control TTLs to 1h so that no 5m block precedes
+	// a 1h block, which would violate the Anthropic ordering constraint.
+	payload = normalizeCacheControlTTL(payload)
+
 	// Replace billing header placeholders with real build hash and cch now
 	// that all injections (system-reminder, deferred-tools, etc.) are done.
 	payload = finalizeBillingHeader(payload)

@@ -110,6 +110,7 @@ type upstreamPrepResult struct {
 	to                 sdktranslator.Format
 	reporter           *usageReporter
 	prepDuration       time.Duration
+	sessionRelease     func() // must be called when request completes
 }
 
 // prepareUpstream contains the shared preparation logic for Execute and ExecuteStream.
@@ -139,12 +140,15 @@ func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth
 	poolKey := stablePoolKey(auth, apiKey)
 	isCliClient := isClaudeCodeClient(getClientUserAgent(ctx))
 
-	// Map CLI client session_id to a bounded pool of sessions per auth.
+	// Acquire a rotating session for CLI clients.
+	// All concurrent requests (including subagents) share the same session_id,
+	// matching real Claude Code behavior. Session rotates every 30–45 min.
 	var mappedSessionID string
+	sessionRelease := noopRelease
 	if isCliClient {
 		clientSID := extractClientSessionID(req.Payload)
 		if clientSID != "" {
-			mappedSessionID = MapCLISessionID(poolKey, clientSID, 0)
+			mappedSessionID, sessionRelease = AcquireCLISession(poolKey)
 		}
 	}
 
@@ -208,6 +212,7 @@ func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth
 		to:                 to,
 		reporter:           reporter,
 		prepDuration:       time.Since(tEntry),
+		sessionRelease:     sessionRelease,
 	}, nil
 }
 
@@ -262,6 +267,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
+	defer prep.sessionRelease()
 	reporter := prep.reporter
 	defer reporter.trackFailure(ctx, &err)
 
@@ -375,6 +381,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		defer prep.sessionRelease() // release session after stream fully consumed
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Debugf("response body close error: %v", errClose)
@@ -740,6 +747,7 @@ func buildAnthropicBeta(apiKey, model string, body []byte, extraBetas []string, 
 		addBeta("oauth-2025-04-20")
 	}
 	addBeta("interleaved-thinking-2025-05-14")
+	addBeta("redact-thinking-2026-02-12")
 	addBeta("prompt-caching-scope-2026-01-05")
 
 	// Conditional betas based on body features.
@@ -909,7 +917,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Stainless SDK headers: Title-Case, except OS which is all-caps
 	setRaw("X-Stainless-Retry-Count", "0")
-	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
+	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.11.1"))
 	setRaw("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
 	setRaw("X-Stainless-Runtime", "node")
 	setRaw("X-Stainless-Lang", "js")
@@ -919,11 +927,11 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Standard HTTP headers matching real CLI 2.1.84 MITM capture.
 	// Accept is Title-Case; the rest are lowercase in real Bun wire format.
-	userAgent := hdrDefault(hd.UserAgent, "claude-cli/2.1.85 (external, cli)")
+	userAgent := hdrDefault(hd.UserAgent, "claude-cli/2.1.90 (external, cli)")
 	clientReqID := uuid.New().String()
 	r.Header.Set("User-Agent", userAgent)
 	r.Header.Set("Accept", "application/json")
-	setRaw("accept-encoding", "gzip, deflate, br, zstd")
+	setRaw("accept-encoding", "br, gzip, deflate")
 	setRaw("accept-language", "*")
 	setRaw("sec-fetch-mode", "cors")
 	setRaw("connection", "keep-alive")
@@ -1342,7 +1350,7 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 const billingBuildHashSalt = "59cf53e54c78"
 
 // billingCLIVersion is the CLI version embedded in the billing header.
-const billingCLIVersion = "2.1.85"
+const billingCLIVersion = "2.1.90"
 
 // computeBuildHash computes the 3-char build hash for the billing header.
 // Algorithm (from cli.js _0T): extract chars at positions [4,7,20] from the
@@ -1411,15 +1419,11 @@ func firstUserMessageText(payload []byte) string {
 	return ""
 }
 
-// generateCCH generates a 5-char hex string for the cch field in the billing header.
-// The real CLI 2.1.84 JS source sets cch=00000, but MITM + fake server captures confirm
-// the actual wire value is a non-zero 5-char hex that changes per request.
-// The replacement happens in Bun's native layer (not visible in JS source).
-// We generate a deterministic hash from the request payload to produce realistic,
-// per-request varying values without true randomness.
-func generateCCH(payload []byte) string {
-	h := sha256.Sum256(payload)
-	return hex.EncodeToString(h[:])[:5]
+// generateCCH returns the cch field for the billing header.
+// Node runtime always sends cch=00000; non-zero values seen in MITM captures
+// come from Bun's native layer. We target Node behavior.
+func generateCCH(_ []byte) string {
+	return "00000"
 }
 
 // Billing header placeholder tokens, replaced by finalizeBillingHeader after
@@ -1466,7 +1470,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 	billingText := generateBillingHeader()
 	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
 
-	agentBlock := `{"type":"text","cache_control":{"type":"ephemeral"},"text":"You are Claude Code, Anthropic's official CLI for Claude."}`
+	agentBlock := `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}`
 	if strictMode {
 		// Strict mode: billing header + agent block only
 		result := "[" + billingBlock + "," + agentBlock + "]"
@@ -1475,12 +1479,14 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 	}
 
 	// Non-strict mode: billing header + agent block + user system messages.
-	// Always regenerate billing + agent to ensure version consistency (2.1.84).
-	// Matches MITM capture 20260325_230810 #010 structure:
+	// Always regenerate billing + agent to ensure version consistency.
+	// Matches Node CLI 2.1.90 MITM capture structure:
 	//   system[0]: billing header (no cache_control)
-	//   system[1]: agent identifier (cache_control: ephemeral)
-	//   system[2..]: user system messages (cache_control: ephemeral)
+	//   system[1]: agent identifier (no cache_control)
+	//   system[2]: first user system message (cache_control: scope=global, ttl=1h, ephemeral)
+	//   system[3..]: remaining user system messages (no cache_control)
 	result := "[" + billingBlock + "," + agentBlock
+	firstUserBlock := true
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {
@@ -1494,16 +1500,18 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode, oauthMode bool,
 					return true
 				}
 				partJSON := part.Raw
-				if !part.Get("cache_control").Exists() {
-					updated, _ := sjson.SetBytes([]byte(partJSON), "cache_control.type", "ephemeral")
+				// Only the first user system block gets cache_control (matches CLI 2.1.90).
+				if firstUserBlock && !part.Get("cache_control").Exists() {
+					updated, _ := sjson.SetRawBytes([]byte(partJSON), "cache_control", []byte(`{"scope":"global","ttl":"1h","type":"ephemeral"}`))
 					partJSON = string(updated)
 				}
+				firstUserBlock = false
 				result += "," + partJSON
 			}
 			return true
 		})
 	} else if system.Type == gjson.String && system.String() != "" {
-		partJSON := `{"type":"text","cache_control":{"type":"ephemeral"}}`
+		partJSON := `{"type":"text","cache_control":{"scope":"global","ttl":"1h","type":"ephemeral"}}`
 		updated, _ := sjson.SetBytes([]byte(partJSON), "text", system.String())
 		partJSON = string(updated)
 		result += "," + partJSON
@@ -1970,27 +1978,25 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// a fixed build hash regardless of client content.
 	payload = migrateSystemToUserMessage(payload, defaultSystemReminders())
 
-	// Match real CLI 2.1.84 behavior: only output_config.effort, no thinking field.
-	// MITM captures confirm real CLI never sends thinking for opus-4-6 or sonnet-4-6.
-	// If client sends thinking, convert it to an appropriate effort level and remove it.
+	// Match real CLI 2.1.90 (Node) behavior: send both thinking:{"type":"adaptive"}
+	// and output_config:{"effort":"medium"}. Ensure both fields are present.
 	if supportsAdaptiveThinking(model) {
-		thinkingRemoved := false
 		effortInjected := false
-		if gjson.GetBytes(payload, "thinking").Exists() {
-			// Map client's thinking to effort if client didn't set output_config
-			if !gjson.GetBytes(payload, "output_config").Exists() {
-				effort := thinkingToEffort(payload)
-				payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"`+effort+`"}`))
-				effortInjected = true
-			}
-			payload, _ = sjson.DeleteBytes(payload, "thinking")
-			thinkingRemoved = true
-		} else if !gjson.GetBytes(payload, "output_config").Exists() {
-			payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"medium"}`))
+		thinkingInjected := false
+		// Ensure thinking is set to adaptive
+		if !gjson.GetBytes(payload, "thinking").Exists() {
+			payload, _ = sjson.SetRawBytes(payload, "thinking", []byte(`{"type":"adaptive"}`))
+			thinkingInjected = true
+		}
+		// Ensure output_config.effort is set
+		if !gjson.GetBytes(payload, "output_config").Exists() {
+			effort := thinkingToEffort(payload)
+			payload, _ = sjson.SetRawBytes(payload, "output_config", []byte(`{"effort":"`+effort+`"}`))
 			effortInjected = true
 		}
-		log.Infof("[cloaking] output_config: effort=%s (injected=%t) thinking: removed=%t",
-			gjson.GetBytes(payload, "output_config.effort").String(), effortInjected, thinkingRemoved)
+		log.Infof("[cloaking] thinking: type=%s (injected=%t) output_config: effort=%s (injected=%t)",
+			gjson.GetBytes(payload, "thinking.type").String(), thinkingInjected,
+			gjson.GetBytes(payload, "output_config.effort").String(), effortInjected)
 	}
 
 	// context_management replacement removed: clients manage their own context.

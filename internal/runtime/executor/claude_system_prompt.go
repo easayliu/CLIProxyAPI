@@ -191,19 +191,29 @@ func migrateSystemToUserMessage(payload []byte, texts []string) []byte {
 		reminderJSON, _ := json.Marshal(reminderBlock)
 
 		if content.IsArray() {
-			// Prepend to existing content array
+			// Prepend to existing content array, ensure last text block has cache_control.
+			blocks := content.Array()
 			var newContent []interface{}
 			newContent = append(newContent, json.RawMessage(reminderJSON))
-			for _, block := range content.Array() {
-				newContent = append(newContent, json.RawMessage(block.Raw))
+			for j, block := range blocks {
+				raw := block.Raw
+				// Last block: add cache_control if missing (matches CLI 2.1.90 behavior).
+				if j == len(blocks)-1 && block.Get("type").String() == "text" && !block.Get("cache_control").Exists() {
+					updated, err := sjson.SetRaw(raw, "cache_control", `{"ttl":"1h","type":"ephemeral"}`)
+					if err == nil {
+						raw = updated
+					}
+				}
+				newContent = append(newContent, json.RawMessage(raw))
 			}
 			path := fmt.Sprintf("messages.%d.content", i)
 			payload, _ = sjson.SetBytes(payload, path, newContent)
 		} else if content.Type == gjson.String {
-			// Convert string content to array with reminder prepended
+			// Convert string content to array with reminder prepended.
+			// The user text block gets cache_control (matches CLI 2.1.90 behavior).
 			var newContent []interface{}
 			newContent = append(newContent, json.RawMessage(reminderJSON))
-			textBlock := fmt.Sprintf(`{"type":"text","text":%s}`, strconv.Quote(content.String()))
+			textBlock := fmt.Sprintf(`{"type":"text","cache_control":{"ttl":"1h","type":"ephemeral"},"text":%s}`, strconv.Quote(content.String()))
 			newContent = append(newContent, json.RawMessage(textBlock))
 			path := fmt.Sprintf("messages.%d.content", i)
 			payload, _ = sjson.SetBytes(payload, path, newContent)

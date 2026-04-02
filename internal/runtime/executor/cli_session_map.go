@@ -11,9 +11,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// ---------------------------------------------------------------------------
+// Legacy fixed-slot pool — used by applyCloaking for non-CLI clients.
+// ---------------------------------------------------------------------------
+
 // cliSessionSlot is a lightweight session slot for CLI client session mapping.
-// Unlike the full sessionSlot in user_id_cache.go, this has no busy/initialized
-// tracking because multiple CLI clients can share the same mapped session.
 type cliSessionSlot struct {
 	sessionID string
 	expireAt  time.Time
@@ -30,14 +32,9 @@ var (
 )
 
 const (
-	// cliSessionDefaultSlots is the default number of session slots per auth.
-	// Simulates a user with 3 terminal windows open — common for developers.
 	cliSessionDefaultSlots = 3
-
-	// cliSessionBaseTTL + jitter gives each slot a 6–12 hour lifetime,
-	// matching realistic CLI session durations (a work day).
-	cliSessionBaseTTL    = 6 * time.Hour
-	cliSessionJitterSecs = 6 * 60 * 60 // 6 hours in seconds
+	cliSessionBaseTTL      = 6 * time.Hour
+	cliSessionJitterSecs   = 6 * 60 * 60 // 6 hours in seconds
 )
 
 func newCLISessionSlot() cliSessionSlot {
@@ -52,12 +49,8 @@ func newCLISessionSlot() cliSessionSlot {
 // given auth key. The mapping is consistent: the same clientSessionID always
 // maps to the same pool slot (via hash). Expired slots are refreshed lazily.
 //
-// Parameters:
-//   - authKey: stable auth identifier (e.g. auth.ID or stablePoolKey)
-//   - clientSessionID: the session_id from the CLI client's request
-//   - slotCount: number of pool slots (0 uses default)
-//
-// Returns the mapped pool session_id.
+// This is used by applyCloaking for non-CLI clients. CLI clients use
+// AcquireCLISession instead.
 func MapCLISessionID(authKey string, clientSessionID string, slotCount int) string {
 	if authKey == "" || clientSessionID == "" {
 		return clientSessionID
@@ -81,12 +74,10 @@ func MapCLISessionID(authKey string, clientSessionID string, slotCount int) stri
 		log.Infof("[cli-session-map] auth=%.16s initialized %d slots", authKey, slotCount)
 	}
 
-	// Adapt pool size if config changed.
 	for len(pool.slots) < slotCount {
 		pool.slots = append(pool.slots, newCLISessionSlot())
 	}
 
-	// Refresh expired slots.
 	now := time.Now()
 	for i := range pool.slots {
 		if now.After(pool.slots[i].expireAt) {
@@ -94,11 +85,87 @@ func MapCLISessionID(authKey string, clientSessionID string, slotCount int) stri
 		}
 	}
 
-	// Consistent hash: same clientSessionID always picks the same slot.
 	h := sha256.Sum256([]byte(clientSessionID))
 	idx := int(binary.BigEndian.Uint32(h[:4])) % len(pool.slots)
 
 	mapped := pool.slots[idx].sessionID
 	log.Debugf("[cli-session-map] auth=%.16s client=%s -> slot[%d]=%s", authKey, clientSessionID, idx, mapped)
 	return mapped
+}
+
+// ---------------------------------------------------------------------------
+// Single rotating session — used by CLI clients.
+//
+// Real Claude Code shares one session_id across the main agent and all
+// subagents. The session rotates periodically (30–45 min) to avoid
+// long-lived sessions that look abnormal.
+// ---------------------------------------------------------------------------
+
+const (
+	// primarySessionBaseTTL + jitter = 30–45 min per session.
+	primarySessionBaseTTL = 30 * time.Minute
+	primarySessionJitter  = 15 * time.Minute
+)
+
+type authSession struct {
+	sessionID string
+	expireAt  time.Time
+}
+
+type authSessionPool struct {
+	mu      sync.Mutex
+	current *authSession
+}
+
+var (
+	authSessionPools   = make(map[string]*authSessionPool)
+	authSessionPoolsMu sync.Mutex
+)
+
+func getOrCreateAuthPool(authKey string) *authSessionPool {
+	authSessionPoolsMu.Lock()
+	defer authSessionPoolsMu.Unlock()
+	pool, ok := authSessionPools[authKey]
+	if !ok {
+		pool = &authSessionPool{}
+		authSessionPools[authKey] = pool
+	}
+	return pool
+}
+
+func newAuthSession() *authSession {
+	jitter := time.Duration(rand.Int64N(int64(primarySessionJitter)))
+	return &authSession{
+		sessionID: uuid.New().String(),
+		expireAt:  time.Now().Add(primarySessionBaseTTL + jitter),
+	}
+}
+
+// noopRelease is a no-op release function for callers that don't acquire a session.
+func noopRelease() {}
+
+// AcquireCLISession returns the current session_id for the given auth,
+// rotating to a new one when the TTL expires. All concurrent requests
+// (including subagent requests) share the same session_id, matching real
+// Claude Code behavior.
+//
+// The returned release function is currently a no-op but kept in the
+// interface for future extensibility.
+func AcquireCLISession(authKey string) (string, func()) {
+	if authKey == "" {
+		return "", noopRelease
+	}
+
+	pool := getOrCreateAuthPool(authKey)
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	now := time.Now()
+	if pool.current == nil || now.After(pool.current.expireAt) {
+		pool.current = newAuthSession()
+		log.Infof("[cli-session] auth=%.16s new session %s (expires %s)",
+			authKey, pool.current.sessionID[:8], pool.current.expireAt.Format("15:04:05"))
+	}
+
+	return pool.current.sessionID, noopRelease
 }

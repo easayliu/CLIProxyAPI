@@ -66,8 +66,8 @@ func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte 
 	promptText := buildCLISystemPrompt(model)
 
 	// Build the CLI system prompt block with cache_control.
-	// Real CLI uses {"ttl":"1h","type":"ephemeral"} without ttl for system[2].
-	cliBlock := `{"type":"text","cache_control":{"ttl":"1h","type":"ephemeral"}}`
+	// Real CLI uses {"scope":"global","ttl":"1h","type":"ephemeral"} for system[2].
+	cliBlock := `{"type":"text","cache_control":{"scope":"global","ttl":"1h","type":"ephemeral"}}`
 	// Prefix with \n to match real CLI behavior observed in MITM capture.
 	cliBlockJSON, _ := sjson.Set(cliBlock, "text", "\n"+promptText)
 

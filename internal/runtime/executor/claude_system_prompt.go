@@ -24,9 +24,13 @@ var modelDisplayNames = map[string]string{
 	"claude-sonnet-4-20250514":  "Sonnet 4 (with 200K context)",
 }
 
-// buildCLISystemPrompt generates the full Claude Code CLI system prompt
-// with model-specific details substituted into the template.
-func buildCLISystemPrompt(model string) string {
+// buildCLISystemPrompt generates the Claude Code CLI system prompt split into
+// two parts matching real CLI behavior:
+//   - part1 (system[2]): stable across sessions, cached with scope=global
+//   - part2 (system[3]): session-specific guidance, not cached
+//
+// The split point is marked by {{SESSION_SPLIT}} in the template.
+func buildCLISystemPrompt(model string) (string, string) {
 	display := modelDisplayNames[model]
 	if display == "" {
 		// Fallback: generate a reasonable display name from the model ID
@@ -42,17 +46,21 @@ func buildCLISystemPrompt(model string) string {
 	prompt := claudeSystemPromptTemplate
 	prompt = strings.ReplaceAll(prompt, "{{MODEL_DISPLAY}}", display)
 	prompt = strings.ReplaceAll(prompt, "{{MODEL_ID}}", modelID)
-	return prompt
+
+	// Split at the session marker
+	parts := strings.SplitN(prompt, "{{SESSION_SPLIT}}\n", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	// No marker found: everything goes to system[2]
+	return prompt, ""
 }
 
 // injectCLISystemPrompt inserts the Claude Code CLI system prompt as system[2]
-// and migrates any extra system messages into the first user message content.
-// Real Claude Code CLI always sends exactly 3 system blocks: billing, agent, and
-// the full CLI system prompt. Any additional system messages from the client would
-// be a detectable fingerprint. To preserve the client's custom instructions without
-// breaking cloaking, extra system messages are wrapped in <system-reminder> tags
-// and prepended to the first user message's content, matching how the real CLI
-// handles CLAUDE.md and other injected context.
+// and session-specific guidance as system[3], matching real CLI 2.1.90 structure.
+// Extra system messages from the client are migrated into the first user message
+// content wrapped in <system-reminder> tags, matching how the real CLI handles
+// CLAUDE.md and other injected context.
 func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 	if !system.Exists() || !system.IsArray() {
@@ -64,13 +72,12 @@ func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte 
 		return payload // need at least billing + agent blocks
 	}
 
-	promptText := buildCLISystemPrompt(model)
+	stablePrompt, sessionPrompt := buildCLISystemPrompt(model)
 
-	// Build the CLI system prompt block with cache_control.
-	// Real CLI uses {"scope":"global","ttl":"1h","type":"ephemeral"} for system[2].
-	cliBlock := `{"type":"text","cache_control":{"scope":"global","ttl":"1h","type":"ephemeral"}}`
+	// Build system[2]: stable CLI prompt with cache_control (scope=global, cached across sessions).
 	// Prefix with \n to match real CLI behavior observed in MITM capture.
-	cliBlockJSON, _ := sjson.Set(cliBlock, "text", "\n"+promptText)
+	cliBlock := `{"type":"text","cache_control":{"scope":"global","ttl":"1h","type":"ephemeral"}}`
+	cliBlockJSON, _ := sjson.Set(cliBlock, "text", "\n"+stablePrompt)
 
 	// Collect extra system messages (beyond billing + agent) for migration
 	var extraTexts []string
@@ -81,10 +88,20 @@ func injectCLISystemPrompt(payload []byte, model string, oauthMode bool) []byte 
 		}
 	}
 
-	// Rebuild system array: exactly 3 blocks (matching real CLI)
+	// Rebuild system array: 4 blocks matching real CLI 2.1.90 structure:
+	//   system[0]: billing header (no cache_control)
+	//   system[1]: agent identifier (no cache_control)
+	//   system[2]: stable CLI prompt (cache_control: scope=global, ttl=1h)
+	//   system[3]: session-specific guidance (no cache_control)
 	billingBlock := blocks[0].Raw
 	agentBlock := blocks[1].Raw
-	result := "[" + billingBlock + "," + agentBlock + "," + cliBlockJSON + "]"
+	result := "[" + billingBlock + "," + agentBlock + "," + cliBlockJSON
+	if sessionPrompt != "" {
+		sessionBlock := `{"type":"text"}`
+		sessionBlockJSON, _ := sjson.Set(sessionBlock, "text", sessionPrompt)
+		result += "," + sessionBlockJSON
+	}
+	result += "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
 
 	// Migrate extra system messages into the first user message content.

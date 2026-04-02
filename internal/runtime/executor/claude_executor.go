@@ -1876,8 +1876,8 @@ func repairToolUsePairing(payload []byte) []byte {
 // when real CLI behavior changes. Using the registry is unreliable because models
 // may have multiple entries with different providers/values.
 var cliMaxTokens = map[string]int{
-	"claude-opus-4-6":           64000,
-	"claude-sonnet-4-6":         32000,
+	"claude-opus-4-6":           8000,
+	"claude-sonnet-4-6":         8000,
 	"claude-sonnet-4-20250514":  16000,
 	"claude-haiku-4-5-20251001": 32000,
 }

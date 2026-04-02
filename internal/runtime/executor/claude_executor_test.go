@@ -1766,26 +1766,36 @@ func TestInjectCLISystemPrompt_AddsSystemBlock(t *testing.T) {
 	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected 3 system blocks after injection, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("expected 4 system blocks after injection, got %d", len(blocks))
 	}
 
-	// system[2] should contain the CLI system prompt
+	// system[2] should contain the stable CLI system prompt
 	text := blocks[2].Get("text").String()
 	if !strings.Contains(text, "You are an interactive agent") {
 		t.Fatalf("system[2] should contain CLI system prompt, got: %.100s...", text)
 	}
-	if !strings.Contains(text, "Sonnet 4.6") {
-		t.Fatalf("system[2] should contain model display name 'Sonnet 4.6', got: %.200s...", text)
+	// Model display name is in the session-specific part (system[3])
+	sessionText := blocks[3].Get("text").String()
+	if !strings.Contains(sessionText, "Sonnet 4.6") {
+		t.Fatalf("system[3] should contain model display name 'Sonnet 4.6', got: %.200s...", sessionText)
 	}
 
-	// Should have cache_control with ttl=1h (matching Node CLI 2.1.90 behavior)
+	// system[2] should have cache_control with scope=global, ttl=1h
 	cc := blocks[2].Get("cache_control")
 	if cc.Get("type").String() != "ephemeral" {
 		t.Fatalf("system[2] cache_control should be ephemeral, got: %s", cc.Raw)
 	}
 	if cc.Get("ttl").String() != "1h" {
 		t.Fatalf("system[2] cache_control.ttl should be 1h, got: %s", cc.Raw)
+	}
+
+	// system[3] should also contain session-specific guidance (no cache_control)
+	if !strings.Contains(sessionText, "Session-specific guidance") {
+		t.Fatalf("system[3] should contain session-specific guidance, got: %.100s...", sessionText)
+	}
+	if blocks[3].Get("cache_control").Exists() {
+		t.Fatalf("system[3] should NOT have cache_control")
 	}
 }
 
@@ -1795,10 +1805,10 @@ func TestInjectCLISystemPrompt_MigratesExtraToUserMessage(t *testing.T) {
 
 	out := injectCLISystemPrompt(payload, "claude-sonnet-4-6", false)
 
-	// System should have exactly 3 blocks
+	// System should have exactly 4 blocks (billing + agent + CLI prompt + session guidance)
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected exactly 3 system blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("expected exactly 4 system blocks, got %d", len(blocks))
 	}
 
 	// The extra system message should be in the first user message content

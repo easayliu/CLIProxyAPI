@@ -1969,16 +1969,17 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Claude Code CLI sends model-appropriate values (e.g. 128000 for Opus 4.6).
 	payload = normalizeMaxTokensForCloaking(payload, model)
 
-	// Inject system[0] (billing header) and system[1] (agent block) for non-CLI clients.
+	// Inject system[0] (billing header) and system[1] (agent block).
 	// Non-strict: prepend billing + agent, keep client system messages.
 	// Strict: replace all system with billing + agent only.
 	oauthMode := isClaudeOAuthToken(apiKey)
 	payload = checkSystemInstructionsWithMode(payload, strictMode, oauthMode, stablePoolKey(auth, apiKey))
 
-	// Prepend default system-reminders to first user message for consistent
-	// build hash. Real CLI always has these as the first text block, producing
-	// a fixed build hash regardless of client content.
-	payload = migrateSystemToUserMessage(payload, defaultSystemReminders())
+	// Inject full CLI system prompt as system[2], migrate extra system messages
+	// and default system-reminders into first user message. This produces a
+	// request structure identical to real Claude Code CLI (billing + agent +
+	// CLI prompt in system, reminders in user message).
+	payload = injectCLISystemPrompt(payload, model, oauthMode)
 
 	// Match real CLI 2.1.90 (Node) behavior: send both thinking:{"type":"adaptive"}
 	// and output_config:{"effort":"medium"}. Ensure both fields are present.

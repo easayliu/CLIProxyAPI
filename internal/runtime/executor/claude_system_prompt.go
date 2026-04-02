@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -18,7 +19,7 @@ var claudeSystemPromptTemplate string
 // modelDisplayNames maps model IDs to their display names as shown in Claude Code CLI.
 var modelDisplayNames = map[string]string{
 	"claude-opus-4-6":           "Opus 4.6 (with 1M context)",
-	"claude-sonnet-4-6":         "Sonnet 4.6 (with 1M context)",
+	"claude-sonnet-4-6":         "Sonnet 4.6 (with 200K context)",
 	"claude-haiku-4-5-20251001": "Haiku 4.5",
 	"claude-sonnet-4-20250514":  "Sonnet 4 (with 200K context)",
 }
@@ -163,8 +164,10 @@ Today's date is %s.
 func migrateSystemToUserMessage(payload []byte, texts []string) []byte {
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.Exists() || !messages.IsArray() {
+		log.Infof("[migrate-debug] no messages array found, skipping migration")
 		return payload
 	}
+	log.Infof("[migrate-debug] called with %d texts, %d messages", len(texts), len(messages.Array()))
 
 	// Find the first user message
 	for i, msg := range messages.Array() {

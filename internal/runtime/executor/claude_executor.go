@@ -116,6 +116,9 @@ type upstreamPrepResult struct {
 // prepareUpstream contains the shared preparation logic for Execute and ExecuteStream.
 // It performs rate limiting, body sanitization, cloaking, header injection, and builds
 // the upstream HTTP request. The caller is responsible for sending the request.
+//
+// CLI clients take a fast path: only auth credentials are replaced, body and headers
+// are forwarded as-is from the original request.
 func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, streaming bool, callerTag string) (*upstreamPrepResult, error) {
 	tEntry := time.Now()
 
@@ -137,35 +140,53 @@ func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth
 	// Log identity on every request for auditing.
 	extractAuthIdentity(auth, apiKey)
 
-	poolKey := stablePoolKey(auth, apiKey)
 	isCliClient := isClaudeCodeClient(getClientUserAgent(ctx))
-
-	// Acquire a rotating session for CLI clients.
-	// All concurrent requests (including subagents) share the same session_id,
-	// matching real Claude Code behavior. Session rotates every 30–45 min.
-	var mappedSessionID string
-	sessionRelease := noopRelease
-	if isCliClient {
-		clientSID := extractClientSessionID(req.Payload)
-		if clientSID != "" {
-			mappedSessionID, sessionRelease = AcquireCLISession(poolKey)
-		}
-	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+
+	// CLI clients: passthrough body as-is, only replace auth credentials in headers.
+	if isCliClient {
+		body := req.Payload
+		url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		// Copy original client headers and replace only auth credentials.
+		applyClaudeHeadersCLIPassthrough(httpReq, auth, apiKey)
+
+		if log.IsLevelEnabled(log.DebugLevel) {
+			hdrs, _ := json.Marshal(httpReq.Header)
+			log.Debugf("[upstream-debug] url=%s headers=%s", url, string(hdrs))
+			log.Debugf("[upstream-debug] body=%s", string(body))
+		}
+
+		recordAPIRequest(ctx, e.cfg, buildUpstreamLog(url, body, httpReq.Header, e.Identifier(), auth))
+
+		return &upstreamPrepResult{
+			httpReq:            httpReq,
+			apiKey:             apiKey,
+			bodyForTranslation: body,
+			from:               from,
+			to:                 to,
+			reporter:           reporter,
+			prepDuration:       time.Since(tEntry),
+			sessionRelease:     noopRelease,
+		}, nil
+	}
+
+	// Non-CLI clients: full processing pipeline.
+	poolKey := stablePoolKey(auth, apiKey)
 
 	body := req.Payload
 
 	// Sanitize context_management.edits: remove edits without server-issued signatures.
 	body = sanitizeContextManagementEdits(body)
 
-	// For non-CLI clients only: repair malformed body structures.
-	if !isCliClient {
-		body = repairToolUsePairing(body)
-		body = sanitizeEmptyTextBlocks(body)
-	}
+	body = repairToolUsePairing(body)
+	body = sanitizeEmptyTextBlocks(body)
 
 	// Apply cloaking (fake user ID, field sanitization, sensitive word obfuscation).
 	t0 = time.Now()
@@ -178,7 +199,7 @@ func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth
 	}
 
 	// Replace metadata.user_id with auth's real identity.
-	body = replaceMetadataUserID(body, auth, poolKey, mappedSessionID)
+	body = replaceMetadataUserID(body, auth, poolKey)
 
 	// Extract betas from body and convert to header.
 	var extraBetas []string
@@ -194,7 +215,7 @@ func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth
 	if err != nil {
 		return nil, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, streaming, extraBetas, e.cfg, baseModel, bodyForUpstream, mappedSessionID)
+	applyClaudeHeaders(httpReq, auth, apiKey, streaming, extraBetas, e.cfg, baseModel, bodyForUpstream)
 
 	if log.IsLevelEnabled(log.DebugLevel) {
 		hdrs, _ := json.Marshal(httpReq.Header)
@@ -212,7 +233,7 @@ func (e *ClaudeExecutor) prepareUpstream(ctx context.Context, auth *cliproxyauth
 		to:                 to,
 		reporter:           reporter,
 		prepDuration:       time.Since(tEntry),
-		sessionRelease:     sessionRelease,
+		sessionRelease:     noopRelease,
 	}, nil
 }
 
@@ -826,6 +847,40 @@ func isHaikuModel(model string) bool {
 	return strings.HasPrefix(model, "claude-3-5-haiku") || strings.HasPrefix(model, "claude-haiku-4-5")
 }
 
+// applyClaudeHeadersCLIPassthrough copies the original client headers verbatim and only
+// replaces auth credentials. Everything else (User-Agent, session ID, betas, etc.) is
+// forwarded as-is from the CLI client.
+func applyClaudeHeadersCLIPassthrough(r *http.Request, auth *cliproxyauth.Auth, apiKey string) {
+	var ginHeaders http.Header
+	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header
+	}
+	if ginHeaders != nil {
+		for k, v := range ginHeaders {
+			r.Header[k] = v
+		}
+	}
+	// Remove proxy-specific headers that must not leak to upstream.
+	r.Header.Del("Host")
+	r.Header.Del("Content-Length") // recalculated by http.Client
+
+	// Replace auth credentials only.
+	if isClaudeOAuthToken(apiKey) {
+		r.Header.Del("x-api-key")
+		r.Header.Set("Authorization", "Bearer "+apiKey)
+	} else if apiKey != "" {
+		r.Header.Del("Authorization")
+		r.Header.Set("x-api-key", apiKey)
+	}
+
+	// Apply custom headers from auth attributes (e.g. per-account overrides).
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
 // modelSupports1MContext returns true if the model name explicitly requests 1M context.
 // Real Claude CLI only adds context-1m-2025-08-07 beta when the model name contains "[1m]"
 // suffix (e.g. "claude-opus-4-6[1m]"). Without this suffix, even Opus 4.6 uses 200K context.
@@ -833,47 +888,12 @@ func modelSupports1MContext(model string) bool {
 	return strings.Contains(strings.ToLower(model), "[1m]")
 }
 
+// applyClaudeHeaders builds upstream headers for non-CLI clients, simulating a real
+// Claude CLI request fingerprint. CLI clients use applyClaudeHeadersCLIPassthrough instead.
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, _ bool, extraBetas []string, cfg *config.Config, model string, body []byte, mappedSessionID ...string) {
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
-	}
-
-	// CLI clients: passthrough original headers, only replace auth credentials
-	// and rebuild anthropic-beta (client generates betas based on proxy key/domain,
-	// which may differ from the actual upstream OAuth context).
-	if ginHeaders != nil && isClaudeCodeClient(ginHeaders.Get("User-Agent")) {
-		for k, v := range ginHeaders {
-			r.Header[k] = v
-		}
-		// Remove proxy-specific headers that must not leak to upstream.
-		r.Header.Del("Host")
-		r.Header.Del("Content-Length") // recalculated by http.Client
-		// Replace auth with proxy's credentials.
-		if isClaudeOAuthToken(apiKey) {
-			r.Header.Del("x-api-key")
-			r.Header.Set("Authorization", "Bearer "+apiKey)
-		} else if apiKey != "" {
-			r.Header.Del("Authorization")
-			r.Header.Set("x-api-key", apiKey)
-		}
-		// Ensure x-client-request-id is present (real CLI sends it to
-		// api.anthropic.com but may omit it when targeting a proxy domain).
-		if r.Header.Get("x-client-request-id") == "" {
-			r.Header.Set("x-client-request-id", uuid.New().String())
-		}
-		// Replace X-Claude-Code-Session-Id with mapped pool session to
-		// bound the number of visible sessions per auth.
-		if len(mappedSessionID) > 0 && mappedSessionID[0] != "" {
-			r.Header.Set("X-Claude-Code-Session-Id", mappedSessionID[0])
-		}
-		// Rebuild anthropic-beta: start from client's betas, then supplement
-		// any missing betas that the proxy's upstream auth/model context requires.
-		r.Header.Del("anthropic-beta")
-		r.Header.Del("Anthropic-Beta")
-		betaStr := buildAnthropicBeta(apiKey, model, body, extraBetas, ginHeaders)
-		r.Header["anthropic-beta"] = []string{betaStr}
-		return
 	}
 
 	hdrDefault := func(cfgVal, fallback string) string {

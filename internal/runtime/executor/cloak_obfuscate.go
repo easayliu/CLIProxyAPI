@@ -55,12 +55,19 @@ func buildSensitiveWordMatcher(words []string) *SensitiveWordMatcher {
 	return &SensitiveWordMatcher{regex: re}
 }
 
+// zeroWidthSpace is the Unicode zero-width space character that some clients
+// pre-insert into sensitive words. We strip it before matching so the regex
+// can find the underlying word regardless.
+const zeroWidthSpace = "\u200B"
+
 // obfuscateText removes all sensitive words from the text.
+// It first strips zero-width spaces so pre-obfuscated variants are also caught.
 func (m *SensitiveWordMatcher) obfuscateText(text string) string {
 	if m == nil || m.regex == nil {
 		return text
 	}
-	return m.regex.ReplaceAllString(text, "")
+	cleaned := strings.ReplaceAll(text, zeroWidthSpace, "")
+	return m.regex.ReplaceAllString(cleaned, "")
 }
 
 // obfuscateSensitiveWords processes the payload and obfuscates sensitive words

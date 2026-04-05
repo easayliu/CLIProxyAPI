@@ -10,9 +10,6 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// zeroWidthSpace is the Unicode zero-width space character used for obfuscation.
-const zeroWidthSpace = "\u200B"
-
 // SensitiveWordMatcher holds the compiled regex for matching sensitive words.
 type SensitiveWordMatcher struct {
 	regex *regexp.Regexp
@@ -29,7 +26,7 @@ func buildSensitiveWordMatcher(words []string) *SensitiveWordMatcher {
 	var validWords []string
 	for _, w := range words {
 		w = strings.TrimSpace(w)
-		if utf8.RuneCountInString(w) >= 2 && !strings.Contains(w, zeroWidthSpace) {
+		if utf8.RuneCountInString(w) >= 2 {
 			validWords = append(validWords, w)
 		}
 	}
@@ -58,27 +55,12 @@ func buildSensitiveWordMatcher(words []string) *SensitiveWordMatcher {
 	return &SensitiveWordMatcher{regex: re}
 }
 
-// obfuscateWord inserts a zero-width space after the first grapheme.
-func obfuscateWord(word string) string {
-	if strings.Contains(word, zeroWidthSpace) {
-		return word
-	}
-
-	// Get first rune
-	r, size := utf8.DecodeRuneInString(word)
-	if r == utf8.RuneError || size >= len(word) {
-		return word
-	}
-
-	return string(r) + zeroWidthSpace + word[size:]
-}
-
-// obfuscateText replaces all sensitive words in the text.
+// obfuscateText removes all sensitive words from the text.
 func (m *SensitiveWordMatcher) obfuscateText(text string) string {
 	if m == nil || m.regex == nil {
 		return text
 	}
-	return m.regex.ReplaceAllStringFunc(text, obfuscateWord)
+	return m.regex.ReplaceAllString(text, "")
 }
 
 // obfuscateSensitiveWords processes the payload and obfuscates sensitive words

@@ -939,34 +939,35 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// Stainless SDK headers: Title-Case, except OS which is all-caps
 	setRaw("X-Stainless-Retry-Count", "0")
-	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.11.1"))
-	setRaw("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
+	setRaw("X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
+	setRaw("X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.80.0"))
 	setRaw("X-Stainless-Runtime", "node")
 	setRaw("X-Stainless-Lang", "js")
 	setRaw("X-Stainless-Arch", hdrDefault(hd.Arch, mapStainlessArch()))
 	setRaw("X-Stainless-OS", hdrDefault(hd.Os, mapStainlessOS()))
 	setRaw("X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 
-	// Standard HTTP headers matching real CLI 2.1.84 MITM capture.
-	// Accept is Title-Case; the rest are lowercase in real Bun wire format.
-	userAgent := hdrDefault(hd.UserAgent, "claude-cli/2.1.90 (external, cli)")
+	// Standard HTTP headers matching real CLI 2.1.91 MITM capture.
+	// Accept is Title-Case; Connection is Title-Case; the rest are lowercase in real wire format.
+	userAgent := hdrDefault(hd.UserAgent, "claude-cli/2.1.91 (external, cli)")
 	clientReqID := uuid.New().String()
 	r.Header.Set("User-Agent", userAgent)
 	r.Header.Set("Accept", "application/json")
-	setRaw("accept-encoding", "br, gzip, deflate")
-	setRaw("accept-language", "*")
-	setRaw("sec-fetch-mode", "cors")
-	setRaw("connection", "keep-alive")
-	// Real CLI 2.1.84 sends x-client-request-id (UUID v4) with every /v1/messages request.
+	setRaw("accept-encoding", "gzip, deflate, br, zstd")
+	r.Header.Set("Connection", "keep-alive")
+	// Real CLI 2.1.91 sends x-client-request-id (UUID v4) with every /v1/messages request.
 	setRaw("x-client-request-id", clientReqID)
+
+	// Real CLI 2.1.91 sends X-Claude-Code-Session-Id header with a random UUID per request.
+	r.Header.Set("X-Claude-Code-Session-Id", uuid.New().String())
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 
-	log.Infof("[cloaking] headers: User-Agent=%s anthropic-beta=%s x-client-request-id=%s X-Stainless-Package-Version=%s X-Stainless-Runtime-Version=%s X-Stainless-OS=%s X-Stainless-Arch=%s",
-		userAgent, strings.Join(betas, ","), clientReqID,
+	log.Infof("[cloaking] headers: User-Agent=%s anthropic-beta=%s x-client-request-id=%s X-Claude-Code-Session-Id=%s X-Stainless-Package-Version=%s X-Stainless-Runtime-Version=%s X-Stainless-OS=%s X-Stainless-Arch=%s",
+		userAgent, strings.Join(betas, ","), clientReqID, r.Header.Get("X-Claude-Code-Session-Id"),
 		r.Header["X-Stainless-Package-Version"], r.Header["X-Stainless-Runtime-Version"],
 		r.Header["X-Stainless-OS"], r.Header["X-Stainless-Arch"])
 }
@@ -1372,7 +1373,7 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 const billingBuildHashSalt = "59cf53e54c78"
 
 // billingCLIVersion is the CLI version embedded in the billing header.
-const billingCLIVersion = "2.1.90"
+const billingCLIVersion = "2.1.91"
 
 // computeBuildHash computes the 3-char build hash for the billing header.
 // Algorithm (from cli.js _0T): extract chars at positions [4,7,20] from the
@@ -1441,10 +1442,22 @@ func firstUserMessageText(payload []byte) string {
 }
 
 // generateCCH returns the cch field for the billing header.
-// Node runtime always sends cch=00000; non-zero values seen in MITM captures
-// come from Bun's native layer. We target Node behavior.
-func generateCCH(_ []byte) string {
-	return "00000"
+// Algorithm: extract runes at positions [0,1,2,8,16] from the first user message
+// text, take each rune's Unicode code point modulo 10, and concatenate into a
+// 5-digit string. Falls back to '0' for positions beyond the text length.
+func generateCCH(payload []byte) string {
+	text := firstUserMessageText(payload)
+	runes := []rune(text)
+	indices := [5]int{0, 1, 2, 8, 16}
+	result := make([]byte, 5)
+	for i, idx := range indices {
+		if idx < len(runes) {
+			result[i] = byte('0' + int(runes[idx])%10)
+		} else {
+			result[i] = '0'
+		}
+	}
+	return string(result)
 }
 
 // Billing header placeholder tokens, replaced by finalizeBillingHeader after

@@ -1,6 +1,6 @@
 package executor
 
-// Tests in this file are derived from real MITM captures of Claude Code CLI v2.1.90 (Node).
+// Tests in this file are derived from real MITM captures of Claude Code CLI v2.1.91 (Node).
 // Capture: /tmp/proxy_captures/20260402_110537
 // Each test references the specific capture sequence number it validates against.
 
@@ -30,31 +30,29 @@ import (
 // conversation, streaming, with tools + effort).
 var captureMainHeaders = map[string]string{
 	"Accept":                                   "application/json",
-	"User-Agent":                               "claude-cli/2.1.90 (external, cli)",
+	"User-Agent":                               "claude-cli/2.1.91 (external, cli)",
 	"X-Stainless-Arch":                         "arm64",
 	"X-Stainless-Lang":                         "js",
 	"X-Stainless-OS":                           "MacOS",
-	"X-Stainless-Package-Version":              "0.74.0",
+	"X-Stainless-Package-Version":              "0.80.0",
 	"X-Stainless-Retry-Count":                  "0",
 	"X-Stainless-Runtime":                      "node",
-	"X-Stainless-Runtime-Version":              "v24.11.1",
+	"X-Stainless-Runtime-Version":              "v24.3.0",
 	"X-Stainless-Timeout":                      "600",
-	"accept-encoding":                          "br, gzip, deflate",
-	"accept-language":                           "*",
+	"accept-encoding":                          "gzip, deflate, br, zstd",
 	"anthropic-dangerous-direct-browser-access": "true",
 	"anthropic-version":                         "2023-06-01",
-	"connection":                                "keep-alive",
+	"Connection":                                "keep-alive",
 	"content-type":                              "application/json",
-	"sec-fetch-mode":                            "cors",
 	"x-app":                                     "cli",
 }
 
-// captureMainBetas is the exact anthropic-beta value from capture #030 (2.1.90 Node).
+// captureMainBetas is the exact anthropic-beta value from capture (2.1.91 Node).
 // opus-4-6 main conversation with tools + effort + context-management.
 var captureMainBetas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
 
 // captureBillingHeader prefix; build hash is now dynamic per-request.
-const captureBillingHeaderPrefix = "x-anthropic-billing-header: cc_version=2.1.90."
+const captureBillingHeaderPrefix = "x-anthropic-billing-header: cc_version=2.1.91."
 
 // captureAgentBlock is from capture #010 system[1].
 const captureAgentBlock = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -219,7 +217,7 @@ func TestCapture010_NonStreamingHeaders(t *testing.T) {
 			enc = vals[0]
 		}
 	}
-	assertHeader(t, "accept-encoding", enc, "br, gzip, deflate")
+	assertHeader(t, "accept-encoding", enc, "gzip, deflate, br, zstd")
 }
 
 // TestCapture010_StreamNonStreamIdentical verifies stream and non-stream
@@ -306,8 +304,8 @@ func TestCapture010_SystemArray(t *testing.T) {
 	if !strings.HasPrefix(sys0, "x-anthropic-billing-header:") {
 		t.Fatalf("system[0] not billing header: %s", sys0)
 	}
-	if !strings.Contains(sys0, "cc_version=2.1.90.") {
-		t.Errorf("billing header missing cc_version=2.1.90: %s", sys0)
+	if !strings.Contains(sys0, "cc_version=2.1.91.") {
+		t.Errorf("billing header missing cc_version=2.1.91: %s", sys0)
 	}
 	if !strings.Contains(sys0, "cc_entrypoint=cli") {
 		t.Errorf("billing header missing cc_entrypoint=cli: %s", sys0)
@@ -315,8 +313,10 @@ func TestCapture010_SystemArray(t *testing.T) {
 	if !strings.Contains(sys0, "cch=") {
 		t.Errorf("billing header missing cch= field: %s", sys0)
 	}
-	if !strings.Contains(sys0, "cch=00000") {
-		t.Errorf("billing header should have cch=00000 (Node runtime): %s", sys0)
+	// cch is dynamically computed from first user text positions [0,1,2,8,16] charCode%10.
+	// The injected system-reminder starts with "<system-reminder>\n..." → cch=05142.
+	if !strings.Contains(sys0, "cch=05142") {
+		t.Errorf("billing header should have cch=05142: %s", sys0)
 	}
 	// Capture #010: system[0] has NO cache_control
 	if gjson.GetBytes(cap.Body, "system.0.cache_control").Exists() {

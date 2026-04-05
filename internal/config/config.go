@@ -102,6 +102,10 @@ type Config struct {
 	// These are used as fallbacks when the client does not send its own headers.
 	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
 
+	// ClaudeCloakDefaults configures global default cloaking behavior for all Claude requests.
+	// Per-key cloak config in claude-api-key takes precedence over this global default.
+	ClaudeCloakDefaults *CloakConfig `yaml:"claude-cloak-defaults,omitempty" json:"claude-cloak-defaults,omitempty"`
+
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 

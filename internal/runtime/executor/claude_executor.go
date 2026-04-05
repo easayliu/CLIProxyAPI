@@ -1945,8 +1945,11 @@ func normalizeMaxTokensForCloaking(payload []byte, model string) []byte {
 func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string, sessionID string) ([]byte, string, error) {
 	clientUserAgent := getClientUserAgent(ctx)
 
-	// Get cloak config from ClaudeKey configuration
+	// Get cloak config from ClaudeKey configuration, fallback to global defaults.
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
+	if cloakCfg == nil && cfg != nil {
+		cloakCfg = cfg.ClaudeCloakDefaults
+	}
 
 	// Determine cloak settings
 	var cloakMode string
